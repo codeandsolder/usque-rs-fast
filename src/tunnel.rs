@@ -100,19 +100,24 @@ fn reset_udp_read_bufs(bufs: &mut [ReadBuf<'_>]) {
     }
 }
 
-fn process_udp_batch(
+fn process_udp_batch<H>(
     conn: &mut quiche::Connection,
     bufs: &mut [ReadBuf<'_>],
     count: usize,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
-) {
+    datagram_handler: &mut H,
+) where
+    H: FnMut(&[u8]) -> bool,
+{
     for buf in &mut bufs[..count] {
         let recv_info = quiche::RecvInfo {
             to: local_addr,
             from: peer_addr,
         };
-        if let Err(error) = conn.recv(buf.filled_mut(), recv_info) {
+        if let Err(error) =
+            conn.recv_with_dgram_handler(buf.filled_mut(), recv_info, datagram_handler)
+        {
             log::debug!("dropping UDP packet rejected by QUIC: {error}");
         }
     }
@@ -611,8 +616,20 @@ async fn drain_inbound_datagrams(
     flow_id: u64,
     buffers: &mut ForwardBuffers,
     stats: &mut TunnelStats,
+    inbound_count: &mut usize,
 ) -> Result<()> {
-    let mut inbound_count = 0usize;
+    // Synchronous DATAGRAM delivery may already have filled the batch. Flush it
+    // before draining any overflow that fell back to quiche's receive queue.
+    if *inbound_count == buffers.inbound_packets.len() {
+        send_tun_batch(
+            tun_dev,
+            &mut buffers.gro_table,
+            &mut buffers.inbound_packets[..*inbound_count],
+        )
+        .await?;
+        *inbound_count = 0;
+    }
+
     loop {
         match conn.dgram_recv_buf() {
             Ok(datagram) => {
@@ -626,17 +643,17 @@ async fn drain_inbound_datagrams(
                 stats.rx_packets += 1;
                 stats.rx_bytes += u64::try_from(ip_payload.len())
                     .map_err(|_| anyhow::anyhow!("packet length does not fit u64"))?;
-                stage_tun_packet(&mut buffers.inbound_packets[inbound_count], ip_payload);
-                inbound_count += 1;
+                stage_tun_packet(&mut buffers.inbound_packets[*inbound_count], ip_payload);
+                *inbound_count += 1;
 
-                if inbound_count == buffers.inbound_packets.len() {
+                if *inbound_count == buffers.inbound_packets.len() {
                     send_tun_batch(
                         tun_dev,
                         &mut buffers.gro_table,
-                        &mut buffers.inbound_packets[..inbound_count],
+                        &mut buffers.inbound_packets[..*inbound_count],
                     )
                     .await?;
-                    inbound_count = 0;
+                    *inbound_count = 0;
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -647,13 +664,14 @@ async fn drain_inbound_datagrams(
         }
     }
 
-    if inbound_count > 0 {
+    if *inbound_count > 0 {
         send_tun_batch(
             tun_dev,
             &mut buffers.gro_table,
-            &mut buffers.inbound_packets[..inbound_count],
+            &mut buffers.inbound_packets[..*inbound_count],
         )
         .await?;
+        *inbound_count = 0;
     }
     Ok(())
 }
@@ -700,6 +718,10 @@ async fn forward_native_session(
     stats_interval.tick().await;
 
     loop {
+        // DATAGRAMs consumed synchronously by quiche are staged directly into
+        // this preallocated batch. Overflow remains queued in quiche and is
+        // drained into the same batch below.
+        let mut inbound_count = 0usize;
         let quic_timeout = session.quic.conn.timeout();
         let timeout = quic_timeout
             .unwrap_or(keepalive_interval)
@@ -718,6 +740,29 @@ async fn forward_native_session(
                     count,
                     session.quic.local_addr,
                     session.quic.endpoint,
+                    &mut |dgram| {
+                        if inbound_count == buffers.inbound_packets.len() {
+                            return false;
+                        }
+                        let Some(ip_payload) = parse_datagram(dgram, session.flow_id) else {
+                            return false;
+                        };
+                        if packet::validate_incoming(ip_payload).is_err() {
+                            return false;
+                        }
+                        let Ok(packet_len) = u64::try_from(ip_payload.len()) else {
+                            return false;
+                        };
+
+                        stats.rx_packets += 1;
+                        stats.rx_bytes += packet_len;
+                        stage_tun_packet(
+                            &mut buffers.inbound_packets[inbound_count],
+                            ip_payload,
+                        );
+                        inbound_count += 1;
+                        true
+                    },
                 );
             }
             result = tun_dev.recv_multiple(
@@ -757,6 +802,7 @@ async fn forward_native_session(
             session.flow_id,
             &mut buffers,
             &mut stats,
+            &mut inbound_count,
         )
         .await?;
         flush_quic_packets(
