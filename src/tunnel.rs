@@ -17,6 +17,143 @@ use crate::udp_socket::{bind_udp_socket, detect_udp_gso, send_udp_gso};
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const TUN_READY_DRAIN_MAX_READS: usize = 8;
+const TUN_DRAIN_INITIAL_SAMPLES_PER_MODE: u8 = 3;
+const TUN_DRAIN_CHALLENGE_INTERVAL_SECS: u16 = 30;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CpuPerPacketStats {
+    samples: u8,
+    mean_ns: f64,
+    m2_ns: f64,
+}
+
+impl CpuPerPacketStats {
+    fn add(&mut self, cpu_ns: u64, packets: u64) {
+        if packets == 0 {
+            return;
+        }
+
+        let sample = cpu_ns as f64 / packets as f64;
+        self.samples = self.samples.saturating_add(1);
+        let delta = sample - self.mean_ns;
+        self.mean_ns += delta / f64::from(self.samples);
+        let delta2 = sample - self.mean_ns;
+        self.m2_ns += delta * delta2;
+    }
+
+    fn standard_error(&self) -> f64 {
+        if self.samples < 2 {
+            return f64::INFINITY;
+        }
+
+        let variance = self.m2_ns / f64::from(self.samples - 1);
+        (variance / f64::from(self.samples)).sqrt()
+    }
+}
+
+#[derive(Debug)]
+struct TunDrainTuner {
+    calibrating: bool,
+    selected: bool,
+    off: CpuPerPacketStats,
+    on: CpuPerPacketStats,
+    challenge_countdown: u16,
+    challenge_baseline_ns: Option<f64>,
+}
+
+impl TunDrainTuner {
+    fn new() -> Self {
+        Self {
+            calibrating: true,
+            selected: false,
+            off: CpuPerPacketStats::default(),
+            on: CpuPerPacketStats::default(),
+            challenge_countdown: TUN_DRAIN_CHALLENGE_INTERVAL_SECS,
+            challenge_baseline_ns: None,
+        }
+    }
+
+    fn observe(&mut self, mode: bool, cpu_ns: u64, packets: u64) -> bool {
+        if packets == 0 {
+            return mode;
+        }
+
+        let sample_ns = cpu_ns as f64 / packets as f64;
+
+        if self.calibrating {
+            if mode {
+                self.on.add(cpu_ns, packets);
+            } else {
+                self.off.add(cpu_ns, packets);
+            }
+
+            if self.off.samples >= TUN_DRAIN_INITIAL_SAMPLES_PER_MODE
+                && self.on.samples >= TUN_DRAIN_INITIAL_SAMPLES_PER_MODE
+            {
+                // Prefer ready-drain only when its measured improvement is
+                // larger than the observed sample noise. Ambiguous cases
+                // conservatively stay off.
+                let uncertainty = self.off.standard_error().hypot(self.on.standard_error());
+                self.selected = self.on.mean_ns + uncertainty < self.off.mean_ns;
+                self.calibrating = false;
+                self.challenge_countdown = TUN_DRAIN_CHALLENGE_INTERVAL_SECS;
+                return self.selected;
+            }
+
+            let opposite_needs_sample = if mode {
+                self.off.samples < TUN_DRAIN_INITIAL_SAMPLES_PER_MODE
+            } else {
+                self.on.samples < TUN_DRAIN_INITIAL_SAMPLES_PER_MODE
+            };
+
+            return if opposite_needs_sample { !mode } else { mode };
+        }
+
+        if let Some(baseline_ns) = self.challenge_baseline_ns.take() {
+            // This interval ran in the opposite mode. Switch only if that
+            // immediately-adjacent challenger beat the selected-mode sample.
+            if sample_ns < baseline_ns {
+                self.selected = mode;
+            }
+            self.challenge_countdown = TUN_DRAIN_CHALLENGE_INTERVAL_SECS;
+            return self.selected;
+        }
+
+        if mode == self.selected {
+            if self.challenge_countdown > 0 {
+                self.challenge_countdown -= 1;
+            }
+
+            if self.challenge_countdown == 0 {
+                self.challenge_baseline_ns = Some(sample_ns);
+                return !self.selected;
+            }
+        }
+
+        self.selected
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_time_ns() -> Option<u64> {
+    let mut ts = std::mem::MaybeUninit::<nix::libc::timespec>::uninit();
+    let rc =
+        unsafe { nix::libc::clock_gettime(nix::libc::CLOCK_PROCESS_CPUTIME_ID, ts.as_mut_ptr()) };
+
+    if rc != 0 {
+        return None;
+    }
+
+    let ts = unsafe { ts.assume_init() };
+    let secs = u64::try_from(ts.tv_sec).ok()?;
+    let nanos = u64::try_from(ts.tv_nsec).ok()?;
+    secs.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cpu_time_ns() -> Option<u64> {
+    None
+}
 
 /// Configuration for a MASQUE tunnel session.
 pub struct TunnelConfig {
@@ -489,6 +626,11 @@ async fn run_tunnel_session(
         .collect::<Vec<_>>();
 
     let result: Result<()> = async {
+        let mut tun_ready_drain = false;
+        let mut tun_drain_tuner = TunDrainTuner::new();
+        let mut tune_tx_packets = tx_packets;
+        let mut tune_process_cpu_ns = process_cpu_time_ns();
+
         loop {
             // DATAGRAMs consumed synchronously by quiche are staged directly
             // into this preallocated batch for this forwarding-loop iteration.
@@ -600,7 +742,8 @@ async fn run_tunnel_session(
                     //
                     // Leave one worst-case split batch of queue headroom and
                     // cap the number of reads for fairness under a hot producer.
-                    if reads >= TUN_READY_DRAIN_MAX_READS ||
+                    if !tun_ready_drain ||
+                        reads >= TUN_READY_DRAIN_MAX_READS ||
                         conn.dgram_send_queue_len() >
                             tls::DGRAM_QUEUE_LEN - IDEAL_BATCH_SIZE
                     {
@@ -639,6 +782,18 @@ async fn run_tunnel_session(
             // Status is sampled once per second instead of maintaining shared
             // atomics and querying QUIC stats on every packet/event.
             _ = stats_interval.tick() => {
+                let current_cpu_ns = process_cpu_time_ns();
+                if let (Some(previous_cpu_ns), Some(current_cpu_ns)) =
+                    (tune_process_cpu_ns, current_cpu_ns)
+                {
+                    let cpu_delta = current_cpu_ns.saturating_sub(previous_cpu_ns);
+                    let packet_delta = tx_packets.saturating_sub(tune_tx_packets);
+                    tun_ready_drain =
+                        tun_drain_tuner.observe(tun_ready_drain, cpu_delta, packet_delta);
+                }
+                tune_process_cpu_ns = current_cpu_ns;
+                tune_tx_packets = tx_packets;
+
                 let qs = conn.stats();
                 eprint!(
                     "\r\x1b[2K[connected {}] tx: {} ({})  rx: {} ({})  drop: {}  lost: {}  retrans: {}",
