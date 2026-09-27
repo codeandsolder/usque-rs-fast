@@ -55,7 +55,9 @@ enum Commands {
         name: Option<String>,
         #[arg(long)]
         jwt: Option<String>,
-        #[arg(short, long, default_value_t = false)]
+        // Kept as a hidden no-op for CLI compatibility. Registering already
+        // implies consent, so unattended registration must not prompt.
+        #[arg(long = "accept-tos", hide = true)]
         accept_tos: bool,
     },
     /// Expose WARP as a native TUN device
@@ -93,8 +95,8 @@ async fn main() -> Result<()> {
             model,
             name,
             jwt,
-            accept_tos,
-        } => cmd_register(&cli.config, &locale, &model, name, jwt, accept_tos).await,
+            accept_tos: _,
+        } => cmd_register(&cli.config, &locale, &model, name, jwt).await,
         Commands::NativeTun {
             connect_port,
             ipv6,
@@ -129,7 +131,6 @@ async fn cmd_register(
     model: &str,
     device_name: Option<String>,
     jwt: Option<String>,
-    accept_tos: bool,
 ) -> Result<()> {
     if let Ok(existing) = config::Config::load(config_path) {
         let _ = existing;
@@ -139,19 +140,6 @@ async fn cmd_register(
         if response.trim() != "y" {
             log::info!("Aborted.");
             return Ok(());
-        }
-    }
-
-    if !accept_tos {
-        eprintln!(
-            "You must accept the Terms of Service \
-             (https://www.cloudflare.com/application/terms/) to register."
-        );
-        eprint!("Do you agree? (y/n): ");
-        let mut response = String::new();
-        std::io::stdin().read_line(&mut response)?;
-        if response.trim() != "y" {
-            anyhow::bail!("User did not accept TOS");
         }
     }
 
