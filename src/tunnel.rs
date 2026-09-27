@@ -16,6 +16,7 @@ use crate::udp_socket::{bind_udp_socket, detect_udp_gso, send_udp_gso};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const TUN_READY_DRAIN_MAX_READS: usize = 8;
 
 /// Configuration for a MASQUE tunnel session.
 pub struct TunnelConfig {
@@ -540,49 +541,85 @@ async fn run_tunnel_session(
                 );
             }
 
-            // Read from TUN -> send a burst of CONNECT-IP datagrams.
+            // Read from TUN -> queue a bounded burst of CONNECT-IP datagrams.
             result = tun_dev.recv_multiple(&mut tun_raw, &mut tun_packets, &mut tun_sizes, 0) => {
-                let count = result
+                let mut count = result
                     .map_err(|e| anyhow::anyhow!("failed to read packet batch from TUN: {e}"))?;
                 if count == 0 {
                     bail!("TUN device closed");
                 }
 
-                for i in 0..count {
-                    let n = tun_sizes[i];
-                    let pkt = &mut tun_packets[i][..n];
-                    match packet::prepare_outgoing(pkt) {
-                        Ok(_) => {
-                            let pkt_len = n as u64;
-                            let mut dgram = Vec::with_capacity(flow_prefix.len() + n);
-                            dgram.extend_from_slice(&flow_prefix);
-                            dgram.extend_from_slice(pkt);
+                let mut reads = 0usize;
+                loop {
+                    reads += 1;
 
-                            match conn.dgram_send_buf(dgram) {
-                                Ok(()) => {
-                                    tx_packets += 1;
-                                    tx_bytes += pkt_len;
-                                }
-                                Err(quiche::Error::InvalidState) => {
-                                    log::warn!("datagram send: peer doesn't support datagrams");
-                                }
-                                Err(quiche::Error::Done) => {
-                                    dropped += 1;
-                                    log::trace!("datagram send queue full, dropping packet");
-                                }
-                                Err(e) => {
-                                    dropped += 1;
-                                    log::debug!("datagram send error: {e}, generating ICMP");
-                                    if let Some(icmp) = icmp::compose_icmp_too_large(pkt, 1280) {
-                                        stage_tun_packet(&mut icmp_packet[0], &icmp);
-                                        send_tun_batch(tun_dev, &mut gro_table, &mut icmp_packet).await?;
+                    for i in 0..count {
+                        let n = tun_sizes[i];
+                        let pkt = &mut tun_packets[i][..n];
+                        match packet::prepare_outgoing(pkt) {
+                            Ok(_) => {
+                                let pkt_len = n as u64;
+                                let mut dgram = Vec::with_capacity(flow_prefix.len() + n);
+                                dgram.extend_from_slice(&flow_prefix);
+                                dgram.extend_from_slice(pkt);
+
+                                match conn.dgram_send_buf(dgram) {
+                                    Ok(()) => {
+                                        tx_packets += 1;
+                                        tx_bytes += pkt_len;
+                                    }
+                                    Err(quiche::Error::InvalidState) => {
+                                        log::warn!("datagram send: peer doesn't support datagrams");
+                                    }
+                                    Err(quiche::Error::Done) => {
+                                        dropped += 1;
+                                        log::trace!("datagram send queue full, dropping packet");
+                                    }
+                                    Err(e) => {
+                                        dropped += 1;
+                                        log::debug!("datagram send error: {e}, generating ICMP");
+                                        if let Some(icmp) = icmp::compose_icmp_too_large(pkt, 1280) {
+                                            stage_tun_packet(&mut icmp_packet[0], &icmp);
+                                            send_tun_batch(tun_dev, &mut gro_table, &mut icmp_packet).await?;
+                                        }
                                     }
                                 }
                             }
+                            Err(e) => {
+                                dropped += 1;
+                                log::trace!("dropping outgoing packet: {e}");
+                            }
                         }
+                    }
+
+                    // recv_multiple() performs one TUN read; for ordinary
+                    // non-GSO packets that means one packet per event-loop
+                    // iteration. Drain only packets that are already ready so
+                    // quiche can pack multiple DATAGRAM frames before the
+                    // common flush below, without adding a coalescing delay.
+                    //
+                    // Leave one worst-case split batch of queue headroom and
+                    // cap the number of reads for fairness under a hot producer.
+                    if reads >= TUN_READY_DRAIN_MAX_READS ||
+                        conn.dgram_send_queue_len() >
+                            tls::DGRAM_QUEUE_LEN - IDEAL_BATCH_SIZE
+                    {
+                        break;
+                    }
+
+                    match tun_dev.try_recv_multiple(
+                        &mut tun_raw,
+                        &mut tun_packets,
+                        &mut tun_sizes,
+                        0,
+                    ) {
+                        Ok(0) => break,
+                        Ok(next_count) => count = next_count,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
-                            dropped += 1;
-                            log::trace!("dropping outgoing packet: {e}");
+                            return Err(anyhow::anyhow!(
+                                "failed to drain ready TUN packet batch: {e}"
+                            ));
                         }
                     }
                 }
