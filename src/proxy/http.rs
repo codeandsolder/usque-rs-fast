@@ -1,11 +1,12 @@
 use super::net::VirtualNet;
 use anyhow::Result;
+use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
 use hyper::{
     body::Incoming,
     client::conn::http1 as client_http1,
-    header::{CONNECTION, HOST},
+    header::{CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
     server::conn::http1 as server_http1,
     service::service_fn,
     Method, Request, Response, StatusCode, Uri,
@@ -25,19 +26,32 @@ type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 #[derive(Clone, Debug)]
 pub struct HttpConfig {
     pub bind: SocketAddr,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 pub async fn serve(config: HttpConfig, net: Arc<VirtualNet>) -> Result<()> {
+    let expected_auth = match (&config.username, &config.password) {
+        (Some(username), Some(password)) => Some(format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        )),
+        (None, None) => None,
+        _ => anyhow::bail!("HTTP proxy username and password must be configured together"),
+    };
+
     let listener = TcpListener::bind(config.bind).await?;
     log::info!("HTTP proxy listening on {}", config.bind);
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let net = net.clone();
+        let expected_auth = expected_auth.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let net = net.clone();
-                async move { Ok::<_, Infallible>(handle(request, net).await) }
+                let expected_auth = expected_auth.clone();
+                async move { Ok::<_, Infallible>(handle(request, net, expected_auth.as_deref()).await) }
             });
 
             if let Err(error) = server_http1::Builder::new()
@@ -53,7 +67,25 @@ pub async fn serve(config: HttpConfig, net: Arc<VirtualNet>) -> Result<()> {
     }
 }
 
-async fn handle(mut request: Request<Incoming>, net: Arc<VirtualNet>) -> Response<ProxyBody> {
+async fn handle(
+    mut request: Request<Incoming>,
+    net: Arc<VirtualNet>,
+    expected_auth: Option<&str>,
+) -> Response<ProxyBody> {
+    if let Some(expected) = expected_auth {
+        let provided = request
+            .headers()
+            .get(PROXY_AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        if provided != Some(expected) {
+            return Response::builder()
+                .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                .header(PROXY_AUTHENTICATE, "Basic realm=\"usque-rs\"")
+                .body(empty_body())
+                .expect("static proxy authentication response");
+        }
+    }
+
     if request.method() == Method::CONNECT {
         return handle_connect(request, net).await;
     }
