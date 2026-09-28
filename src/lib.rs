@@ -13,6 +13,7 @@ pub mod config;
 pub mod icmp;
 pub mod packet;
 pub mod packet_session;
+pub mod proxy;
 pub mod register;
 pub mod tls;
 pub mod tun_device;
