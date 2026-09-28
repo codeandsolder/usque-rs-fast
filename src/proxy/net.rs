@@ -133,14 +133,11 @@ impl Stack {
     }
 
     fn retire(&mut self, handle: SocketHandle, abort: bool) {
-        if let Some(socket) = self.sockets.iter_mut().find_map(|(candidate, socket)| {
-            (candidate == handle).then(|| socket.downcast_mut::<tcp::Socket>())
-        }) {
-            if abort {
-                socket.abort();
-            } else {
-                socket.close();
-            }
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        if abort {
+            socket.abort();
+        } else {
+            socket.close();
         }
         self.retired.push((handle, Instant::now()));
     }
@@ -150,16 +147,7 @@ impl Stack {
         let mut index = 0;
         while index < self.retired.len() {
             let (handle, retired_at) = self.retired[index];
-            let finished = self
-                .sockets
-                .iter()
-                .find_map(|(candidate, socket)| {
-                    (candidate == handle).then(|| {
-                        let socket = socket.downcast_ref::<tcp::Socket>();
-                        !socket.is_open()
-                    })
-                })
-                .unwrap_or(true);
+            let finished = !self.sockets.get::<tcp::Socket>(handle).is_open();
 
             if finished || now.duration_since(retired_at) >= RETIRED_SOCKET_GRACE {
                 let _ = self.sockets.remove(handle);
@@ -193,12 +181,12 @@ impl VirtualNet {
         iface.update_ip_addrs(|addresses| {
             if let Some(address) = local_v4 {
                 addresses
-                    .push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::from_bytes(&address.octets())), 32))
+                    .push(IpCidr::new(IpAddress::Ipv4(address), 32))
                     .expect("smoltcp address table has room for IPv4 + IPv6");
             }
             if let Some(address) = local_v6 {
                 addresses
-                    .push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::from_bytes(&address.octets())), 128))
+                    .push(IpCidr::new(IpAddress::Ipv6(address), 128))
                     .expect("smoltcp address table has room for IPv4 + IPv6");
             }
         });
@@ -583,8 +571,8 @@ impl Drop for ConnectGuard {
 
 fn smoltcp_to_std_ip(address: IpAddress) -> IpAddr {
     match address {
-        IpAddress::Ipv4(address) => IpAddr::V4(Ipv4Addr::from(address.0)),
-        IpAddress::Ipv6(address) => IpAddr::V6(Ipv6Addr::from(address.0)),
+        IpAddress::Ipv4(address) => IpAddr::V4(address),
+        IpAddress::Ipv6(address) => IpAddr::V6(address),
     }
 }
 
