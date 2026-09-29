@@ -27,7 +27,7 @@ const fn ip_version(buf: &[u8]) -> u8 {
 ///
 /// # Errors
 ///
-/// Returns PacketError when the packet is empty, malformed, has an unknown
+/// Returns `PacketError` when the packet is empty, malformed, has an unknown
 /// IP version, or has an expired TTL/hop limit.
 pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
     if buf.is_empty() {
@@ -82,7 +82,7 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
 ///
 /// # Errors
 ///
-/// Returns PacketError when the packet is empty, malformed, or has an
+/// Returns `PacketError` when the packet is empty, malformed, or has an
 /// unknown IP version.
 pub fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
     if buf.is_empty() {

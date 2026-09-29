@@ -164,7 +164,7 @@ fn icmpv6_checksum(src: &[u8], dst: &[u8], icmpv6_data: &[u8]) -> Option<u16> {
     Some(fold_checksum(sum))
 }
 
-fn fold_checksum(mut sum: u32) -> u16 {
+const fn fold_checksum(mut sum: u32) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
