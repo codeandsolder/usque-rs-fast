@@ -77,7 +77,7 @@ impl PoolState {
         for proxy in &mut state.proxies {
             proxy.pid = 0;
         }
-        if state.started_at == 0 {
+        if state.started_at == 0.0 {
             state.started_at = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
         }
         Ok(state)

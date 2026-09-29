@@ -160,13 +160,13 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
         }
 
         if last_heartbeat.elapsed() >= config.heartbeat_interval {
-            let stats = cpu.sample();
-            cpu_history.push(stats.cpu_pct);
+            let system_sample = cpu.sample();
+            cpu_history.push(system_sample.cpu_pct);
             if cpu_history.len() > 10 {
                 cpu_history.remove(0);
             }
             if let Err(error) =
-                send_heartbeat(&config, &state, &reporter, stats, &cpu_history).await
+                send_heartbeat(&config, &state, &reporter, system_sample, &cpu_history).await
             {
                 log::warn!("orchestrator heartbeat failed: {error:#}");
             }
@@ -517,7 +517,7 @@ async fn send_heartbeat(
     config: &RemoteConfig,
     state: &PoolState,
     reporter: &RemoteReporter,
-    stats: SystemStats,
+    system_sample: SystemStats,
     cpu_history: &[f64],
 ) -> Result<()> {
     let reports = proxy_reports(config, state)?;
@@ -536,9 +536,9 @@ async fn send_heartbeat(
             seen_v4_count: state.seen_v4.len(),
             stale_count: state.stale_count,
             uptime,
-            cpu_pct: stats.cpu_pct,
-            mem_used_mb: stats.mem_used_mb,
-            mem_total_mb: stats.mem_total_mb,
+            cpu_pct: system_sample.cpu_pct,
+            mem_used_mb: system_sample.mem_used_mb,
+            mem_total_mb: system_sample.mem_total_mb,
             cpu_history,
             proxies_delta: &reports,
         })
@@ -904,13 +904,13 @@ fn read_cpu_ticks() -> Option<(u64, u64)> {
 
 fn read_memory_kb() -> Option<(u64, u64)> {
     let data = fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total = None;
-    let mut available = None;
+    let mut total: Option<u64> = None;
+    let mut available: Option<u64> = None;
     for line in data.lines() {
         if let Some(value) = line.strip_prefix("MemTotal:") {
-            total = value.split_whitespace().next()?.parse().ok();
+            total = value.split_whitespace().next()?.parse::<u64>().ok();
         } else if let Some(value) = line.strip_prefix("MemAvailable:") {
-            available = value.split_whitespace().next()?.parse().ok();
+            available = value.split_whitespace().next()?.parse::<u64>().ok();
         }
     }
     let total = total?;
