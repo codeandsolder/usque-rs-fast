@@ -76,14 +76,14 @@ The listeners are `127.0.0.1:20000`, `127.0.0.1:20001`, and so on. Re-running th
 sudo usque-rs pool-remote \
   --prefix 2001:db8:1234:5678::/64 \
   --slots-per-prefix 10 \
-  --auth-file /etc/warp-pool/auth \
-  --psk-file /etc/warp-pool/psk \
+  --auth-file /etc/usque-pool/proxy.auth \
+  --psk-file /etc/usque-pool/orchestrator.psk \
   --orchestrator-url https://orchestrator.example
 ```
 
-Remote mode requires root or equivalent `CAP_NET_ADMIN` permission to add the routed `/128` addresses. The auth file remains the legacy `username:password` format. By default `pool-remote` also reads the legacy `/etc/warp-pool/config.json`; existing `prefixes`, `orchestrator_url`, and optional `psk` values are accepted so an existing fleet does not need to be reconfigured. Explicit CLI values take priority; `ORCHESTRATOR_URL` remains an environment override, and `PREFIXES_CSV` is used when neither CLI nor the legacy config supplies prefixes.
+Remote mode requires root or equivalent `CAP_NET_ADMIN` permission to add routed `/128` addresses. `--prefix` and `--orchestrator-url` are required inputs. The proxy-auth file contains `username:password`; the orchestrator PSK is stored separately. Runtime state defaults to `/var/lib/usque-pool`.
 
-The useful legacy layout is retained (`identities/group-N/slot-N/config.json`, `addresses/group-N.json`, and `state.json`), but Python self-update is intentionally not part of the Rust agent; binary deployment/versioning owns upgrades.
+The Rust pool owns its identity configs, generated address suffixes, and state directly. There is no Python supervisor or self-update compatibility layer; binary deployment/versioning owns upgrades.
 
 
 ## Why the rewrite?

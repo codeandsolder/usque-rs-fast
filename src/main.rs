@@ -13,7 +13,6 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use serde::Deserialize;
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -97,10 +96,6 @@ enum Commands {
         name: Option<String>,
         #[arg(long)]
         jwt: Option<String>,
-        // Kept as a hidden no-op for CLI compatibility. Registering already
-        // implies consent, so unattended registration must not prompt.
-        #[arg(short = 'a', long = "accept-tos", hide = true)]
-        accept_tos: bool,
     },
     /// Expose WARP as a native TUN device
     #[command(name = "nativetun")]
@@ -134,10 +129,6 @@ enum Commands {
         username: Option<String>,
         #[arg(short = 'w', long)]
         password: Option<String>,
-        // Legacy Go/Python launcher compatibility. Rust proxy sessions
-        // reconnect on demand, so there is no separate always-reconnect mode.
-        #[arg(long, hide = true)]
-        always_reconnect: bool,
         #[command(flatten)]
         transport: ProxyTransportArgs,
     },
@@ -172,9 +163,9 @@ enum Commands {
     },
     /// Run a routed proxy pool and report healthy identities to warp-orchestrator.
     PoolRemote {
-        #[arg(long, default_value = "/opt/warp-pool")]
+        #[arg(long, default_value = "/var/lib/usque-pool")]
         dir: PathBuf,
-        #[arg(long = "prefix")]
+        #[arg(long = "prefix", required = true)]
         prefixes: Vec<String>,
         #[arg(long)]
         interface: Option<String>,
@@ -183,12 +174,10 @@ enum Commands {
         #[arg(long, default_value_t = 20_000)]
         base_port: u16,
         #[arg(long)]
-        orchestrator_url: Option<String>,
-        #[arg(long, default_value = "/etc/warp-pool/config.json")]
-        pool_config: PathBuf,
-        #[arg(long, default_value = "/etc/warp-pool/psk")]
+        orchestrator_url: String,
+        #[arg(long, default_value = "/etc/usque-pool/orchestrator.psk")]
         psk_file: PathBuf,
-        #[arg(long, default_value = "/etc/warp-pool/auth")]
+        #[arg(long, default_value = "/etc/usque-pool/proxy.auth")]
         auth_file: PathBuf,
         #[arg(long)]
         hostname: Option<String>,
@@ -208,7 +197,6 @@ async fn main() -> Result<()> {
             model,
             name,
             jwt,
-            accept_tos: _,
         } => cmd_register(&cli.config, &locale, &model, name, jwt).await,
         Commands::NativeTun {
             connect_port,
@@ -244,7 +232,6 @@ async fn main() -> Result<()> {
             port,
             username,
             password,
-            always_reconnect: _,
             transport,
         } => cmd_socks(&cli.config, bind, port, username, password, &transport).await,
         Commands::HttpProxy {
@@ -269,7 +256,6 @@ async fn main() -> Result<()> {
             slots_per_prefix,
             base_port,
             orchestrator_url,
-            pool_config,
             psk_file,
             auth_file,
             hostname,
@@ -282,7 +268,6 @@ async fn main() -> Result<()> {
                 slots_per_prefix,
                 base_port,
                 orchestrator_url,
-                pool_config,
                 psk_file,
                 auth_file,
                 hostname,
@@ -462,62 +447,36 @@ struct RemoteCommandOptions {
     interface: Option<String>,
     slots_per_prefix: usize,
     base_port: u16,
-    orchestrator_url: Option<String>,
-    pool_config: PathBuf,
+    orchestrator_url: String,
     psk_file: PathBuf,
     auth_file: PathBuf,
     hostname: Option<String>,
     transport: ProxyTransportArgs,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct LegacyPoolConfig {
-    #[serde(default)]
-    orchestrator_url: Option<String>,
-    #[serde(default)]
-    psk: Option<String>,
-    #[serde(default)]
-    prefixes: Vec<String>,
-}
-
 async fn cmd_pool_remote(options: RemoteCommandOptions) -> Result<()> {
     let RemoteCommandOptions {
         dir,
-        mut prefixes,
+        prefixes,
         interface,
         slots_per_prefix,
         base_port,
         orchestrator_url,
-        pool_config,
         psk_file,
         auth_file,
         hostname,
         transport,
     } = options;
-    let legacy = load_legacy_pool_config(&pool_config)?;
 
-    if prefixes.is_empty() {
-        if legacy.prefixes.is_empty() {
-            prefixes = csv_env("PREFIXES_CSV");
-        } else {
-            prefixes = legacy.prefixes;
-        }
+    let psk = std::fs::read_to_string(&psk_file)?.trim().to_string();
+    if psk.is_empty() {
+        anyhow::bail!("orchestrator PSK file is empty: {}", psk_file.display());
     }
-
-    let orchestrator_url = orchestrator_url
-        .or_else(|| std::env::var("ORCHESTRATOR_URL").ok())
-        .or(legacy.orchestrator_url)
-        .unwrap_or_else(|| "https://orchestrator.onhir.com".to_string());
-
-    let psk = match legacy.psk.filter(|value| !value.is_empty()) {
-        Some(value) => value,
-        None => std::fs::read_to_string(&psk_file)?.trim().to_string(),
-    };
     let auth = read_proxy_auth(&auth_file)?;
     let hostname = hostname
-        .or_else(|| std::env::var("VPS_ID").ok())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "unknown".to_string());
+
     remote::run(RemoteConfig {
         root: dir,
         prefixes,
@@ -571,25 +530,6 @@ fn child_transport(transport: &ProxyTransportArgs) -> ChildTransport {
         no_tunnel_ipv6: transport.no_tunnel_ipv6,
         use_ipv6_endpoint: transport.ipv6,
     }
-}
-
-fn load_legacy_pool_config(path: &Path) -> Result<LegacyPoolConfig> {
-    if !path.exists() {
-        return Ok(LegacyPoolConfig::default());
-    }
-    let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| anyhow::anyhow!("invalid pool config {}: {error}", path.display()))
-}
-
-fn csv_env(name: &str) -> Vec<String> {
-    std::env::var(name)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 fn read_proxy_auth(path: &Path) -> Result<ProxyAuth> {
@@ -669,90 +609,38 @@ mod tests {
     }
 
     #[test]
-    fn remote_pool_requires_prefixes_at_runtime_not_parse_time() -> Result<()> {
-        let cli = Cli::try_parse_from(["usque-rs", "pool-remote"])?;
+    fn remote_pool_requires_explicit_remote_inputs() -> Result<()> {
+        assert!(Cli::try_parse_from(["usque-rs", "pool-remote"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "usque-rs",
+            "pool-remote",
+            "--prefix",
+            "2001:db8:1:2::/64",
+            "--orchestrator-url",
+            "https://orchestrator.example",
+        ])?;
         let Commands::PoolRemote {
+            dir,
             prefixes,
             slots_per_prefix,
             base_port,
             orchestrator_url,
-            pool_config,
+            psk_file,
+            auth_file,
             ..
         } = cli.command
         else {
             anyhow::bail!("expected remote pool command");
         };
-        assert_eq!(prefixes, Vec::<String>::new());
+
+        assert_eq!(dir, PathBuf::from("/var/lib/usque-pool"));
+        assert_eq!(prefixes, ["2001:db8:1:2::/64"]);
         assert_eq!(slots_per_prefix, 10);
         assert_eq!(base_port, 20_000);
-        assert!(orchestrator_url.is_none());
-        assert_eq!(pool_config, PathBuf::from("/etc/warp-pool/config.json"));
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_warpproxy_cli_flags_are_accepted() -> Result<()> {
-        let register = Cli::try_parse_from(["usque-rs", "register", "-a", "-n", "g0-s0"])?;
-        let Commands::Register {
-            name, accept_tos, ..
-        } = register.command
-        else {
-            anyhow::bail!("expected register command");
-        };
-        assert_eq!(name.as_deref(), Some("g0-s0"));
-        assert!(accept_tos);
-
-        let socks = Cli::try_parse_from([
-            "usque-rs",
-            "socks",
-            "-b",
-            "::1",
-            "-p",
-            "20000",
-            "-u",
-            "warp",
-            "-w",
-            "secret",
-            "--source-ip",
-            "::1",
-            "--always-reconnect",
-            "--ipv6",
-        ])?;
-        let Commands::Socks {
-            always_reconnect,
-            transport,
-            ..
-        } = socks.command
-        else {
-            anyhow::bail!("expected SOCKS command");
-        };
-        assert!(always_reconnect);
-        assert_eq!(transport.source_ip, Some("::1".parse()?));
-        assert!(transport.ipv6);
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_pool_config_is_compatible() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("config.json");
-        std::fs::write(
-            &path,
-            br#"{
-              "version": 1,
-              "orchestrator_url": "https://orchestrator.example",
-              "psk": "legacy-psk",
-              "prefixes": ["2001:db8:1:2::/64"],
-              "socks_user": "ignored-by-rust-auth-file"
-            }"#,
-        )?;
-        let parsed = load_legacy_pool_config(&path)?;
-        assert_eq!(
-            parsed.orchestrator_url.as_deref(),
-            Some("https://orchestrator.example")
-        );
-        assert_eq!(parsed.psk.as_deref(), Some("legacy-psk"));
-        assert_eq!(parsed.prefixes, ["2001:db8:1:2::/64"]);
+        assert_eq!(orchestrator_url, "https://orchestrator.example");
+        assert_eq!(psk_file, PathBuf::from("/etc/usque-pool/orchestrator.psk"));
+        assert_eq!(auth_file, PathBuf::from("/etc/usque-pool/proxy.auth"));
         Ok(())
     }
 }

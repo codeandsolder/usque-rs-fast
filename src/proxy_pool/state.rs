@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
-use serde::de::Visitor;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fmt,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -24,7 +22,7 @@ pub struct ProxyRecord {
     pub v4: String,
     #[serde(default)]
     pub pid: u32,
-    #[serde(default, deserialize_with = "deserialize_legacy_timestamp")]
+    #[serde(default)]
     pub last_keepalive: i64,
 }
 
@@ -42,7 +40,7 @@ pub struct PoolState {
     pub seen_v4: BTreeSet<String>,
     #[serde(default)]
     pub stale_count: usize,
-    #[serde(default, deserialize_with = "deserialize_legacy_timestamp")]
+    #[serde(default)]
     pub started_at: i64,
     #[serde(default)]
     pub proxies: Vec<ProxyRecord>,
@@ -68,7 +66,7 @@ impl Default for PoolState {
 }
 
 impl PoolState {
-    /// Load persisted proxy-pool state, accepting legacy floating-point timestamps.
+    /// Load persisted proxy-pool state.
     ///
     /// # Errors
     /// Returns an error when the state file cannot be read or decoded.
@@ -116,7 +114,7 @@ impl PoolState {
     }
 }
 
-/// Return the config path for one legacy-compatible pool identity.
+/// Return the config path for one pool identity.
 #[must_use]
 pub fn identity_config_path(root: &Path, group: usize, slot: usize) -> PathBuf {
     root.join("identities")
@@ -165,45 +163,6 @@ pub fn save_suffixes(root: &Path, group: usize, suffixes: &[String]) -> Result<(
     Ok(())
 }
 
-fn deserialize_legacy_timestamp<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct TimestampVisitor;
-
-    impl Visitor<'_> for TimestampVisitor {
-        type Value = i64;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a Unix timestamp encoded as an integer or floating-point number")
-        }
-
-        fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
-            Ok(value)
-        }
-
-        fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            i64::try_from(value).map_err(E::custom)
-        }
-
-        fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            if !value.is_finite() {
-                return Err(E::custom("timestamp must be finite"));
-            }
-            let truncated = value.trunc();
-            format!("{truncated:.0}").parse::<i64>().map_err(E::custom)
-        }
-    }
-
-    deserializer.deserialize_any(TimestampVisitor)
-}
-
 fn temporary_sibling(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
@@ -217,44 +176,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_warp_pool_proxy_state_is_accepted() -> Result<()> {
+    fn pool_state_round_trip_resets_process_ids() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.json");
-        fs::write(
-            &path,
-            br#"{
-              "phase":"locked",
-              "started_at":123.5,
-              "seen_v4":["104.16.1.2"],
-              "proxies":[{
-                "addr":"2001:db8::1:2",
-                "group":0,
-                "slot":3,
-                "registered":true,
-                "locked":true,
-                "v6":"2001:db8::1:2",
-                "v4":"104.16.1.2",
-                "pid":4242,
-                "last_keepalive":123.0,
-                "port":20003
-              }]
-            }"#,
-        )?;
-        let state = PoolState::load(&path)?;
-        assert_eq!(state.phase, "locked");
-        assert_eq!(state.proxies.len(), 1);
-        assert_eq!(state.started_at, 123);
-        assert_eq!(state.proxies[0].last_keepalive, 123);
-        assert_eq!(state.proxies[0].pid, 0);
-        assert!(state.proxies[0].locked);
+        let mut state = PoolState {
+            started_at: 123,
+            ..PoolState::default()
+        };
+        state.phase = "locked".to_string();
+        state.proxies.push(ProxyRecord {
+            addr: "2001:db8::1:2".to_string(),
+            group: 0,
+            slot: 3,
+            registered: true,
+            locked: true,
+            v6: "2001:db8::1:2".to_string(),
+            v4: "104.16.1.2".to_string(),
+            pid: 4242,
+            last_keepalive: 123,
+        });
+        state.save(&path)?;
+
+        let loaded = PoolState::load(&path)?;
+        assert_eq!(loaded.phase, "locked");
+        assert_eq!(loaded.started_at, 123);
+        assert_eq!(loaded.proxies.len(), 1);
+        assert_eq!(loaded.proxies[0].last_keepalive, 123);
+        assert_eq!(loaded.proxies[0].pid, 0);
+        assert!(loaded.proxies[0].locked);
         Ok(())
     }
 
     #[test]
-    fn identity_layout_matches_legacy_pool() {
+    fn identity_layout_is_stable() {
         assert_eq!(
-            identity_config_path(Path::new("/opt/warp-pool"), 2, 7),
-            PathBuf::from("/opt/warp-pool/identities/group-2/slot-7/config.json")
+            identity_config_path(Path::new("/var/lib/usque-pool"), 2, 7),
+            PathBuf::from("/var/lib/usque-pool/identities/group-2/slot-7/config.json")
         );
     }
 }

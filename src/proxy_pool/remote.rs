@@ -718,7 +718,7 @@ fn parse_prefix64(value: &str) -> Result<Prefix64> {
 fn compose_address(prefix: Prefix64, suffix: &str) -> Result<Ipv6Addr> {
     let suffix_address: Ipv6Addr = format!("::{suffix}")
         .parse()
-        .with_context(|| format!("invalid legacy pool suffix {suffix:?}"))?;
+        .with_context(|| format!("invalid pool suffix {suffix:?}"))?;
     let suffix_segments = suffix_address.segments();
     Ok(Ipv6Addr::new(
         prefix.segments[0],
@@ -956,7 +956,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_suffix_composes_inside_prefix() -> Result<()> {
+    fn suffix_composes_inside_prefix() -> Result<()> {
         let prefix = parse_prefix64("2001:db8:1234:5678::/64")?;
         assert_eq!(
             compose_address(prefix, "abcd:1234")?,
