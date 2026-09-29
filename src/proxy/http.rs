@@ -38,8 +38,14 @@ pub async fn serve(config: HttpConfig, net: Arc<VirtualNet>) -> Result<()> {
     let listener = TcpListener::bind(config.bind).await?;
     log::info!("HTTP proxy listening on {}", config.bind);
 
+    let closed = net.wait_closed();
+    tokio::pin!(closed);
+
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            result = listener.accept() => result?,
+            () = &mut closed => anyhow::bail!("userspace WARP network stopped"),
+        };
         let net = net.clone();
         let expected_auth = expected_auth.clone();
         tokio::spawn(async move {
@@ -228,9 +234,10 @@ fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), 
     }
 }
 
-fn rewrite_for_origin(request: &mut Request<Incoming>) -> Result<(), &'static str> {
-    let uri = request.uri();
-    let path_and_query = uri
+fn rewrite_for_origin<B>(request: &mut Request<B>) -> Result<(), &'static str> {
+    let authority = request.uri().authority().cloned();
+    let path_and_query = request
+        .uri()
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
@@ -238,6 +245,12 @@ fn rewrite_for_origin(request: &mut Request<Incoming>) -> Result<(), &'static st
         .parse()
         .map_err(|_| "invalid origin-form request URI")?;
     *request.uri_mut() = origin_uri;
+
+    if let Some(authority) = authority {
+        let host = HeaderValue::from_str(authority.as_str())
+            .map_err(|_| "invalid proxy request authority")?;
+        request.headers_mut().insert(HOST, host);
+    }
     Ok(())
 }
 
@@ -298,6 +311,62 @@ fn text_response(status: StatusCode, message: &'static str) -> Response<ProxyBod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_form_request_rewrites_host_for_origin() {
+        let mut request = Request::builder()
+            .uri("http://example.com:8080/path?q=1")
+            .header(HOST, "wrong.example")
+            .body(())
+            .expect("valid test request");
+
+        rewrite_for_origin(&mut request).expect("absolute-form rewrite succeeds");
+
+        assert_eq!(request.uri(), "/path?q=1");
+        assert_eq!(
+            request.headers().get(HOST),
+            Some(&HeaderValue::from_static("example.com:8080"))
+        );
+    }
+
+    #[test]
+    fn origin_form_request_keeps_existing_host() {
+        let mut request = Request::builder()
+            .uri("/path")
+            .header(HOST, "example.com")
+            .body(())
+            .expect("valid test request");
+
+        rewrite_for_origin(&mut request).expect("origin-form rewrite succeeds");
+
+        assert_eq!(request.uri(), "/path");
+        assert_eq!(
+            request.headers().get(HOST),
+            Some(&HeaderValue::from_static("example.com"))
+        );
+    }
+
+    #[test]
+    fn strips_connection_named_hop_by_hop_headers() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            CONNECTION,
+            HeaderValue::from_static("x-private, keep-alive"),
+        );
+        headers.insert("x-private", HeaderValue::from_static("secret"));
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("x-end-to-end", HeaderValue::from_static("keep"));
+
+        strip_hop_by_hop(&mut headers);
+
+        assert!(!headers.contains_key(CONNECTION));
+        assert!(!headers.contains_key("x-private"));
+        assert!(!headers.contains_key("keep-alive"));
+        assert_eq!(
+            headers.get("x-end-to-end"),
+            Some(&HeaderValue::from_static("keep"))
+        );
+    }
 
     #[test]
     fn parses_domain_and_ipv6_authorities() {

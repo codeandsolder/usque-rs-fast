@@ -17,8 +17,14 @@ pub async fn serve(config: SocksConfig, net: Arc<VirtualNet>) -> Result<()> {
     let listener = TcpListener::bind(config.bind).await?;
     log::info!("SOCKS5/SOCKS5h proxy listening on {}", config.bind);
 
+    let closed = net.wait_closed();
+    tokio::pin!(closed);
+
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            result = listener.accept() => result?,
+            () = &mut closed => anyhow::bail!("userspace WARP network stopped"),
+        };
         let net = net.clone();
         let username = config.username.clone();
         let password = config.password.clone();

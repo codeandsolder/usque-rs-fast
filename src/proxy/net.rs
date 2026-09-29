@@ -14,14 +14,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 const TCP_BUFFER_SIZE: usize = 256 * 1024;
 const FIRST_EPHEMERAL_PORT: u16 = 49_152;
@@ -40,6 +40,8 @@ pub struct VirtualNet {
 struct Shared {
     inner: Mutex<Stack>,
     activity: Notify,
+    closed: AtomicBool,
+    closed_tx: watch::Sender<bool>,
     next_port: AtomicU16,
     local_v4: Option<Ipv4Addr>,
     local_v6: Option<Ipv6Addr>,
@@ -69,6 +71,29 @@ fn lock_stack(shared: &Shared) -> std::sync::MutexGuard<'_, Stack> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+impl Shared {
+    fn shutdown(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.closed_tx.send_replace(true);
+
+        let mut inner = lock_stack(self);
+        for (_, socket) in inner.sockets.iter_mut() {
+            if let smoltcp::socket::Socket::Tcp(socket) = socket {
+                socket.abort();
+            }
+        }
+    }
+
+    fn closed_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "userspace network reactor is closed",
+        )
+    }
+}
+
 impl PacketDevice {
     fn new(mtu: usize) -> Self {
         let mut caps = DeviceCapabilities::default();
@@ -86,8 +111,8 @@ impl PacketDevice {
         self.rx.push_back(packet);
     }
 
-    fn take_tx(&mut self) -> VecDeque<Bytes> {
-        std::mem::take(&mut self.tx)
+    fn drain_tx(&mut self, out: &mut Vec<Bytes>) {
+        out.extend(self.tx.drain(..));
     }
 }
 
@@ -176,6 +201,7 @@ impl Stack {
 
 impl Drop for VirtualNet {
     fn drop(&mut self) {
+        self.shared.shutdown();
         self.reactor.abort();
     }
 }
@@ -235,6 +261,7 @@ impl VirtualNet {
                 })?;
         }
 
+        let (closed_tx, _) = watch::channel(false);
         let shared = Arc::new(Shared {
             inner: Mutex::new(Stack {
                 iface,
@@ -243,13 +270,17 @@ impl VirtualNet {
                 retired: Vec::new(),
             }),
             activity: Notify::new(),
+            closed: AtomicBool::new(false),
+            closed_tx,
             next_port: AtomicU16::new(FIRST_EPHEMERAL_PORT),
             local_v4,
             local_v6,
         });
         let reactor_shared = shared.clone();
         let reactor = tokio::spawn(async move {
-            if let Err(error) = run_reactor(packet_stream, reactor_shared).await {
+            let result = run_reactor(packet_stream, reactor_shared.clone()).await;
+            reactor_shared.shutdown();
+            if let Err(error) = result {
                 log::error!("userspace proxy stack stopped: {error}");
             }
         });
@@ -259,6 +290,14 @@ impl VirtualNet {
         });
 
         Ok(net)
+    }
+
+    pub async fn wait_closed(&self) {
+        let mut closed = self.shared.closed_tx.subscribe();
+        if *closed.borrow() {
+            return;
+        }
+        let _ = closed.wait_for(|is_closed| *is_closed).await;
     }
 
     pub async fn dial_host(
@@ -298,6 +337,9 @@ impl VirtualNet {
 
         let handle = {
             let mut inner = lock_stack(&self.shared);
+            if self.shared.closed.load(Ordering::Acquire) {
+                return Err(Shared::closed_error());
+            }
             let local_port = self.allocate_port(&inner)?;
             let rx = tcp::SocketBuffer::new(vec![0_u8; TCP_BUFFER_SIZE]);
             let tx = tcp::SocketBuffer::new(vec![0_u8; TCP_BUFFER_SIZE]);
@@ -319,6 +361,9 @@ impl VirtualNet {
         tokio::time::timeout(
             TCP_CONNECT_TIMEOUT,
             poll_fn(|cx| {
+                if self.shared.closed.load(Ordering::Acquire) {
+                    return Poll::Ready(Err(Shared::closed_error()));
+                }
                 let mut inner = lock_stack(&self.shared);
                 let socket = inner.sockets.get_mut::<tcp::Socket>(handle);
                 match socket.state() {
@@ -390,6 +435,9 @@ impl VirtualNet {
 
         let socket_handle = {
             let mut inner = lock_stack(&self.shared);
+            if self.shared.closed.load(Ordering::Acquire) {
+                return Err(Shared::closed_error());
+            }
             inner.sockets.add(dns::Socket::new(&servers, vec![None; 1]))
         };
         let _socket_guard = DnsSocketGuard {
@@ -478,6 +526,8 @@ impl VirtualNet {
 }
 
 async fn run_reactor(mut packet_stream: MasquePacketStream, shared: Arc<Shared>) -> io::Result<()> {
+    let mut outbound = Vec::with_capacity(64);
+
     loop {
         tokio::select! {
             packet = packet_stream.next() => {
@@ -494,14 +544,17 @@ async fn run_reactor(mut packet_stream: MasquePacketStream, shared: Arc<Shared>)
             () = tokio::time::sleep(REACTOR_TICK) => {}
         }
 
-        let outbound = {
+        {
             let mut inner = lock_stack(&shared);
             inner.poll();
-            inner.device.take_tx()
-        };
+            inner.device.drain_tx(&mut outbound);
+        }
 
-        for packet in outbound {
-            packet_stream.send(packet).await?;
+        if !outbound.is_empty() {
+            for packet in outbound.drain(..) {
+                packet_stream.feed(packet).await?;
+            }
+            packet_stream.flush().await?;
         }
     }
 }
@@ -517,6 +570,9 @@ impl AsyncRead for VirtualTcpStream {
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(Shared::closed_error()));
+        }
         let Some(handle) = self.handle else {
             return Poll::Ready(Ok(()));
         };
@@ -551,6 +607,9 @@ impl AsyncWrite for VirtualTcpStream {
         cx: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(Shared::closed_error()));
+        }
         let Some(handle) = self.handle else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -578,6 +637,9 @@ impl AsyncWrite for VirtualTcpStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(Shared::closed_error()));
+        }
         let Some(handle) = self.handle else {
             return Poll::Ready(Ok(()));
         };
