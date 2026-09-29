@@ -64,6 +64,27 @@ struct PacketRxToken(Bytes);
 
 struct PacketTxToken<'a>(&'a mut VecDeque<Bytes>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DnsFamilyPlan {
+    DualStack,
+    Ipv4Only,
+    Ipv6Only,
+    None,
+}
+
+fn dns_family_plan(local_v4: Option<Ipv4Addr>, local_v6: Option<Ipv6Addr>) -> DnsFamilyPlan {
+    match (local_v4.is_some(), local_v6.is_some()) {
+        (true, true) => DnsFamilyPlan::DualStack,
+        (true, false) => DnsFamilyPlan::Ipv4Only,
+        (false, true) => DnsFamilyPlan::Ipv6Only,
+        (false, false) => DnsFamilyPlan::None,
+    }
+}
+
+fn should_reap_retired(state: tcp::State, age: Duration) -> bool {
+    state == tcp::State::Closed || age >= RETIRED_SOCKET_GRACE
+}
+
 fn lock_stack(shared: &Shared) -> std::sync::MutexGuard<'_, Stack> {
     shared
         .inner
@@ -187,9 +208,8 @@ impl Stack {
         let mut index = 0;
         while index < self.retired.len() {
             let (handle, retired_at) = self.retired[index];
-            let finished = !self.sockets.get::<tcp::Socket>(handle).is_open();
-
-            if finished || now.duration_since(retired_at) >= RETIRED_SOCKET_GRACE {
+            let state = self.sockets.get::<tcp::Socket>(handle).state();
+            if should_reap_retired(state, now.duration_since(retired_at)) {
                 let _ = self.sockets.remove(handle);
                 self.retired.swap_remove(index);
             } else {
@@ -396,10 +416,26 @@ impl VirtualNet {
     }
 
     pub async fn resolve_all(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        let (v6, v4) = tokio::join!(
-            self.resolve_type(host, DnsQueryType::Aaaa),
-            self.resolve_type(host, DnsQueryType::A)
-        );
+        let (v6, v4) = match dns_family_plan(self.shared.local_v4, self.shared.local_v6) {
+            DnsFamilyPlan::DualStack => tokio::join!(
+                self.resolve_type(host, DnsQueryType::Aaaa),
+                self.resolve_type(host, DnsQueryType::A)
+            ),
+            DnsFamilyPlan::Ipv6Only => (
+                self.resolve_type(host, DnsQueryType::Aaaa).await,
+                Ok(Vec::new()),
+            ),
+            DnsFamilyPlan::Ipv4Only => (
+                Ok(Vec::new()),
+                self.resolve_type(host, DnsQueryType::A).await,
+            ),
+            DnsFamilyPlan::None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "no WARP address family available for DNS",
+                ));
+            }
+        };
 
         let mut addresses = Vec::new();
         if let Ok(v6) = v6 {
@@ -587,6 +623,8 @@ impl AsyncRead for VirtualTcpStream {
             return match socket.recv_slice(target) {
                 Ok(read) => {
                     buffer.advance(read);
+                    drop(inner);
+                    self.shared.activity.notify_one();
                     Poll::Ready(Ok(()))
                 }
                 Err(tcp::RecvError::Finished) => Poll::Ready(Ok(())),
@@ -638,24 +676,11 @@ impl AsyncWrite for VirtualTcpStream {
         Poll::Pending
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Poll::Ready(Err(Shared::closed_error()));
         }
-        let Some(handle) = self.handle else {
-            return Poll::Ready(Ok(()));
-        };
-
-        let mut inner = lock_stack(&self.shared);
-        let socket = inner.sockets.get_mut::<tcp::Socket>(handle);
-        if socket.send_queue() == 0 {
-            Poll::Ready(Ok(()))
-        } else {
-            socket.register_send_waker(cx.waker());
-            drop(inner);
-            self.shared.activity.notify_one();
-            Poll::Pending
-        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -721,4 +746,33 @@ fn seed() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     now.as_nanos() as u64 ^ u64::from(std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_family_plan_matches_enabled_warp_addresses() {
+        let v4 = Some(Ipv4Addr::new(172, 16, 0, 2));
+        let v6 = Some(Ipv6Addr::LOCALHOST);
+
+        assert_eq!(dns_family_plan(v4, v6), DnsFamilyPlan::DualStack);
+        assert_eq!(dns_family_plan(v4, None), DnsFamilyPlan::Ipv4Only);
+        assert_eq!(dns_family_plan(None, v6), DnsFamilyPlan::Ipv6Only);
+        assert_eq!(dns_family_plan(None, None), DnsFamilyPlan::None);
+    }
+
+    #[test]
+    fn time_wait_is_retained_until_grace_expires() {
+        assert!(should_reap_retired(tcp::State::Closed, Duration::ZERO));
+        assert!(!should_reap_retired(
+            tcp::State::TimeWait,
+            RETIRED_SOCKET_GRACE - Duration::from_millis(1)
+        ));
+        assert!(should_reap_retired(
+            tcp::State::TimeWait,
+            RETIRED_SOCKET_GRACE
+        ));
+    }
 }
