@@ -99,7 +99,7 @@ enum Commands {
         jwt: Option<String>,
         // Kept as a hidden no-op for CLI compatibility. Registering already
         // implies consent, so unattended registration must not prompt.
-        #[arg(long = "accept-tos", hide = true)]
+        #[arg(short = 'a', long = "accept-tos", hide = true)]
         accept_tos: bool,
     },
     /// Expose WARP as a native TUN device
@@ -134,6 +134,10 @@ enum Commands {
         username: Option<String>,
         #[arg(short = 'w', long)]
         password: Option<String>,
+        // Legacy Go/Python launcher compatibility. Rust proxy sessions
+        // reconnect on demand, so there is no separate always-reconnect mode.
+        #[arg(long, hide = true)]
+        always_reconnect: bool,
         #[command(flatten)]
         transport: ProxyTransportArgs,
     },
@@ -240,6 +244,7 @@ async fn main() -> Result<()> {
             port,
             username,
             password,
+            always_reconnect: _,
             transport,
         } => cmd_socks(&cli.config, bind, port, username, password, &transport).await,
         Commands::HttpProxy {
@@ -492,10 +497,10 @@ async fn cmd_pool_remote(options: RemoteCommandOptions) -> Result<()> {
     let legacy = load_legacy_pool_config(&pool_config)?;
 
     if prefixes.is_empty() {
-        if !legacy.prefixes.is_empty() {
-            prefixes = legacy.prefixes;
-        } else {
+        if legacy.prefixes.is_empty() {
             prefixes = csv_env("PREFIXES_CSV");
+        } else {
+            prefixes = legacy.prefixes;
         }
     }
 
@@ -677,11 +682,53 @@ mod tests {
         else {
             anyhow::bail!("expected remote pool command");
         };
-        assert!(prefixes.is_empty());
+        assert_eq!(prefixes, Vec::<String>::new());
         assert_eq!(slots_per_prefix, 10);
         assert_eq!(base_port, 20_000);
         assert!(orchestrator_url.is_none());
         assert_eq!(pool_config, PathBuf::from("/etc/warp-pool/config.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_warpproxy_cli_flags_are_accepted() -> Result<()> {
+        let register = Cli::try_parse_from(["usque-rs", "register", "-a", "-n", "g0-s0"])?;
+        let Commands::Register {
+            name, accept_tos, ..
+        } = register.command
+        else {
+            anyhow::bail!("expected register command");
+        };
+        assert_eq!(name.as_deref(), Some("g0-s0"));
+        assert!(accept_tos);
+
+        let socks = Cli::try_parse_from([
+            "usque-rs",
+            "socks",
+            "-b",
+            "::1",
+            "-p",
+            "20000",
+            "-u",
+            "warp",
+            "-w",
+            "secret",
+            "--source-ip",
+            "::1",
+            "--always-reconnect",
+            "--ipv6",
+        ])?;
+        let Commands::Socks {
+            always_reconnect,
+            transport,
+            ..
+        } = socks.command
+        else {
+            anyhow::bail!("expected SOCKS command");
+        };
+        assert!(always_reconnect);
+        assert_eq!(transport.source_ip, Some("::1".parse()?));
+        assert!(transport.ipv6);
         Ok(())
     }
 
