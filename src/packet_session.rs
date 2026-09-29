@@ -6,7 +6,7 @@ use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use std::collections::VecDeque;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -99,8 +99,8 @@ impl MasquePacketStream {
             session_cfg
                 .bind
                 .unwrap_or_else(|| match session_cfg.endpoint {
-                    SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-                    SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+                    SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                    SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
                 });
 
         let socket = bind_udp_socket(bind_addr, "masque-packet-stream")?;
@@ -185,7 +185,7 @@ impl MasquePacketStream {
             socket,
             conn,
             h3_conn,
-            flow_prefix: build_flow_prefix(flow_id),
+            flow_prefix: build_flow_prefix(flow_id)?,
             outbound_queue: VecDeque::new(),
             inbound_queue: VecDeque::new(),
             out,
@@ -374,7 +374,11 @@ impl MasquePacketStream {
                 self.reset_timeout();
             }
 
-            let pending = self.pending_send.as_ref().unwrap();
+            let Some(pending) = self.pending_send.as_ref() else {
+                return Poll::Ready(Err(io::Error::other(
+                    "internal error: pending UDP send missing after initialization",
+                )));
+            };
             if pending.to != self.endpoint {
                 return Poll::Ready(Err(io::Error::other(format!(
                     "unexpected QUIC send target {} (expected {})",
@@ -788,17 +792,19 @@ fn build_flow_datagram(flow_prefix: &[u8], packet: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn build_flow_prefix(flow_id: u64) -> Vec<u8> {
+fn build_flow_prefix(flow_id: u64) -> Result<Vec<u8>> {
     let mut prefix = Vec::with_capacity(16);
     let mut tmp = [0u8; 8];
     let len = {
         let mut builder = octets::OctetsMut::with_slice(&mut tmp);
-        builder.put_varint(flow_id).unwrap();
+        builder
+            .put_varint(flow_id)
+            .map_err(|error| anyhow::anyhow!("flow ID does not fit a QUIC varint: {error}"))?;
         builder.off()
     };
     prefix.extend_from_slice(&tmp[..len]);
     prefix.push(0x00);
-    prefix
+    Ok(prefix)
 }
 
 fn parse_datagram_offset(dgram: &[u8], expected_flow_id: u64) -> Option<usize> {
@@ -846,7 +852,7 @@ mod tests {
 
     #[test]
     fn build_flow_datagram_prepares_ttl() {
-        let flow_prefix = build_flow_prefix(0);
+        let flow_prefix = build_flow_prefix(0).expect("test flow ID fits QUIC varint");
         let packet = Bytes::from_static(&[
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 64, 0x11, 0x00, 0x00, 10, 0, 0, 1, 10,
             0, 0, 2,
