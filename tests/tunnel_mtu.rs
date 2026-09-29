@@ -5,7 +5,7 @@
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 
-fn low_u16(value: u32) -> u16 {
+const fn low_u16(value: u32) -> u16 {
     let bytes = value.to_be_bytes();
     u16::from_be_bytes([bytes[2], bytes[3]])
 }
