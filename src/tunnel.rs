@@ -3,7 +3,7 @@ use datagram_socket::DatagramSocketRecvExt;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -239,8 +239,8 @@ async fn run_tunnel_session(
     let mut quic_config = tls::build_quic_config(&tls_material, MAX_DATAGRAM_SIZE)?;
 
     let bind_addr: SocketAddr = match tunnel_cfg.endpoint {
-        SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-        SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
     };
 
     let mut socket = bind_udp_socket(bind_addr, "masque-native-tunnel")?;
@@ -439,7 +439,8 @@ async fn run_tunnel_session(
     {
         let mut tmp = [0u8; 8];
         let mut b = octets::OctetsMut::with_slice(&mut tmp);
-        b.put_varint(flow_id).unwrap();
+        b.put_varint(flow_id)
+            .map_err(|error| anyhow::anyhow!("flow ID does not fit a QUIC varint: {error}"))?;
         let len = b.off();
         flow_prefix.extend_from_slice(&tmp[..len]);
     }
