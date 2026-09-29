@@ -246,26 +246,90 @@ pub async fn maintain_tunnel(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "single QUIC/TUN event loop keeps transport state and select branches co-located"
-)]
-async fn run_tunnel_session(
-    config: &Config,
-    tunnel_cfg: &TunnelConfig,
-    tun_dev: &tun_rs::AsyncDevice,
-    pending_packets: &mut VecDeque<Vec<u8>>,
-) -> Result<()> {
+struct NativeQuic {
+    socket: tokio::net::UdpSocket,
+    conn: quiche::Connection,
+    out: Vec<u8>,
+    buf: Vec<u8>,
+    local_addr: SocketAddr,
+    endpoint: SocketAddr,
+    udp_gso: bool,
+}
+
+struct NativeSession {
+    quic: NativeQuic,
+    h3_conn: quiche::h3::Connection,
+    flow_id: u64,
+}
+
+struct ForwardBuffers {
+    tun_raw: Vec<u8>,
+    tun_packets: Vec<Vec<u8>>,
+    tun_sizes: Vec<usize>,
+    gro_table: GROTable,
+    inbound_packets: Vec<Vec<u8>>,
+    icmp_packet: Vec<Vec<u8>>,
+}
+
+impl ForwardBuffers {
+    fn new(packet_capacity: usize) -> Self {
+        Self {
+            tun_raw: vec![0u8; VIRTIO_NET_HDR_LEN + 65_535],
+            tun_packets: vec![vec![0u8; packet_capacity]; IDEAL_BATCH_SIZE],
+            tun_sizes: vec![0usize; IDEAL_BATCH_SIZE],
+            gro_table: GROTable::default(),
+            inbound_packets: (0..IDEAL_BATCH_SIZE)
+                .map(|_| Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet_capacity))
+                .collect(),
+            icmp_packet: vec![Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet_capacity)],
+        }
+    }
+}
+
+struct TunnelStats {
+    session_start: Instant,
+    tx_packets: u64,
+    rx_packets: u64,
+    tx_bytes: u64,
+    rx_bytes: u64,
+    dropped: u64,
+}
+
+impl TunnelStats {
+    fn new() -> Self {
+        Self {
+            session_start: Instant::now(),
+            tx_packets: 0,
+            rx_packets: 0,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            dropped: 0,
+        }
+    }
+
+    fn print(&self, conn: &quiche::Connection) {
+        let qs = conn.stats();
+        let connected_for = format_duration(self.session_start.elapsed());
+        let tx_size = format_bytes(self.tx_bytes);
+        let rx_size = format_bytes(self.rx_bytes);
+        let lost = qs.lost;
+        let retrans = qs.retrans;
+        eprint!(
+            "\r\x1b[2K[connected {connected_for}] tx: {} ({tx_size})  rx: {} ({rx_size})  drop: {}  lost: {lost}  retrans: {retrans}",
+            self.tx_packets, self.rx_packets, self.dropped
+        );
+    }
+}
+
+async fn open_native_quic(config: &Config, tunnel_cfg: &TunnelConfig) -> Result<NativeQuic> {
     let tls_material = tls::prepare_tls_material(config)?;
-
     let mut quic_config = tls::build_quic_config(&tls_material, MAX_DATAGRAM_SIZE)?;
-
-    let bind_addr: SocketAddr = match tunnel_cfg.endpoint {
+    let bind_addr = match tunnel_cfg.endpoint {
         SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
     };
 
-    let mut socket = bind_udp_socket(bind_addr, "masque-native-tunnel")?;
+    let socket = bind_udp_socket(bind_addr, "masque-native-tunnel")?;
     socket.connect(tunnel_cfg.endpoint).await?;
     let local_addr = socket.local_addr()?;
     let udp_gso = detect_udp_gso(&socket, MAX_DATAGRAM_SIZE);
@@ -276,8 +340,7 @@ async fn run_tunnel_session(
         .fill(&mut scid)
         .map_err(|_| anyhow::anyhow!("RNG failure"))?;
     let scid = quiche::ConnectionId::from_ref(&scid);
-
-    let mut conn = quiche::connect(
+    let conn = quiche::connect(
         Some(&tunnel_cfg.sni),
         &scid,
         local_addr,
@@ -286,70 +349,61 @@ async fn run_tunnel_session(
     )
     .map_err(|e| anyhow::anyhow!("quiche connect: {e}"))?;
 
-    let mut out = vec![0u8; MAX_UDP_BATCH_BYTES];
-    let mut buf = vec![0u8; 65535];
+    let mut quic = NativeQuic {
+        socket,
+        conn,
+        out: vec![0u8; MAX_UDP_BATCH_BYTES],
+        buf: vec![0u8; 65_535],
+        local_addr,
+        endpoint: tunnel_cfg.endpoint,
+        udp_gso,
+    };
+    flush_quic_packets(&mut quic.conn, &quic.socket, &mut quic.out, false).await?;
+    complete_native_handshake(&mut quic).await?;
 
-    let (write, send_info) = conn
-        .send(&mut out)
-        .map_err(|e| anyhow::anyhow!("initial send: {e}"))?;
-    socket.send_to(&out[..write], send_info.to).await?;
-
-    // Complete handshake
-    loop {
-        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
-
-        tokio::select! {
-            result = socket.recv(&mut buf) => {
-                let len = result?;
-                let recv_info = quiche::RecvInfo {
-                    to: local_addr,
-                    from: tunnel_cfg.endpoint,
-                };
-                if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
-                log::debug!("dropping UDP packet rejected by QUIC: {error}");
-            }
-            }
-            () = tokio::time::sleep(timeout) => {
-                conn.on_timeout();
-            }
-        }
-
-        loop {
-            match conn.send(&mut out) {
-                Ok((write, send_info)) => {
-                    socket.send_to(&out[..write], send_info.to).await?;
-                }
-                Err(quiche::Error::Done) => break,
-                Err(e) => bail!("send during handshake: {e}"),
-            }
-        }
-
-        if conn.is_established() {
-            break;
-        }
-        if conn.is_closed() {
-            bail!("connection closed during handshake");
-        }
-    }
-
-    // Verify endpoint key pinning.
-    let peer_cert = conn
+    let peer_cert = quic
+        .conn
         .peer_cert()
         .ok_or_else(|| anyhow::anyhow!("peer did not provide a certificate"))?;
     if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
         bail!("peer certificate public key does not match pinned endpoint key");
     }
     log::debug!("Endpoint key pinning verified");
+    Ok(quic)
+}
 
-    // Set up HTTP/3
-    let mut h3_config = quiche::h3::Config::new().map_err(|e| anyhow::anyhow!("h3 config: {e}"))?;
-    h3_config.enable_extended_connect(true);
+async fn complete_native_handshake(quic: &mut NativeQuic) -> Result<()> {
+    loop {
+        let timeout = quic.conn.timeout().unwrap_or(Duration::from_millis(100));
 
-    let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)
-        .map_err(|e| anyhow::anyhow!("h3 connection: {e}"))?;
+        tokio::select! {
+            result = quic.socket.recv(&mut quic.buf) => {
+                let len = result?;
+                let recv_info = quiche::RecvInfo {
+                    to: quic.local_addr,
+                    from: quic.endpoint,
+                };
+                if let Err(error) = quic.conn.recv(&mut quic.buf[..len], recv_info) {
+                    log::debug!("dropping UDP packet rejected by QUIC: {error}");
+                }
+            }
+            () = tokio::time::sleep(timeout) => {
+                quic.conn.on_timeout();
+            }
+        }
 
-    // Send CONNECT request for cf-connect-ip
-    let req = vec![
+        flush_quic_packets(&mut quic.conn, &quic.socket, &mut quic.out, false).await?;
+        if quic.conn.is_established() {
+            return Ok(());
+        }
+        if quic.conn.is_closed() {
+            bail!("connection closed during handshake");
+        }
+    }
+}
+
+fn connect_request_headers() -> Vec<quiche::h3::Header> {
+    vec![
         quiche::h3::Header::new(b":method", b"CONNECT"),
         quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
         quiche::h3::Header::new(b":scheme", b"https"),
@@ -357,329 +411,381 @@ async fn run_tunnel_session(
         quiche::h3::Header::new(b":path", b"/"),
         quiche::h3::Header::new(b"capsule-protocol", b"?1"),
         quiche::h3::Header::new(b"user-agent", b""),
-    ];
+    ]
+}
 
+async fn establish_connect_ip(mut quic: NativeQuic) -> Result<NativeSession> {
+    let mut h3_config = quiche::h3::Config::new().map_err(|e| anyhow::anyhow!("h3 config: {e}"))?;
+    h3_config.enable_extended_connect(true);
+    let mut h3_conn = quiche::h3::Connection::with_transport(&mut quic.conn, &h3_config)
+        .map_err(|e| anyhow::anyhow!("h3 connection: {e}"))?;
+
+    let request = connect_request_headers();
     let stream_id = h3_conn
-        .send_request(&mut conn, &req, false)
+        .send_request(&mut quic.conn, &request, false)
         .map_err(|e| anyhow::anyhow!("send CONNECT request: {e}"))?;
-
     let flow_id = stream_id / 4;
     log::debug!("CONNECT request sent on stream {stream_id}, flow_id={flow_id}");
 
-    loop {
-        match conn.send(&mut out) {
-            Ok((write, send_info)) => {
-                socket.send_to(&out[..write], send_info.to).await?;
-            }
-            Err(quiche::Error::Done) => break,
-            Err(e) => bail!("send after CONNECT: {e}"),
-        }
-    }
+    flush_quic_packets(&mut quic.conn, &quic.socket, &mut quic.out, false).await?;
+    wait_for_connect_response(&mut quic, &mut h3_conn, stream_id).await?;
 
-    // Wait for 2xx
-    let mut connect_established = false;
+    Ok(NativeSession {
+        quic,
+        h3_conn,
+        flow_id,
+    })
+}
+
+async fn wait_for_connect_response(
+    quic: &mut NativeQuic,
+    h3_conn: &mut quiche::h3::Connection,
+    stream_id: u64,
+) -> Result<()> {
     for _ in 0..100 {
-        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
+        let timeout = quic.conn.timeout().unwrap_or(Duration::from_millis(100));
 
         tokio::select! {
-            result = socket.recv(&mut buf) => {
+            result = quic.socket.recv(&mut quic.buf) => {
                 let len = result?;
                 let recv_info = quiche::RecvInfo {
-                    to: local_addr,
-                    from: tunnel_cfg.endpoint,
+                    to: quic.local_addr,
+                    from: quic.endpoint,
                 };
-                if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
-                log::debug!("dropping UDP packet rejected by QUIC: {error}");
-            }
+                if let Err(error) = quic.conn.recv(&mut quic.buf[..len], recv_info) {
+                    log::debug!("dropping UDP packet rejected by QUIC: {error}");
+                }
             }
             () = tokio::time::sleep(timeout) => {
-                conn.on_timeout();
+                quic.conn.on_timeout();
             }
         }
 
-        loop {
-            match h3_conn.poll(&mut conn) {
-                Ok((response_stream_id, quiche::h3::Event::Headers { list, .. }))
-                    if response_stream_id == stream_id =>
-                {
-                    for h in &list {
-                        if h.name() == b":status" {
-                            let status = std::str::from_utf8(h.value()).unwrap_or("?");
-                            log::debug!("CONNECT response status: {status}");
-                            if status.starts_with('2') {
-                                connect_established = true;
-                            } else {
-                                bail!("CONNECT rejected with status {status}");
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => break,
-                Err(e) => bail!("h3 poll error: {e}"),
-            }
+        let established = connect_response_ready(h3_conn, &mut quic.conn, stream_id)?;
+        flush_quic_packets(&mut quic.conn, &quic.socket, &mut quic.out, false).await?;
+        if established {
+            return Ok(());
         }
-
-        // Flush
-        loop {
-            match conn.send(&mut out) {
-                Ok((write, send_info)) => {
-                    socket.send_to(&out[..write], send_info.to).await?;
-                }
-                Err(quiche::Error::Done) => break,
-                Err(e) => bail!("send during CONNECT wait: {e}"),
-            }
-        }
-
-        if connect_established {
-            break;
-        }
-        if conn.is_closed() {
+        if quic.conn.is_closed() {
             bail!("connection closed before CONNECT response");
         }
     }
 
-    if !connect_established {
-        bail!("timed out waiting for CONNECT response");
+    bail!("timed out waiting for CONNECT response")
+}
+
+fn connect_response_ready(
+    h3_conn: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+) -> Result<bool> {
+    loop {
+        match h3_conn.poll(conn) {
+            Ok((response_stream_id, quiche::h3::Event::Headers { list, .. }))
+                if response_stream_id == stream_id =>
+            {
+                for header in &list {
+                    if header.name() == b":status" {
+                        let status = std::str::from_utf8(header.value()).unwrap_or("?");
+                        log::debug!("CONNECT response status: {status}");
+                        if status.starts_with('2') {
+                            return Ok(true);
+                        }
+                        bail!("CONNECT rejected with status {status}");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(quiche::h3::Error::Done) => return Ok(false),
+            Err(e) => bail!("h3 poll error: {e}"),
+        }
     }
+}
 
-    eprintln!("\r\x1b[2K[connected] MASQUE tunnel established");
+fn build_flow_prefix(flow_id: u64) -> Result<Vec<u8>> {
+    let mut prefix = Vec::with_capacity(16);
+    let mut tmp = [0u8; 8];
+    let mut buf = octets::OctetsMut::with_slice(&mut tmp);
+    buf.put_varint(flow_id)
+        .map_err(|error| anyhow::anyhow!("flow ID does not fit a QUIC varint: {error}"))?;
+    let len = buf.off();
+    prefix.extend_from_slice(&tmp[..len]);
+    prefix.push(0);
+    Ok(prefix)
+}
 
-    let session_start = Instant::now();
-    let mut tx_packets = 0u64;
-    let mut rx_packets = 0u64;
-    let mut tx_bytes = 0u64;
-    let mut rx_bytes = 0u64;
-    let mut dropped = 0u64;
+fn queue_pending_packets(
+    conn: &mut quiche::Connection,
+    flow_prefix: &[u8],
+    pending_packets: &mut VecDeque<Vec<u8>>,
+    stats: &mut TunnelStats,
+) -> Result<()> {
+    while let Some(mut packet) = pending_packets.pop_front() {
+        if packet::prepare_outgoing(&mut packet).is_err() {
+            continue;
+        }
 
-    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
-    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Tokio intervals tick immediately once; consume that initial tick so the
-    // first display update happens after one second of useful work.
-    stats_interval.tick().await;
-
-    // Build the flow_id varint prefix + context_id zero
-    let mut flow_prefix = Vec::with_capacity(16);
-    {
-        let mut tmp = [0u8; 8];
-        let mut b = octets::OctetsMut::with_slice(&mut tmp);
-        b.put_varint(flow_id)
-            .map_err(|error| anyhow::anyhow!("flow ID does not fit a QUIC varint: {error}"))?;
-        let len = b.off();
-        flow_prefix.extend_from_slice(&tmp[..len]);
+        let mut datagram = Vec::with_capacity(flow_prefix.len() + packet.len());
+        datagram.extend_from_slice(flow_prefix);
+        datagram.extend_from_slice(&packet);
+        let packet_len = u64::try_from(packet.len())
+            .map_err(|_| anyhow::anyhow!("packet length does not fit u64"))?;
+        if conn.dgram_send_buf(datagram).is_ok() {
+            stats.tx_packets += 1;
+            stats.tx_bytes += packet_len;
+        }
     }
-    flow_prefix.push(0x00);
+    Ok(())
+}
 
-    while let Some(mut pkt) = pending_packets.pop_front() {
-        if packet::prepare_outgoing(&mut pkt).is_ok() {
-            let mut dgram = Vec::with_capacity(flow_prefix.len() + pkt.len());
-            dgram.extend_from_slice(&flow_prefix);
-            dgram.extend_from_slice(&pkt);
-            let pkt_len = u64::try_from(pkt.len())
-                .map_err(|_| anyhow::anyhow!("packet length does not fit u64"))?;
-            if conn.dgram_send_buf(dgram).is_ok() {
-                tx_packets += 1;
-                tx_bytes += pkt_len;
+async fn forward_tun_batch(
+    conn: &mut quiche::Connection,
+    tun_dev: &tun_rs::AsyncDevice,
+    flow_prefix: &[u8],
+    buffers: &mut ForwardBuffers,
+    count: usize,
+    stats: &mut TunnelStats,
+) -> Result<()> {
+    for index in 0..count {
+        let packet_len = buffers.tun_sizes[index];
+        let packet = &mut buffers.tun_packets[index][..packet_len];
+        if let Err(error) = packet::prepare_outgoing(packet) {
+            stats.dropped += 1;
+            log::trace!("dropping outgoing packet: {error}");
+            continue;
+        }
+
+        let mut datagram = Vec::with_capacity(flow_prefix.len() + packet_len);
+        datagram.extend_from_slice(flow_prefix);
+        datagram.extend_from_slice(packet);
+        match conn.dgram_send_buf(datagram) {
+            Ok(()) => {
+                stats.tx_packets += 1;
+                stats.tx_bytes += u64::try_from(packet_len)
+                    .map_err(|_| anyhow::anyhow!("packet length does not fit u64"))?;
+            }
+            Err(quiche::Error::InvalidState) => {
+                log::warn!("datagram send: peer doesn't support datagrams");
+            }
+            Err(quiche::Error::Done) => {
+                stats.dropped += 1;
+                log::trace!("datagram send queue full, dropping packet");
+            }
+            Err(error) => {
+                stats.dropped += 1;
+                log::debug!("datagram send error: {error}, generating ICMP");
+                if let Some(icmp) = icmp::compose_icmp_too_large(packet, 1280) {
+                    stage_tun_packet(&mut buffers.icmp_packet[0], &icmp);
+                    send_tun_batch(tun_dev, &mut buffers.gro_table, &mut buffers.icmp_packet)
+                        .await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn drain_h3_events(h3_conn: &mut quiche::h3::Connection, conn: &mut quiche::Connection) {
+    loop {
+        match h3_conn.poll(conn) {
+            Ok(_) => {}
+            Err(quiche::h3::Error::Done) => break,
+            Err(error) => {
+                log::warn!("h3 poll error: {error}");
+                break;
+            }
+        }
+    }
+}
+
+async fn drain_inbound_datagrams(
+    conn: &mut quiche::Connection,
+    tun_dev: &tun_rs::AsyncDevice,
+    flow_id: u64,
+    buffers: &mut ForwardBuffers,
+    stats: &mut TunnelStats,
+) -> Result<()> {
+    let mut inbound_count = 0usize;
+    loop {
+        match conn.dgram_recv_buf() {
+            Ok(datagram) => {
+                let Some(ip_payload) = parse_datagram(&datagram, flow_id) else {
+                    continue;
+                };
+                if packet::validate_incoming(ip_payload).is_err() {
+                    continue;
+                }
+
+                stats.rx_packets += 1;
+                stats.rx_bytes += u64::try_from(ip_payload.len())
+                    .map_err(|_| anyhow::anyhow!("packet length does not fit u64"))?;
+                stage_tun_packet(&mut buffers.inbound_packets[inbound_count], ip_payload);
+                inbound_count += 1;
+
+                if inbound_count == buffers.inbound_packets.len() {
+                    send_tun_batch(
+                        tun_dev,
+                        &mut buffers.gro_table,
+                        &mut buffers.inbound_packets[..inbound_count],
+                    )
+                    .await?;
+                    inbound_count = 0;
+                }
+            }
+            Err(quiche::Error::Done) => break,
+            Err(error) => {
+                log::debug!("dgram recv error: {error}");
+                break;
             }
         }
     }
 
-    // Main data forwarding loop. Linux offload lets one TUN read contain a
-    // large GSO packet, which tun-rs splits into a burst of MTU-sized packets.
-    // Received CONNECT-IP packets are drained into a GRO batch before crossing
-    // back into the kernel.
-    let mtu = usize::try_from(tunnel_cfg.mtu)
-        .map_err(|_| anyhow::anyhow!("configured MTU does not fit usize"))?;
-    let packet_capacity = mtu + 128;
-    let mut tun_raw = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
-    let mut tun_packets = vec![vec![0u8; packet_capacity]; IDEAL_BATCH_SIZE];
-    let mut tun_sizes = vec![0usize; IDEAL_BATCH_SIZE];
+    if inbound_count > 0 {
+        send_tun_batch(
+            tun_dev,
+            &mut buffers.gro_table,
+            &mut buffers.inbound_packets[..inbound_count],
+        )
+        .await?;
+    }
+    Ok(())
+}
 
-    let mut gro_table = GROTable::default();
-    let mut inbound_packets = (0..IDEAL_BATCH_SIZE)
-        .map(|_| Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet_capacity))
-        .collect::<Vec<_>>();
-    let mut icmp_packet = vec![Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet_capacity)];
+fn handle_session_timeout(
+    conn: &mut quiche::Connection,
+    quic_timeout: Option<Duration>,
+    keepalive_interval: Duration,
+) -> Result<()> {
+    if quic_timeout.is_some_and(|duration| duration <= keepalive_interval) {
+        conn.on_timeout();
+    }
+    if quic_timeout.is_none_or(|duration| keepalive_interval <= duration) {
+        conn.send_ack_eliciting()
+            .map_err(|error| anyhow::anyhow!("failed to schedule QUIC keepalive: {error}"))?;
+    }
+    Ok(())
+}
 
-    let keepalive_interval = tunnel_cfg.keepalive_period;
+async fn forward_native_session(
+    session: &mut NativeSession,
+    tun_dev: &tun_rs::AsyncDevice,
+    pending_packets: &mut VecDeque<Vec<u8>>,
+    mtu: usize,
+    keepalive_interval: Duration,
+) -> Result<()> {
+    let flow_prefix = build_flow_prefix(session.flow_id)?;
+    let mut stats = TunnelStats::new();
+    queue_pending_packets(
+        &mut session.quic.conn,
+        &flow_prefix,
+        pending_packets,
+        &mut stats,
+    )?;
 
+    let mut buffers = ForwardBuffers::new(mtu + 128);
     let mut udp_recv_storage = vec![vec![0u8; MAX_DATAGRAM_SIZE]; UDP_RECV_BATCH_SIZE];
     let mut udp_recv_bufs = udp_recv_storage
         .iter_mut()
         .map(|storage| ReadBuf::new(storage.as_mut_slice()))
         .collect::<Vec<_>>();
+    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
+    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    stats_interval.tick().await;
 
-    let result: Result<()> = async {
-        loop {
-            let quic_timeout = conn.timeout();
-            let timeout = quic_timeout
-                .unwrap_or(keepalive_interval)
-                .min(keepalive_interval);
+    loop {
+        let quic_timeout = session.quic.conn.timeout();
+        let timeout = quic_timeout
+            .unwrap_or(keepalive_interval)
+            .min(keepalive_interval);
 
-            tokio::select! {
+        tokio::select! {
             biased;
-
-            // Read a batch from the QUIC UDP socket with recvmmsg().
             result = async {
                 reset_udp_read_bufs(&mut udp_recv_bufs);
-                socket.recv_many(&mut udp_recv_bufs).await
+                session.quic.socket.recv_many(&mut udp_recv_bufs).await
             } => {
                 let count = result?;
                 process_udp_batch(
-                    &mut conn,
+                    &mut session.quic.conn,
                     &mut udp_recv_bufs,
                     count,
-                    local_addr,
-                    tunnel_cfg.endpoint,
+                    session.quic.local_addr,
+                    session.quic.endpoint,
                 );
             }
-
-            // Read from TUN -> send a burst of CONNECT-IP datagrams.
-            result = tun_dev.recv_multiple(&mut tun_raw, &mut tun_packets, &mut tun_sizes, 0) => {
+            result = tun_dev.recv_multiple(
+                &mut buffers.tun_raw,
+                &mut buffers.tun_packets,
+                &mut buffers.tun_sizes,
+                0,
+            ) => {
                 let count = result
                     .map_err(|e| anyhow::anyhow!("failed to read packet batch from TUN: {e}"))?;
                 if count == 0 {
                     bail!("TUN device closed");
                 }
-
-                for i in 0..count {
-                    let n = tun_sizes[i];
-                    let pkt = &mut tun_packets[i][..n];
-                    match packet::prepare_outgoing(pkt) {
-                        Ok(_) => {
-                            let pkt_len = n as u64;
-                            let mut dgram = Vec::with_capacity(flow_prefix.len() + n);
-                            dgram.extend_from_slice(&flow_prefix);
-                            dgram.extend_from_slice(pkt);
-
-                            match conn.dgram_send_buf(dgram) {
-                                Ok(()) => {
-                                    tx_packets += 1;
-                                    tx_bytes += pkt_len;
-                                }
-                                Err(quiche::Error::InvalidState) => {
-                                    log::warn!("datagram send: peer doesn't support datagrams");
-                                }
-                                Err(quiche::Error::Done) => {
-                                    dropped += 1;
-                                    log::trace!("datagram send queue full, dropping packet");
-                                }
-                                Err(e) => {
-                                    dropped += 1;
-                                    log::debug!("datagram send error: {e}, generating ICMP");
-                                    if let Some(icmp) = icmp::compose_icmp_too_large(pkt, 1280) {
-                                        stage_tun_packet(&mut icmp_packet[0], &icmp);
-                                        send_tun_batch(tun_dev, &mut gro_table, &mut icmp_packet).await?;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            dropped += 1;
-                            log::trace!("dropping outgoing packet: {e}");
-                        }
-                    }
-                }
+                forward_tun_batch(
+                    &mut session.quic.conn,
+                    tun_dev,
+                    &flow_prefix,
+                    &mut buffers,
+                    count,
+                    &mut stats,
+                ).await?;
             }
-
-            // QUIC loss-recovery timeout and idle keepalive share the wakeup.
             () = tokio::time::sleep(timeout) => {
-                if quic_timeout.is_some_and(|duration| duration <= keepalive_interval) {
-                    conn.on_timeout();
-                }
-                if quic_timeout.is_none_or(|duration| keepalive_interval <= duration) {
-                    conn.send_ack_eliciting()
-                        .map_err(|error| anyhow::anyhow!("failed to schedule QUIC keepalive: {error}"))?;
-                }
+                handle_session_timeout(
+                    &mut session.quic.conn,
+                    quic_timeout,
+                    keepalive_interval,
+                )?;
             }
-
-            // Status is sampled once per second instead of maintaining shared
-            // atomics and querying QUIC stats on every packet/event.
-            _ = stats_interval.tick() => {
-                let qs = conn.stats();
-                let connected_for = format_duration(session_start.elapsed());
-                let tx_size = format_bytes(tx_bytes);
-                let rx_size = format_bytes(rx_bytes);
-                let lost = qs.lost;
-                let retrans = qs.retrans;
-                eprint!(
-                    "\r\x1b[2K[connected {connected_for}] tx: {tx_packets} ({tx_size})  rx: {rx_packets} ({rx_size})  drop: {dropped}  lost: {lost}  retrans: {retrans}"
-                );
-            }
+            _ = stats_interval.tick() => stats.print(&session.quic.conn),
         }
 
-        // Process H3 events (capsules, etc.)
-        loop {
-            match h3_conn.poll(&mut conn) {
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => break,
-                Err(e) => {
-                    log::warn!("h3 poll error: {e}");
-                    break;
-                }
-            }
-        }
+        drain_h3_events(&mut session.h3_conn, &mut session.quic.conn);
+        drain_inbound_datagrams(
+            &mut session.quic.conn,
+            tun_dev,
+            session.flow_id,
+            &mut buffers,
+            &mut stats,
+        )
+        .await?;
+        flush_quic_packets(
+            &mut session.quic.conn,
+            &session.quic.socket,
+            &mut session.quic.out,
+            session.quic.udp_gso,
+        )
+        .await?;
 
-        // Drain received datagrams -> one GRO-capable TUN batch.
-        let mut inbound_count = 0usize;
-        loop {
-            match conn.dgram_recv_buf() {
-                Ok(dgram) => {
-                    if let Some(ip_payload) = parse_datagram(&dgram, flow_id) {
-                        if packet::validate_incoming(ip_payload).is_ok() {
-                            rx_packets += 1;
-                            rx_bytes += ip_payload.len() as u64;
-
-                            stage_tun_packet(
-                                &mut inbound_packets[inbound_count],
-                                ip_payload,
-                            );
-                            inbound_count += 1;
-
-                            if inbound_count == inbound_packets.len() {
-                                send_tun_batch(
-                                    tun_dev,
-                                    &mut gro_table,
-                                    &mut inbound_packets[..inbound_count],
-                                )
-                                .await?;
-                                inbound_count = 0;
-                            }
-                        }
-                    }
-                }
-                Err(quiche::Error::Done) => break,
-                Err(e) => {
-                    log::debug!("dgram recv error: {e}");
-                    break;
-                }
-            }
-        }
-
-        if inbound_count > 0 {
-            send_tun_batch(
-                tun_dev,
-                &mut gro_table,
-                &mut inbound_packets[..inbound_count],
-            )
-            .await?;
-        }
-
-        // Always flush outgoing QUIC packets. When Linux UDP GSO is available,
-        // collect a send quantum into one UDP_SEGMENT super-buffer.
-        if let Err(e) = flush_quic_packets(&mut conn, &socket, &mut out, udp_gso).await {
-            log::error!("{e:#}");
-            bail!("{e}");
-        }
-
-        if conn.is_closed() {
-            break Ok(());
+        if session.quic.conn.is_closed() {
+            return Ok(());
         }
     }
-    }
-    .await;
+}
 
-    result
+async fn run_tunnel_session(
+    config: &Config,
+    tunnel_cfg: &TunnelConfig,
+    tun_dev: &tun_rs::AsyncDevice,
+    pending_packets: &mut VecDeque<Vec<u8>>,
+) -> Result<()> {
+    let quic = open_native_quic(config, tunnel_cfg).await?;
+    let mut session = establish_connect_ip(quic).await?;
+    eprintln!("\r\x1b[2K[connected] MASQUE tunnel established");
+
+    let mtu = usize::try_from(tunnel_cfg.mtu)
+        .map_err(|_| anyhow::anyhow!("configured MTU does not fit usize"))?;
+    forward_native_session(
+        &mut session,
+        tun_dev,
+        pending_packets,
+        mtu,
+        tunnel_cfg.keepalive_period,
+    )
+    .await
 }
 
 /// Parse an H3 datagram: `varint(flow_id)` + `varint(context_id)` + IP packet

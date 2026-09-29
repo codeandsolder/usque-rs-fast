@@ -29,15 +29,15 @@ struct Cli {
     command: Commands,
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "CLI carrier preserves four independent user-facing switches"
-)]
-struct NativeTunOptions {
-    connect_port: u16,
-    use_ipv6: bool,
+struct AddressSelection {
+    use_ipv6_endpoint: bool,
     no_tunnel_ipv4: bool,
     no_tunnel_ipv6: bool,
+}
+
+struct NativeTunOptions {
+    connect_port: u16,
+    addresses: AddressSelection,
     sni: String,
     keepalive_period: Duration,
     mtu: u32,
@@ -114,9 +114,11 @@ async fn main() -> Result<()> {
                 &cli.config,
                 NativeTunOptions {
                     connect_port,
-                    use_ipv6: ipv6,
-                    no_tunnel_ipv4,
-                    no_tunnel_ipv6,
+                    addresses: AddressSelection {
+                        use_ipv6_endpoint: ipv6,
+                        no_tunnel_ipv4,
+                        no_tunnel_ipv6,
+                    },
                     sni: sni_address,
                     keepalive_period: Duration::from_secs(keepalive_period),
                     mtu,
@@ -163,9 +165,12 @@ async fn cmd_register(
 async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<()> {
     let NativeTunOptions {
         connect_port,
-        use_ipv6,
-        no_tunnel_ipv4,
-        no_tunnel_ipv6,
+        addresses:
+            AddressSelection {
+                use_ipv6_endpoint,
+                no_tunnel_ipv4,
+                no_tunnel_ipv6,
+            },
         sni,
         keepalive_period,
         mtu,
@@ -184,7 +189,7 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
     let cfg = config::Config::load(config_path)?;
     eprintln!("Config loaded from {config_path}");
 
-    let endpoint_ip: std::net::IpAddr = if use_ipv6 {
+    let endpoint_ip: std::net::IpAddr = if use_ipv6_endpoint {
         cfg.endpoint_v6.parse()?
     } else {
         cfg.endpoint_v4.parse()?
