@@ -40,6 +40,11 @@ socket2 = "0.6"
 nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
 datagram-socket = "0.8.0"
 
+[patch.crates-io]
+quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f793695dcabd4ce4095ad2a7dd34e31d0eb34819" }
+octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f793695dcabd4ce4095ad2a7dd34e31d0eb34819" }
+tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "c86b971b5c7e42efa024a1040325dc86836528c4" }
+
 [profile.release]
 opt-level = 3
 lto = true
