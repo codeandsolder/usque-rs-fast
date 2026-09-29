@@ -13,6 +13,7 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use serde::Deserialize;
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -177,8 +178,10 @@ enum Commands {
         slots_per_prefix: usize,
         #[arg(long, default_value_t = 20_000)]
         base_port: u16,
-        #[arg(long, default_value = "https://orchestrator.onhir.com")]
-        orchestrator_url: String,
+        #[arg(long)]
+        orchestrator_url: Option<String>,
+        #[arg(long, default_value = "/etc/warp-pool/config.json")]
+        pool_config: PathBuf,
         #[arg(long, default_value = "/etc/warp-pool/psk")]
         psk_file: PathBuf,
         #[arg(long, default_value = "/etc/warp-pool/auth")]
@@ -261,23 +264,25 @@ async fn main() -> Result<()> {
             slots_per_prefix,
             base_port,
             orchestrator_url,
+            pool_config,
             psk_file,
             auth_file,
             hostname,
             transport,
         } => {
-            cmd_pool_remote(
+            cmd_pool_remote(RemoteCommandOptions {
                 dir,
                 prefixes,
                 interface,
                 slots_per_prefix,
                 base_port,
                 orchestrator_url,
-                &psk_file,
-                &auth_file,
+                pool_config,
+                psk_file,
+                auth_file,
                 hostname,
-                &transport,
-            )
+                transport,
+            })
             .await
         }
     }
@@ -446,29 +451,64 @@ async fn cmd_pool_offline(
     .await
 }
 
-async fn cmd_pool_remote(
+struct RemoteCommandOptions {
     dir: PathBuf,
-    mut prefixes: Vec<String>,
+    prefixes: Vec<String>,
     interface: Option<String>,
     slots_per_prefix: usize,
     base_port: u16,
-    orchestrator_url: String,
-    psk_file: &Path,
-    auth_file: &Path,
+    orchestrator_url: Option<String>,
+    pool_config: PathBuf,
+    psk_file: PathBuf,
+    auth_file: PathBuf,
     hostname: Option<String>,
-    transport: &ProxyTransportArgs,
-) -> Result<()> {
+    transport: ProxyTransportArgs,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyPoolConfig {
+    #[serde(default)]
+    orchestrator_url: Option<String>,
+    #[serde(default)]
+    psk: Option<String>,
+    #[serde(default)]
+    prefixes: Vec<String>,
+}
+
+async fn cmd_pool_remote(options: RemoteCommandOptions) -> Result<()> {
+    let RemoteCommandOptions {
+        dir,
+        mut prefixes,
+        interface,
+        slots_per_prefix,
+        base_port,
+        orchestrator_url,
+        pool_config,
+        psk_file,
+        auth_file,
+        hostname,
+        transport,
+    } = options;
+    let legacy = load_legacy_pool_config(&pool_config)?;
+
     if prefixes.is_empty() {
-        prefixes = std::env::var("PREFIXES_CSV")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .collect();
+        if !legacy.prefixes.is_empty() {
+            prefixes = legacy.prefixes;
+        } else {
+            prefixes = csv_env("PREFIXES_CSV");
+        }
     }
-    let psk = std::fs::read_to_string(psk_file)?.trim().to_string();
-    let auth = read_proxy_auth(auth_file)?;
+
+    let orchestrator_url = orchestrator_url
+        .or_else(|| std::env::var("ORCHESTRATOR_URL").ok())
+        .or(legacy.orchestrator_url)
+        .unwrap_or_else(|| "https://orchestrator.onhir.com".to_string());
+
+    let psk = match legacy.psk.filter(|value| !value.is_empty()) {
+        Some(value) => value,
+        None => std::fs::read_to_string(&psk_file)?.trim().to_string(),
+    };
+    let auth = read_proxy_auth(&auth_file)?;
     let hostname = hostname
         .or_else(|| std::env::var("VPS_ID").ok())
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -483,7 +523,7 @@ async fn cmd_pool_remote(
         base_port,
         port_stride: 1_000,
         auth,
-        transport: child_transport(transport),
+        transport: child_transport(&transport),
         registration_delay: Duration::from_secs(8),
         probe_wait: Duration::from_secs(8),
         heartbeat_interval: Duration::from_secs(15),
@@ -526,6 +566,25 @@ fn child_transport(transport: &ProxyTransportArgs) -> ChildTransport {
         no_tunnel_ipv6: transport.no_tunnel_ipv6,
         use_ipv6_endpoint: transport.ipv6,
     }
+}
+
+fn load_legacy_pool_config(path: &Path) -> Result<LegacyPoolConfig> {
+    if !path.exists() {
+        return Ok(LegacyPoolConfig::default());
+    }
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid pool config {}: {error}", path.display()))
+}
+
+fn csv_env(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn read_proxy_auth(path: &Path) -> Result<ProxyAuth> {
@@ -611,6 +670,8 @@ mod tests {
             prefixes,
             slots_per_prefix,
             base_port,
+            orchestrator_url,
+            pool_config,
             ..
         } = cli.command
         else {
@@ -619,6 +680,32 @@ mod tests {
         assert!(prefixes.is_empty());
         assert_eq!(slots_per_prefix, 10);
         assert_eq!(base_port, 20_000);
+        assert!(orchestrator_url.is_none());
+        assert_eq!(pool_config, PathBuf::from("/etc/warp-pool/config.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_pool_config_is_compatible() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{
+              "version": 1,
+              "orchestrator_url": "https://orchestrator.example",
+              "psk": "legacy-psk",
+              "prefixes": ["2001:db8:1:2::/64"],
+              "socks_user": "ignored-by-rust-auth-file"
+            }"#,
+        )?;
+        let parsed = load_legacy_pool_config(&path)?;
+        assert_eq!(
+            parsed.orchestrator_url.as_deref(),
+            Some("https://orchestrator.example")
+        );
+        assert_eq!(parsed.psk.as_deref(), Some("legacy-psk"));
+        assert_eq!(parsed.prefixes, ["2001:db8:1:2::/64"]);
         Ok(())
     }
 }

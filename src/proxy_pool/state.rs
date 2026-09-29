@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::Visitor;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::BTreeSet,
+    fmt,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -22,8 +24,8 @@ pub struct ProxyRecord {
     pub v4: String,
     #[serde(default)]
     pub pid: u32,
-    #[serde(default)]
-    pub last_keepalive: f64,
+    #[serde(default, deserialize_with = "deserialize_legacy_timestamp")]
+    pub last_keepalive: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -40,8 +42,8 @@ pub struct PoolState {
     pub seen_v4: BTreeSet<String>,
     #[serde(default)]
     pub stale_count: usize,
-    #[serde(default)]
-    pub started_at: f64,
+    #[serde(default, deserialize_with = "deserialize_legacy_timestamp")]
+    pub started_at: i64,
     #[serde(default)]
     pub proxies: Vec<ProxyRecord>,
 }
@@ -59,13 +61,17 @@ impl Default for PoolState {
             box_v4: String::new(),
             seen_v4: BTreeSet::new(),
             stale_count: 0,
-            started_at: time::OffsetDateTime::now_utc().unix_timestamp() as f64,
+            started_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             proxies: Vec::new(),
         }
     }
 }
 
 impl PoolState {
+    /// Load persisted proxy-pool state, accepting legacy floating-point timestamps.
+    ///
+    /// # Errors
+    /// Returns an error when the state file cannot be read or decoded.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -77,12 +83,16 @@ impl PoolState {
         for proxy in &mut state.proxies {
             proxy.pid = 0;
         }
-        if state.started_at == 0.0 {
-            state.started_at = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+        if state.started_at == 0 {
+            state.started_at = time::OffsetDateTime::now_utc().unix_timestamp();
         }
         Ok(state)
     }
 
+    /// Atomically persist proxy-pool state.
+    ///
+    /// # Errors
+    /// Returns an error if serialization, directory creation, file I/O, or rename fails.
     pub fn save(&self, path: &Path) -> Result<()> {
         let parent = path
             .parent()
@@ -106,6 +116,8 @@ impl PoolState {
     }
 }
 
+/// Return the config path for one legacy-compatible pool identity.
+#[must_use]
 pub fn identity_config_path(root: &Path, group: usize, slot: usize) -> PathBuf {
     root.join("identities")
         .join(format!("group-{group}"))
@@ -113,10 +125,16 @@ pub fn identity_config_path(root: &Path, group: usize, slot: usize) -> PathBuf {
         .join("config.json")
 }
 
+/// Return the suffix-list path for one remote prefix group.
+#[must_use]
 pub fn address_file(root: &Path, group: usize) -> PathBuf {
     root.join("addresses").join(format!("group-{group}.json"))
 }
 
+/// Load the stable per-group /128 suffix list.
+///
+/// # Errors
+/// Returns an error when an existing suffix file cannot be read or decoded.
 pub fn load_suffixes(root: &Path, group: usize) -> Result<Vec<String>> {
     let path = address_file(root, group);
     if !path.exists() {
@@ -126,6 +144,10 @@ pub fn load_suffixes(root: &Path, group: usize) -> Result<Vec<String>> {
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Atomically persist the stable per-group /128 suffix list.
+///
+/// # Errors
+/// Returns an error for serialization, directory creation, file I/O, permission, or rename failures.
 pub fn save_suffixes(root: &Path, group: usize, suffixes: &[String]) -> Result<()> {
     let path = address_file(root, group);
     let parent = path
@@ -141,6 +163,45 @@ pub fn save_suffixes(root: &Path, group: usize, suffixes: &[String]) -> Result<(
     }
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+fn deserialize_legacy_timestamp<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TimestampVisitor;
+
+    impl Visitor<'_> for TimestampVisitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a Unix timestamp encoded as an integer or floating-point number")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            i64::try_from(value).map_err(E::custom)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if !value.is_finite() {
+                return Err(E::custom("timestamp must be finite"));
+            }
+            let truncated = value.trunc();
+            format!("{truncated:.0}").parse::<i64>().map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(TimestampVisitor)
 }
 
 fn temporary_sibling(path: &Path) -> PathBuf {
@@ -182,7 +243,8 @@ mod tests {
         let state = PoolState::load(&path)?;
         assert_eq!(state.phase, "locked");
         assert_eq!(state.proxies.len(), 1);
-        assert_eq!(state.started_at, 123.5);
+        assert_eq!(state.started_at, 123);
+        assert_eq!(state.proxies[0].last_keepalive, 123);
         assert_eq!(state.proxies[0].pid, 0);
         assert!(state.proxies[0].locked);
         Ok(())

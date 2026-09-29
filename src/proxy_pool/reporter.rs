@@ -56,7 +56,7 @@ impl RemoteReporter {
     ///
     /// # Errors
     /// Returns an error if the URL is not HTTPS or the TLS client cannot be built.
-    pub fn new(base_url: String, psk: String) -> Result<Self> {
+    pub fn new(base_url: &str, psk: String) -> Result<Self> {
         if !base_url.starts_with("https://") {
             anyhow::bail!("orchestrator URL must use HTTPS");
         }
@@ -87,10 +87,18 @@ impl RemoteReporter {
         })
     }
 
+    /// Send a heartbeat to the existing warp-orchestrator data-plane endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if serialization, transport, or the HTTP response fails.
     pub async fn heartbeat(&self, heartbeat: &Heartbeat<'_>) -> Result<()> {
         self.post("/api/warp-pool/heartbeat", heartbeat).await
     }
 
+    /// Publish the complete set of currently locked proxies.
+    ///
+    /// # Errors
+    /// Returns an error if serialization, transport, or the HTTP response fails.
     pub async fn register(
         &self,
         v6_root: &str,
@@ -113,10 +121,10 @@ impl RemoteReporter {
         .await
     }
 
-    async fn post<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<()> {
+    async fn post<T: Serialize + Sync + ?Sized>(&self, path: &str, body: &T) -> Result<()> {
         let response = self
             .client
-            .post(format!("{}{}", self.base_url, path))
+            .post(format!("{}{path}", self.base_url))
             .bearer_auth(&self.psk)
             .json(body)
             .send()

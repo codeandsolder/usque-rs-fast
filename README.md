@@ -81,7 +81,9 @@ sudo usque-rs pool-remote \
   --orchestrator-url https://orchestrator.example
 ```
 
-Remote mode requires root or equivalent `CAP_NET_ADMIN` permission to add the routed `/128` addresses. The auth file remains the legacy `username:password` format. The useful legacy layout is retained (`identities/group-N/slot-N/config.json`, `addresses/group-N.json`, and `state.json`), but Python self-update is intentionally not part of the Rust agent; binary deployment/versioning owns upgrades.
+Remote mode requires root or equivalent `CAP_NET_ADMIN` permission to add the routed `/128` addresses. The auth file remains the legacy `username:password` format. By default `pool-remote` also reads the legacy `/etc/warp-pool/config.json`; existing `prefixes`, `orchestrator_url`, and optional `psk` values are accepted so an existing fleet does not need to be reconfigured. Explicit CLI values take priority; `ORCHESTRATOR_URL` remains an environment override, and `PREFIXES_CSV` is used when neither CLI nor the legacy config supplies prefixes.
+
+The useful legacy layout is retained (`identities/group-N/slot-N/config.json`, `addresses/group-N.json`, and `state.json`), but Python self-update is intentionally not part of the Rust agent; binary deployment/versioning owns upgrades.
 
 
 ## Why the rewrite?

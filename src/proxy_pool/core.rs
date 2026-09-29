@@ -87,6 +87,7 @@ impl Supervisor {
         })
     }
 
+    #[must_use]
     pub fn config_path(&self, group: usize, slot: usize) -> PathBuf {
         identity_config_path(&self.root, group, slot)
     }
@@ -102,10 +103,12 @@ impl Supervisor {
             return Ok(false);
         }
 
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("identity config has no parent: {}", path.display()))?;
-        std::fs::create_dir_all(parent)?;
+        let identities_dir = self.root.join("identities");
+        let group_dir = identities_dir.join(format!("group-{group}"));
+        let slot_dir = group_dir.join(format!("slot-{slot}"));
+        create_identity_dir(&identities_dir)?;
+        create_identity_dir(&group_dir)?;
+        create_identity_dir(&slot_dir)?;
 
         let name = format!("g{group}-s{slot}");
         log::info!("registering WARP identity {name}");
@@ -233,6 +236,11 @@ impl Supervisor {
     }
 }
 
+/// Derive the deterministic listener port for a pool slot.
+///
+/// # Errors
+/// Returns an error for a zero stride, a slot outside its group's stride,
+/// arithmetic overflow, or a derived port above 65535.
 pub fn port_for(base: u16, stride: u16, group: usize, slot: usize) -> Result<u16> {
     if stride == 0 {
         anyhow::bail!("proxy port stride must be greater than zero");
@@ -251,6 +259,10 @@ pub fn port_for(base: u16, stride: u16, group: usize, slot: usize) -> Result<u16
     u16::try_from(value).context("derived proxy port exceeds 65535")
 }
 
+/// Wait for the process shutdown signal used by pool supervisors.
+///
+/// # Errors
+/// Returns an error if the platform signal handler cannot be installed or awaited.
 pub async fn wait_for_shutdown() -> Result<()> {
     #[cfg(unix)]
     {
@@ -260,7 +272,7 @@ pub async fn wait_for_shutdown() -> Result<()> {
             result = tokio::signal::ctrl_c() => result.context("failed to listen for Ctrl-C")?,
             _ = terminate.recv() => {}
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -269,6 +281,24 @@ pub async fn wait_for_shutdown() -> Result<()> {
             .await
             .context("failed to listen for Ctrl-C")
     }
+}
+
+fn create_identity_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create identity directory {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).with_context(
+            || {
+                format!(
+                    "failed to restore traversable permissions on {}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn path_to_str(path: &Path) -> Result<&str> {

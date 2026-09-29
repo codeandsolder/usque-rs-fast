@@ -32,6 +32,10 @@ struct InventoryEntry {
     listen: String,
 }
 
+/// Run a local-only WARP proxy pool until shutdown.
+///
+/// # Errors
+/// Returns an error for identity registration, child lifecycle, filesystem, or signal failures.
 pub async fn run(config: OfflineConfig) -> Result<()> {
     if config.count == 0 {
         anyhow::bail!("offline pool count must be greater than zero");

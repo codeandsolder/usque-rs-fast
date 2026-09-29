@@ -46,18 +46,37 @@ pub struct RemoteConfig {
     pub hostname: String,
 }
 
+/// Run the routed WARP proxy pool and report healthy identities to the control plane.
+///
+/// # Errors
+/// Returns an error for invalid configuration, state or address-management failures,
+/// WARP identity/session failures, child-process failures, or shutdown-signal errors.
 pub async fn run(config: RemoteConfig) -> Result<()> {
     validate_config(&config)?;
     fs::create_dir_all(&config.root)?;
 
-    let reporter = RemoteReporter::new(config.orchestrator_url.clone(), config.psk.clone())?;
+    let reporter = RemoteReporter::new(&config.orchestrator_url, config.psk.clone())?;
     let state_path = config.root.join("state.json");
-    let mut state = PoolState::load(&state_path)?;
+    let mut state = initialize_state(&config, &state_path).await?;
+    let mut supervisor = initialize_supervisor(&config, &mut state, &state_path).await?;
+
+    supervise(&config, &state_path, &reporter, &mut state, &mut supervisor).await?;
+
+    state.save(&state_path)?;
+    supervisor.stop_all().await;
+    Ok(())
+}
+
+async fn initialize_state(
+    config: &RemoteConfig,
+    state_path: &std::path::Path,
+) -> Result<PoolState> {
+    let mut state = PoolState::load(state_path)?;
     let (box_v6, box_v4) = discover_box_addresses(&config.prefixes).await;
     state.box_v6 = box_v6;
     state.box_v4 = box_v4;
 
-    prepare_proxy_records(&config, &mut state).await?;
+    prepare_proxy_records(config, &mut state).await?;
     if state.phase != "locked" {
         state.phase = "init".to_string();
     }
@@ -66,8 +85,15 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
     } else if !state.proxies.iter().any(|proxy| proxy.locked) {
         state.phase = "init".to_string();
     }
-    state.save(&state_path)?;
+    state.save(state_path)?;
+    Ok(state)
+}
 
+async fn initialize_supervisor(
+    config: &RemoteConfig,
+    state: &mut PoolState,
+    state_path: &std::path::Path,
+) -> Result<Supervisor> {
     let mut supervisor = Supervisor::new(config.root.clone())?;
     for index in 0..state.proxies.len() {
         let group = state.proxies[index].group;
@@ -78,17 +104,26 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
             tokio::time::sleep(config.registration_delay).await;
         }
     }
-    state.save(&state_path)?;
+    state.save(state_path)?;
 
     for index in 0..state.proxies.len() {
         if !state.proxies[index].locked {
             continue;
         }
-        let spec = child_spec(&config, &state.proxies[index])?;
+        let spec = child_spec(config, &state.proxies[index])?;
         let pid = supervisor.start(&spec).await?;
         state.proxies[index].pid = pid;
     }
+    Ok(supervisor)
+}
 
+async fn supervise(
+    config: &RemoteConfig,
+    state_path: &std::path::Path,
+    reporter: &RemoteReporter,
+    state: &mut PoolState,
+    supervisor: &mut Supervisor,
+) -> Result<()> {
     let mut last_heartbeat = Instant::now()
         .checked_sub(config.heartbeat_interval)
         .unwrap_or_else(Instant::now);
@@ -110,18 +145,18 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
 
-        let mut changed = restart_dead_locked(&config, &mut state, &mut supervisor).await?;
+        let mut changed = restart_dead_locked(config, state, supervisor).await?;
 
         if state.phase == "init" {
             let cycling = state.proxies.iter().filter(|proxy| !proxy.locked).count();
             if cycling < config.topup_count {
-                changed |= top_up_candidates(&config, &mut state).await?;
+                changed |= top_up_candidates(config, state).await?;
             }
 
-            let locked = cycle_one(&config, &mut state, &mut supervisor, &mut cycle_cursor).await?;
+            let locked = cycle_one(config, state, supervisor, &mut cycle_cursor).await?;
             changed |= locked;
             if locked {
-                if let Err(error) = send_register(&config, &state, &reporter).await {
+                if let Err(error) = send_register(config, state, reporter).await {
                     log::warn!("orchestrator register after new lock failed: {error:#}");
                 }
                 last_register = Instant::now();
@@ -135,7 +170,7 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
                 log::info!(
                     "remote pool entering locked phase: {locked_count} locked, {cycling} spare candidates"
                 );
-                if let Err(error) = send_register(&config, &state, &reporter).await {
+                if let Err(error) = send_register(config, state, reporter).await {
                     log::warn!("orchestrator register on lock transition failed: {error:#}");
                 }
                 last_register = Instant::now();
@@ -143,7 +178,7 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
         }
 
         if last_drift.elapsed() >= config.drift_interval {
-            let drifted = check_drift(&config, &mut state, &mut supervisor).await?;
+            let drifted = check_drift(config, state, supervisor).await?;
             if drifted {
                 state.phase = "init".to_string();
                 state.stale_count = 0;
@@ -153,7 +188,7 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
         }
 
         if last_register.elapsed() >= config.register_interval {
-            if let Err(error) = send_register(&config, &state, &reporter).await {
+            if let Err(error) = send_register(config, state, reporter).await {
                 log::warn!("orchestrator register failed: {error:#}");
             }
             last_register = Instant::now();
@@ -166,7 +201,7 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
                 cpu_history.remove(0);
             }
             if let Err(error) =
-                send_heartbeat(&config, &state, &reporter, system_sample, &cpu_history).await
+                send_heartbeat(config, state, reporter, system_sample, &cpu_history).await
             {
                 log::warn!("orchestrator heartbeat failed: {error:#}");
             }
@@ -174,13 +209,9 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
         }
 
         if changed {
-            state.save(&state_path)?;
+            state.save(state_path)?;
         }
     }
-
-    state.save(&state_path)?;
-    supervisor.stop_all().await;
-    Ok(())
 }
 
 fn validate_config(config: &RemoteConfig) -> Result<()> {
@@ -398,9 +429,12 @@ async fn cycle_one(
 
     state.seen_v4.insert(observed_text.clone());
     state.proxies[index].v4 = observed_text;
-    state.proxies[index].v6 = state.proxies[index].addr.clone();
-    state.proxies[index].locked = true;
-    state.proxies[index].last_keepalive = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    {
+        let proxy = &mut state.proxies[index];
+        proxy.v6.clone_from(&proxy.addr);
+        proxy.locked = true;
+        proxy.last_keepalive = time::OffsetDateTime::now_utc().unix_timestamp();
+    }
     state.stale_count = 0;
     log::info!(
         "locked proxy g{} s{} port={} v4={observed}",
@@ -451,22 +485,15 @@ async fn check_drift(
         };
         let observed = observed.to_string();
         if !expected.is_empty() && observed != expected {
-            let key = SlotKey {
-                group: state.proxies[index].group,
-                slot: state.proxies[index].slot,
-            };
-            log::warn!(
-                "WARP egress drift g{} s{} {} -> {}",
-                key.group,
-                key.slot,
-                expected,
-                observed
-            );
+            let group = state.proxies[index].group;
+            let slot = state.proxies[index].slot;
+            let key = SlotKey { group, slot };
+            log::warn!("WARP egress drift g{group} s{slot} {expected} -> {observed}");
             supervisor.stop(key).await?;
             state.proxies[index].pid = 0;
             state.proxies[index].locked = false;
             state.proxies[index].v4 = observed;
-            state.proxies[index].last_keepalive = 0.0;
+            state.proxies[index].last_keepalive = 0;
             changed = true;
         }
     }
@@ -522,7 +549,7 @@ async fn send_heartbeat(
 ) -> Result<()> {
     let reports = proxy_reports(config, state)?;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let uptime = ((now as f64) - state.started_at).max(0.0) as i64;
+    let uptime = now.saturating_sub(state.started_at);
     reporter
         .heartbeat(&Heartbeat {
             v: 1,
@@ -567,7 +594,7 @@ fn proxy_reports(config: &RemoteConfig, state: &PoolState) -> Result<Vec<ProxyRe
                 group: proxy.group,
                 slot: proxy.slot,
                 auth: format!("{}:{}", config.auth.username, config.auth.password),
-                locked_at: Some(proxy.last_keepalive as i64),
+                locked_at: (proxy.last_keepalive != 0).then_some(proxy.last_keepalive),
             })
         })
         .collect()
@@ -823,7 +850,7 @@ fn select_box_v6(addresses: &[Ipv6Addr], prefixes: &[Prefix64]) -> Option<Ipv6Ad
         .or_else(|| addresses.first().copied())
 }
 
-fn is_eui64(address: Ipv6Addr) -> bool {
+const fn is_eui64(address: Ipv6Addr) -> bool {
     let octets = address.octets();
     octets[11] == 0xff && octets[12] == 0xfe
 }
@@ -868,7 +895,12 @@ impl CpuSampler {
             (Some((old_busy, old_total)), Some((busy, total))) if total > old_total => {
                 let busy_delta = busy.saturating_sub(old_busy);
                 let total_delta = total.saturating_sub(old_total);
-                100.0 * busy_delta as f64 / total_delta as f64
+                let hundredths = busy_delta
+                    .saturating_mul(10_000)
+                    .checked_div(total_delta)
+                    .unwrap_or_default()
+                    .min(10_000);
+                f64::from(u32::try_from(hundredths).unwrap_or(10_000)) / 100.0
             }
             _ => 0.0,
         };
@@ -877,7 +909,7 @@ impl CpuSampler {
         }
         let (used_kb, total_kb) = read_memory_kb().unwrap_or_default();
         SystemStats {
-            cpu_pct: (cpu_pct * 100.0).round() / 100.0,
+            cpu_pct,
             mem_used_mb: used_kb / 1024,
             mem_total_mb: total_kb / 1024,
         }
