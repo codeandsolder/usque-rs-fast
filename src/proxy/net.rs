@@ -296,9 +296,9 @@ impl VirtualNet {
             )
         })?;
 
-        let local_port = self.next_port();
         let handle = {
             let mut inner = lock_stack(&self.shared);
+            let local_port = self.allocate_port(&inner)?;
             let rx = tcp::SocketBuffer::new(vec![0_u8; TCP_BUFFER_SIZE]);
             let tx = tcp::SocketBuffer::new(vec![0_u8; TCP_BUFFER_SIZE]);
             let mut socket = tcp::Socket::new(rx, tx);
@@ -454,6 +454,26 @@ impl VirtualNet {
                 })
             })
             .unwrap_or(FIRST_EPHEMERAL_PORT)
+    }
+
+    fn allocate_port(&self, stack: &Stack) -> io::Result<u16> {
+        for _ in FIRST_EPHEMERAL_PORT..=LAST_EPHEMERAL_PORT {
+            let candidate = self.next_port();
+            let in_use = stack.sockets.iter().any(|(_, socket)| match socket {
+                smoltcp::socket::Socket::Tcp(socket) => socket
+                    .local_endpoint()
+                    .is_some_and(|endpoint| endpoint.port == candidate),
+                _ => false,
+            });
+            if !in_use {
+                return Ok(candidate);
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "userspace TCP ephemeral port range exhausted",
+        ))
     }
 }
 
