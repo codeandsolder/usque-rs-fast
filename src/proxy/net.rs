@@ -372,7 +372,7 @@ impl VirtualNet {
         });
         let reactor_shared = shared.clone();
         let reactor = tokio::spawn(async move {
-            let result = run_reactor(packet_stream, reactor_shared.clone()).await;
+            let result = Box::pin(run_reactor(packet_stream, reactor_shared.clone())).await;
             reactor_shared.shutdown();
             if let Err(error) = result {
                 log::error!("userspace proxy stack stopped: {error}");
@@ -701,16 +701,23 @@ impl VirtualNet {
     }
 
     fn next_port(&self) -> u16 {
-        self.shared
-            .next_port
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |port| {
-                Some(if port == LAST_EPHEMERAL_PORT {
-                    FIRST_EPHEMERAL_PORT
-                } else {
-                    port + 1
-                })
-            })
-            .unwrap_or(FIRST_EPHEMERAL_PORT)
+        let mut port = self.shared.next_port.load(Ordering::Relaxed);
+        loop {
+            let next = if port == LAST_EPHEMERAL_PORT {
+                FIRST_EPHEMERAL_PORT
+            } else {
+                port + 1
+            };
+            match self.shared.next_port.compare_exchange_weak(
+                port,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return port,
+                Err(observed) => port = observed,
+            }
+        }
     }
 
     fn allocate_port(&self, stack: &Stack) -> io::Result<u16> {
