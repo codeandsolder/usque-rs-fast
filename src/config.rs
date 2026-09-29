@@ -22,6 +22,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load and parse a saved WARP configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be inspected/read, its permissions
+    /// cannot be tightened on Unix, or the JSON is invalid.
     pub fn load(path: &str) -> Result<Self> {
         let path = Path::new(path);
 
@@ -43,6 +49,11 @@ impl Config {
         serde_json::from_str(&data).with_context(|| "failed to parse config JSON")
     }
 
+    /// Persist the configuration, creating parent directories as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or any filesystem operation fails.
     pub fn save(&self, path: &str) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
         let path = Path::new(path);
@@ -80,6 +91,11 @@ impl Config {
             .with_context(|| format!("failed to write config to {}", path.display()))
     }
 
+    /// Build a local configuration from a successful registration response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response contains no usable WARP peer.
     pub fn from_account_data(
         account: &AccountData,
         token: &str,
@@ -111,12 +127,22 @@ impl Config {
         })
     }
 
+    /// Decode the stored EC private key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured key is not valid base64.
     pub fn get_ec_private_key_der(&self) -> Result<Vec<u8>> {
         base64::engine::general_purpose::STANDARD
             .decode(&self.private_key)
             .with_context(|| "failed to decode private key from base64")
     }
 
+    /// Decode the pinned endpoint public key to SPKI DER.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured PEM is invalid or cannot be encoded.
     pub fn get_endpoint_pub_key_der(&self) -> Result<Vec<u8>> {
         use x509_cert::der::{DecodePem, Encode};
 
@@ -137,10 +163,7 @@ mod tests {
         AccountData {
             id: "device-id".to_string(),
             token: "registration-token".to_string(),
-            account: Account {
-                id: "account-id".to_string(),
-                license: None,
-            },
+            account: Account { license: None },
             config: WarpConfig {
                 peers,
                 interface: Interface {

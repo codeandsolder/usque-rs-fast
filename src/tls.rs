@@ -30,6 +30,11 @@ fn parse_signing_key(priv_key_der: &[u8]) -> Result<SigningKey> {
 
 /// Generate self-signed client cert from the config private key and prepare
 /// temp PEM files that quiche can load.
+///
+/// # Errors
+///
+/// Returns an error if configured keys are invalid, certificate generation
+/// fails, or temporary key/certificate files cannot be created or written.
 pub fn prepare_tls_material(config: &Config) -> Result<TlsMaterial> {
     let priv_key_der = config.get_ec_private_key_der()?;
     let signing_key = parse_signing_key(&priv_key_der)?;
@@ -70,12 +75,21 @@ pub fn prepare_tls_material(config: &Config) -> Result<TlsMaterial> {
 }
 
 /// Validate that TLS material can be built from the MASQUE config.
+///
+/// # Errors
+///
+/// Returns any error encountered while preparing TLS material.
 pub fn validate_config(config: &Config) -> Result<()> {
     prepare_tls_material(config).map(|_| ())
 }
 
 /// Build the shared QUIC configuration used by both the native TUN and
 /// reusable packet-stream paths.
+///
+/// # Errors
+///
+/// Returns an error if quiche rejects the TLS/QUIC configuration or if the
+/// temporary certificate/key paths cannot be represented as UTF-8.
 pub fn build_quic_config(
     tls_material: &TlsMaterial,
     max_datagram_size: usize,
@@ -132,6 +146,7 @@ pub fn build_quic_config(
 
 /// Verify a peer's DER certificate against the pinned SPKI public key.
 /// Returns true if the peer cert's `SubjectPublicKeyInfo` matches.
+#[must_use]
 pub fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bool {
     use x509_cert::der::{Decode, Encode};
 

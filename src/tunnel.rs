@@ -29,12 +29,24 @@ fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;
+
+    fn one_decimal(value: u64, unit: u64, suffix: &str) -> String {
+        let whole = value / unit;
+        let remainder = value % unit;
+        let rounded_tenths = (remainder * 10 + unit / 2) / unit;
+        if rounded_tenths == 10 {
+            format!("{}.0 {suffix}", whole + 1)
+        } else {
+            format!("{whole}.{rounded_tenths} {suffix}")
+        }
+    }
+
     if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+        one_decimal(bytes, GIB, "GiB")
     } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+        one_decimal(bytes, MIB, "MiB")
     } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+        one_decimal(bytes, KIB, "KiB")
     } else {
         format!("{bytes} B")
     }
@@ -182,6 +194,11 @@ async fn flush_quic_packets(
 }
 
 /// Run the MASQUE tunnel, reconnecting on-demand when traffic arrives.
+///
+/// # Errors
+///
+/// Returns an error if the TUN device cannot be read or the tunnel cannot be
+/// initialized before entering the reconnect loop.
 pub async fn maintain_tunnel(
     config: &Config,
     tunnel_cfg: &TunnelConfig,
@@ -191,7 +208,8 @@ pub async fn maintain_tunnel(
         bail!("keepalive period must be greater than zero");
     }
 
-    let mtu = tunnel_cfg.mtu as usize;
+    let mtu = usize::try_from(tunnel_cfg.mtu)
+        .map_err(|_| anyhow::anyhow!("configured MTU does not fit usize"))?;
     let packet_capacity = mtu + 128;
     let mut pending_packets = VecDeque::new();
 
@@ -228,6 +246,10 @@ pub async fn maintain_tunnel(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single QUIC/TUN event loop keeps transport state and select branches co-located"
+)]
 async fn run_tunnel_session(
     config: &Config,
     tunnel_cfg: &TunnelConfig,
@@ -377,7 +399,9 @@ async fn run_tunnel_session(
 
         loop {
             match h3_conn.poll(&mut conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
+                Ok((response_stream_id, quiche::h3::Event::Headers { list, .. }))
+                    if response_stream_id == stream_id =>
+                {
                     for h in &list {
                         if h.name() == b":status" {
                             let status = std::str::from_utf8(h.value()).unwrap_or("?");
@@ -451,7 +475,8 @@ async fn run_tunnel_session(
             let mut dgram = Vec::with_capacity(flow_prefix.len() + pkt.len());
             dgram.extend_from_slice(&flow_prefix);
             dgram.extend_from_slice(&pkt);
-            let pkt_len = pkt.len() as u64;
+            let pkt_len = u64::try_from(pkt.len())
+                .map_err(|_| anyhow::anyhow!("packet length does not fit u64"))?;
             if conn.dgram_send_buf(dgram).is_ok() {
                 tx_packets += 1;
                 tx_bytes += pkt_len;
@@ -463,7 +488,8 @@ async fn run_tunnel_session(
     // large GSO packet, which tun-rs splits into a burst of MTU-sized packets.
     // Received CONNECT-IP packets are drained into a GRO batch before crossing
     // back into the kernel.
-    let mtu = tunnel_cfg.mtu as usize;
+    let mtu = usize::try_from(tunnel_cfg.mtu)
+        .map_err(|_| anyhow::anyhow!("configured MTU does not fit usize"))?;
     let packet_capacity = mtu + 128;
     let mut tun_raw = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
     let mut tun_packets = vec![vec![0u8; packet_capacity]; IDEAL_BATCH_SIZE];
@@ -571,16 +597,13 @@ async fn run_tunnel_session(
             // atomics and querying QUIC stats on every packet/event.
             _ = stats_interval.tick() => {
                 let qs = conn.stats();
+                let connected_for = format_duration(session_start.elapsed());
+                let tx_size = format_bytes(tx_bytes);
+                let rx_size = format_bytes(rx_bytes);
+                let lost = qs.lost;
+                let retrans = qs.retrans;
                 eprint!(
-                    "\r\x1b[2K[connected {}] tx: {} ({})  rx: {} ({})  drop: {}  lost: {}  retrans: {}",
-                    format_duration(session_start.elapsed()),
-                    tx_packets,
-                    format_bytes(tx_bytes),
-                    rx_packets,
-                    format_bytes(rx_bytes),
-                    dropped,
-                    qs.lost,
-                    qs.retrans,
+                    "\r\x1b[2K[connected {connected_for}] tx: {tx_packets} ({tx_size})  rx: {rx_packets} ({rx_size})  drop: {dropped}  lost: {lost}  retrans: {retrans}"
                 );
             }
         }

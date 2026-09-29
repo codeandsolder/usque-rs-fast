@@ -5,12 +5,17 @@
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 
-fn make_ipv4_packet(total_len: usize, ttl: u8, src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
-    assert!(total_len >= IPV4_HEADER_LEN);
-    let mut pkt = vec![0xAAu8; total_len];
+fn low_u16(value: u32) -> u16 {
+    let bytes = value.to_be_bytes();
+    u16::from_be_bytes([bytes[2], bytes[3]])
+}
+
+fn make_ipv4_packet(total_len: u16, ttl: u8, src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+    assert!(usize::from(total_len) >= IPV4_HEADER_LEN);
+    let mut pkt = vec![0xAAu8; usize::from(total_len)];
     pkt[0] = 0x45;
     pkt[1] = 0x00;
-    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
     pkt[4..6].copy_from_slice(&[0x00, 0x00]);
     pkt[6..8].copy_from_slice(&[0x40, 0x00]);
     pkt[8] = ttl;
@@ -25,14 +30,14 @@ fn make_ipv4_packet(total_len: usize, ttl: u8, src: [u8; 4], dst: [u8; 4]) -> Ve
     pkt
 }
 
-fn make_ipv6_packet(total_len: usize, hop_limit: u8, src: [u8; 16], dst: [u8; 16]) -> Vec<u8> {
-    assert!(total_len >= IPV6_HEADER_LEN);
-    let mut pkt = vec![0xBBu8; total_len];
+fn make_ipv6_packet(total_len: u16, hop_limit: u8, src: [u8; 16], dst: [u8; 16]) -> Vec<u8> {
+    assert!(usize::from(total_len) >= IPV6_HEADER_LEN);
+    let mut pkt = vec![0xBBu8; usize::from(total_len)];
     pkt[0] = 0x60;
     pkt[1] = 0x00;
     pkt[2] = 0x00;
     pkt[3] = 0x00;
-    let payload_len = (total_len - IPV6_HEADER_LEN) as u16;
+    let payload_len = total_len - 40;
     pkt[4..6].copy_from_slice(&payload_len.to_be_bytes());
     pkt[6] = 17;
     pkt[7] = hop_limit;
@@ -54,24 +59,24 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
         } else {
             u16::from_be_bytes([header[i], 0])
         };
-        sum += word as u32;
+        sum += u32::from(word);
         i += 2;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    !(sum as u16)
+    !low_u16(sum)
 }
 
 fn verify_ipv4_checksum(header: &[u8]) -> bool {
     let mut sum: u32 = (0..IPV4_HEADER_LEN)
         .step_by(2)
-        .map(|i| u16::from_be_bytes([header[i], header[i + 1]]) as u32)
+        .map(|i| u32::from(u16::from_be_bytes([header[i], header[i + 1]])))
         .sum();
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    sum as u16 == 0xFFFF
+    low_u16(sum) == 0xFFFF
 }
 
 fn try_create_tun(name: &str, mtu: u16) -> Option<tun_rs::SyncDevice> {
@@ -229,7 +234,7 @@ mod pipeline {
         version: u8,
     }
 
-    fn pipeline_ipv4(packet_size: usize, flow_id: u64) -> TestResult {
+    fn pipeline_ipv4(packet_size: u16, flow_id: u64) -> TestResult {
         let mut pkt = make_ipv4_packet(packet_size, 64, [10, 0, 0, 1], [10, 0, 0, 2]);
         let version = prepare_outgoing(&mut pkt).unwrap_or_default();
 
@@ -247,7 +252,7 @@ mod pipeline {
         }
     }
 
-    fn pipeline_ipv6(packet_size: usize, flow_id: u64) -> TestResult {
+    fn pipeline_ipv6(packet_size: u16, flow_id: u64) -> TestResult {
         let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
         let mut pkt = make_ipv6_packet(packet_size, 64, src, dst);
@@ -471,7 +476,8 @@ mod pipeline {
         let total_len = IPV4_HEADER_LEN + 8 + icmp_data.len();
         let mut pkt = vec![0u8; total_len];
         pkt[0] = 0x45;
-        pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        let total_len = u16::try_from(total_len).ok()?;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
         pkt[8] = 64;
         pkt[9] = 1;
         pkt[12..16].copy_from_slice(&original[16..20]);
@@ -499,7 +505,8 @@ mod pipeline {
         let total_len = IPV6_HEADER_LEN + payload_len;
         let mut pkt = vec![0u8; total_len];
         pkt[0] = 0x60;
-        pkt[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        let payload_len = u16::try_from(payload_len).ok()?;
+        pkt[4..6].copy_from_slice(&payload_len.to_be_bytes());
         pkt[6] = 58;
         pkt[7] = 64;
         pkt[8..24].copy_from_slice(&original[24..40]);
@@ -507,15 +514,15 @@ mod pipeline {
         let icmp_start = IPV6_HEADER_LEN;
         pkt[icmp_start] = 2;
         pkt[icmp_start + 1] = 0;
-        pkt[icmp_start + 4..icmp_start + 8].copy_from_slice(&(mtu as u32).to_be_bytes());
+        pkt[icmp_start + 4..icmp_start + 8].copy_from_slice(&u32::from(mtu).to_be_bytes());
         pkt[icmp_start + 8..].copy_from_slice(icmp_data);
         // ICMPv6 checksum with pseudo-header
         let mut sum: u32 = 0;
         for i in (0..16).step_by(2) {
-            sum += u16::from_be_bytes([pkt[8 + i], pkt[8 + i + 1]]) as u32;
-            sum += u16::from_be_bytes([pkt[24 + i], pkt[24 + i + 1]]) as u32;
+            sum += u32::from(u16::from_be_bytes([pkt[8 + i], pkt[8 + i + 1]]));
+            sum += u32::from(u16::from_be_bytes([pkt[24 + i], pkt[24 + i + 1]]));
         }
-        let plen = pkt[icmp_start..].len() as u32;
+        let plen = u32::try_from(pkt[icmp_start..].len()).ok()?;
         sum += plen >> 16;
         sum += plen & 0xFFFF;
         sum += 58u32;
@@ -530,13 +537,13 @@ mod pipeline {
             } else {
                 u16::from_be_bytes([pkt[icmp_start + j], 0])
             };
-            sum += w as u32;
+            sum += u32::from(w);
             j += 2;
         }
         while sum >> 16 != 0 {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }
-        let cksum = !(sum as u16);
+        let cksum = !low_u16(sum);
         pkt[icmp_start + 2..icmp_start + 4].copy_from_slice(&cksum.to_be_bytes());
         Some(pkt)
     }
@@ -550,12 +557,12 @@ mod pipeline {
             } else {
                 u16::from_be_bytes([data[i], 0])
             };
-            sum += word as u32;
+            sum += u32::from(word);
             i += 2;
         }
         while sum >> 16 != 0 {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }
-        !(sum as u16)
+        !low_u16(sum)
     }
 }
