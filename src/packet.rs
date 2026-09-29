@@ -106,7 +106,7 @@ pub fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
     }
 }
 
-const fn ipv4_header_len(buf: &[u8]) -> Result<usize, PacketError> {
+fn ipv4_header_len(buf: &[u8]) -> Result<usize, PacketError> {
     if buf.len() < IPV4_HEADER_LEN {
         return Err(PacketError::TooShort {
             version: 4,
