@@ -11,10 +11,23 @@
 
 //! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
 
-use anyhow::Result;
-use clap::{Parser, Subcommand};
-use std::time::Duration;
-use usque_rs::{config, register, tun_device, tunnel};
+use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
+use usque_rs::{
+    config,
+    packet_session::PacketSessionConfig,
+    proxy::{
+        http::{self as http_proxy, HttpConfig},
+        net::VirtualNet,
+        socks::{self, SocksConfig},
+    },
+    register, tun_device, tunnel, MasquePacketStream,
+};
 
 #[derive(Parser)]
 #[command(
@@ -27,6 +40,24 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Args, Clone)]
+struct ProxyTransportArgs {
+    #[arg(short = 'P', long, default_value_t = 443)]
+    connect_port: u16,
+    #[arg(short = '6', long, default_value_t = false)]
+    ipv6: bool,
+    #[arg(short = 'F', long, default_value_t = false)]
+    no_tunnel_ipv4: bool,
+    #[arg(short = 'S', long, default_value_t = false)]
+    no_tunnel_ipv6: bool,
+    #[arg(short, long, default_value = "consumer-masque.cloudflareclient.com")]
+    sni_address: String,
+    #[arg(short, long, default_value_t = 30)]
+    keepalive_period: u64,
+    #[arg(short, long, default_value_t = 1280)]
+    mtu: u32,
 }
 
 struct AddressSelection {
@@ -84,6 +115,33 @@ enum Commands {
         #[arg(short = 'n', long)]
         interface_name: Option<String>,
     },
+    /// Expose WARP as a dual-stack SOCKS5/SOCKS5h proxy.
+    Socks {
+        #[arg(short, long, default_value = "127.0.0.1")]
+        bind: IpAddr,
+        #[arg(short, long, default_value_t = 1080)]
+        port: u16,
+        #[arg(short, long)]
+        username: Option<String>,
+        #[arg(short = 'w', long)]
+        password: Option<String>,
+        #[command(flatten)]
+        transport: ProxyTransportArgs,
+    },
+    /// Expose WARP as a streaming HTTP/1.1 proxy with CONNECT support.
+    #[command(name = "http-proxy")]
+    HttpProxy {
+        #[arg(short, long, default_value = "127.0.0.1")]
+        bind: IpAddr,
+        #[arg(short, long, default_value_t = 8000)]
+        port: u16,
+        #[arg(short, long)]
+        username: Option<String>,
+        #[arg(short = 'w', long)]
+        password: Option<String>,
+        #[command(flatten)]
+        transport: ProxyTransportArgs,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -128,6 +186,20 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::Socks {
+            bind,
+            port,
+            username,
+            password,
+            transport,
+        } => cmd_socks(&cli.config, bind, port, username, password, &transport).await,
+        Commands::HttpProxy {
+            bind,
+            port,
+            username,
+            password,
+            transport,
+        } => cmd_http_proxy(&cli.config, bind, port, username, password, &transport).await,
     }
 }
 
@@ -226,4 +298,156 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
     };
 
     tunnel::maintain_tunnel(&cfg, &tunnel_cfg, tun_dev).await
+}
+
+async fn cmd_socks(
+    config_path: &str,
+    bind: IpAddr,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    transport: &ProxyTransportArgs,
+) -> Result<()> {
+    validate_auth_pair(username.as_deref(), password.as_deref())?;
+    let net = create_proxy_net(config_path, transport).await?;
+    socks::serve(
+        SocksConfig {
+            bind: SocketAddr::new(bind, port),
+            username,
+            password,
+        },
+        net,
+    )
+    .await
+}
+
+async fn cmd_http_proxy(
+    config_path: &str,
+    bind: IpAddr,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    transport: &ProxyTransportArgs,
+) -> Result<()> {
+    validate_auth_pair(username.as_deref(), password.as_deref())?;
+    let net = create_proxy_net(config_path, transport).await?;
+    http_proxy::serve(
+        HttpConfig {
+            bind: SocketAddr::new(bind, port),
+            username,
+            password,
+        },
+        net,
+    )
+    .await
+}
+
+async fn create_proxy_net(
+    config_path: &str,
+    transport: &ProxyTransportArgs,
+) -> Result<Arc<VirtualNet>> {
+    if transport.keepalive_period == 0 {
+        anyhow::bail!("keepalive period must be greater than zero");
+    }
+    if transport.no_tunnel_ipv4 && transport.no_tunnel_ipv6 {
+        anyhow::bail!("at least one tunnel address family must be enabled");
+    }
+    if transport.mtu != 1280 {
+        log::warn!(
+            "MTU {} differs from the supported/default 1280; packet loss or PMTU issues may occur",
+            transport.mtu
+        );
+    }
+
+    let config = config::Config::load(config_path)?;
+    let endpoint_ip: IpAddr = if transport.ipv6 {
+        config.endpoint_v6.parse()?
+    } else {
+        config.endpoint_v4.parse()?
+    };
+    let endpoint = SocketAddr::new(endpoint_ip, transport.connect_port);
+
+    let local_v4 = if transport.no_tunnel_ipv4 {
+        None
+    } else {
+        Some(parse_assigned_ipv4(&config.ipv4)?)
+    };
+    let local_v6 = if transport.no_tunnel_ipv6 {
+        None
+    } else {
+        Some(parse_assigned_ipv6(&config.ipv6)?)
+    };
+
+    let packet_stream = MasquePacketStream::connect(
+        Arc::new(config),
+        PacketSessionConfig {
+            endpoint,
+            bind: None,
+            sni: transport.sni_address.clone(),
+            keepalive_period: Duration::from_secs(transport.keepalive_period),
+            mtu: transport.mtu,
+        },
+    )
+    .await?;
+
+    let mtu = usize::try_from(transport.mtu)
+        .map_err(|_| anyhow::anyhow!("MTU does not fit usize: {}", transport.mtu))?;
+    VirtualNet::start(packet_stream, local_v4, local_v6, mtu).map_err(Into::into)
+}
+
+fn parse_assigned_ipv4(value: &str) -> Result<Ipv4Addr> {
+    value
+        .split('/')
+        .next()
+        .unwrap_or(value)
+        .parse()
+        .with_context(|| format!("invalid configured WARP IPv4 address {value:?}"))
+}
+
+fn parse_assigned_ipv6(value: &str) -> Result<Ipv6Addr> {
+    value
+        .split('/')
+        .next()
+        .unwrap_or(value)
+        .parse()
+        .with_context(|| format!("invalid configured WARP IPv6 address {value:?}"))
+}
+
+fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<()> {
+    match (username, password) {
+        (Some(_), Some(_)) | (None, None) => Ok(()),
+        _ => anyhow::bail!("username and password must be supplied together"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn proxy_commands_default_to_loopback() -> Result<()> {
+        let socks = Cli::try_parse_from(["usque-rs", "socks"])?;
+        let Commands::Socks { bind, port, .. } = socks.command else {
+            anyhow::bail!("expected SOCKS command");
+        };
+        assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(port, 1080);
+
+        let http = Cli::try_parse_from(["usque-rs", "http-proxy"])?;
+        let Commands::HttpProxy { bind, port, .. } = http.command else {
+            anyhow::bail!("expected HTTP proxy command");
+        };
+        assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(port, 8000);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_authentication_requires_a_complete_pair() {
+        assert!(validate_auth_pair(None, None).is_ok());
+        assert!(validate_auth_pair(Some("user"), Some("pass")).is_ok());
+        assert!(validate_auth_pair(Some("user"), None).is_err());
+        assert!(validate_auth_pair(None, Some("pass")).is_err());
+    }
 }

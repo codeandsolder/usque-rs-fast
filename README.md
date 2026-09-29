@@ -2,11 +2,59 @@
 
 A tiny Rust rewrite of my previous [usque](https://github.com/Diniboy1123/usque) project. The goal is simple: a decently fast, native tunnel using Cloudflare WARP and its MASQUE-based protocol.
 
-This is just the `nativetun` implementation from the [Go version](https://github.com/Diniboy1123/usque/blob/main/README.md#native-tunnel-mode-for-advanced-users-linux-and-windows-only) and it's **Linux-only**. If you need proxy support or other platforms, this isn't for you. Check the docs over there to understand the project better.
+The Rust client supports both the Linux `nativetun` mode and userspace TCP proxy modes. The proxy path runs a dual-stack smoltcp network stack directly over the existing MASQUE CONNECT-IP session, so it does not require a host TUN device.
 
-Just like the Go based usque project, this tool also won't try to mess with your routes, you gotta set them up yourself. IP(v4 and v6) address and MTU is configured for you.
+Just like the Go based usque project, `nativetun` won't try to choose or replace your routes; you still control routing policy. The TUN IP addresses and MTU are configured for you.
 
 Read [SETUP_NOTES.md](SETUP_NOTES.md) for my use-case.
+
+## Proxy modes
+
+Both proxy listeners bind to loopback by default. Binding to a non-loopback address is explicit; if you do that, configure `--username` and `--password` together unless you deliberately want an unauthenticated proxy.
+
+Start a SOCKS5 proxy:
+
+```sh
+usque-rs -c config.json socks
+```
+
+The distinction between SOCKS5 and SOCKS5h is made by the client, not by a separate server mode:
+
+```sh
+# curl resolves the hostname locally and sends an IP address to the proxy.
+curl --socks5 127.0.0.1:1080 https://example.com/
+
+# curl sends the hostname to usque-rs; DNS resolution happens inside the WARP-side userspace stack.
+curl --socks5-hostname 127.0.0.1:1080 https://example.com/
+```
+
+SOCKS5 UDP ASSOCIATE is also supported. UDP destinations may be literal IPv4/IPv6 addresses or domain names; domain targets are resolved through the tunneled WARP-side resolver. SOCKS UDP fragmentation (`FRAG != 0`) is not supported, but ordinary large UDP datagrams are carried using IP fragmentation/reassembly inside the userspace stack when needed.
+
+Start the streaming HTTP/1.1 proxy:
+
+```sh
+usque-rs -c config.json http-proxy
+```
+
+It supports ordinary HTTP forwarding and HTTPS tunnelling with `CONNECT`:
+
+```sh
+curl --proxy http://127.0.0.1:8000 http://example.com/
+curl --proxy http://127.0.0.1:8000 https://example.com/
+```
+
+Optional proxy authentication uses the same flags in both modes:
+
+```sh
+usque-rs -c config.json socks --username alice --password secret
+usque-rs -c config.json http-proxy --username alice --password secret
+```
+
+For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected.
+
+The proxy transport accepts the same WARP-side family controls as the native tunnel (`--ipv6`, `--no-tunnel-ipv4`, `--no-tunnel-ipv6`, `--connect-port`, `--sni-address`, `--keepalive-period`, and `--mtu`). Hostname targets use tunneled DNS and dual-stack connections use staggered IPv6/IPv4 connection attempts rather than waiting through a dead address family serially.
+
+After building the binary, `tests/proxy_smoke.sh` runs authenticated SOCKS5, SOCKS5h, HTTP-forwarding, and HTTPS-CONNECT checks against a real WARP config. Set `USQUE_BIN` if the binary is outside `target/debug/usque-rs`, and pass a config path readable by the account running the test.
 
 ## Why the rewrite?
 
