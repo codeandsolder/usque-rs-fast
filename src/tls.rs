@@ -151,10 +151,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_legacy_sec1_private_key() {
-        let secret = SecretKey::from_slice(&[1u8; 32]).expect("valid P-256 scalar");
-        let sec1 = secret.to_sec1_der().expect("encode SEC1");
-        let parsed = parse_signing_key(sec1.as_ref()).expect("parse legacy SEC1 key");
+    fn accepts_legacy_sec1_private_key() -> Result<()> {
+        let secret = SecretKey::from_slice(&[1u8; 32])?;
+        let sec1 = secret.to_sec1_der()?;
+        let parsed = parse_signing_key(sec1.as_ref())?;
         assert_eq!(parsed.to_bytes().as_slice(), secret.to_bytes().as_slice());
+        Ok(())
     }
 }

@@ -199,10 +199,16 @@ mod tests {
         pkt
     }
 
+    fn require_icmp(original: &[u8], mtu: u16) -> Vec<u8> {
+        let response = compose_icmp_too_large(original, mtu);
+        assert!(response.is_some(), "expected ICMP too-large response");
+        response.unwrap_or_default()
+    }
+
     #[test]
     fn icmpv4_too_large_small_mtu() {
         let original = make_ipv4_packet(576, [10, 0, 0, 1], [10, 0, 0, 2]);
-        let resp = compose_icmp_too_large(&original, 512).expect("should produce ICMP");
+        let resp = require_icmp(&original, 512);
 
         // Outer IP header checks
         assert_eq!(resp[0] >> 4, 4, "IPv4 response");
@@ -227,7 +233,7 @@ mod tests {
     #[test]
     fn icmpv4_too_large_big_mtu() {
         let original = make_ipv4_packet(9000, [192, 168, 1, 1], [8, 8, 8, 8]);
-        let resp = compose_icmp_too_large(&original, 1280).expect("should produce ICMP");
+        let resp = require_icmp(&original, 1280);
 
         let icmp = &resp[IPV4_HEADER_LEN..];
         let mtu_val = u16::from_be_bytes([icmp[6], icmp[7]]);
@@ -240,7 +246,7 @@ mod tests {
     fn icmpv4_minimum_header_only() {
         // Exactly 20-byte packet (header only, no payload beyond header)
         let original = make_ipv4_packet(20, [1, 2, 3, 4], [5, 6, 7, 8]);
-        let resp = compose_icmp_too_large(&original, 576).expect("should produce ICMP");
+        let resp = require_icmp(&original, 576);
 
         let icmp = &resp[IPV4_HEADER_LEN..];
         // ICMP payload = min(20+8, 20) = 20 bytes (just the header)
@@ -258,7 +264,7 @@ mod tests {
         let src = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
         let original = make_ipv6_packet(1500, src, dst);
-        let resp = compose_icmp_too_large(&original, 1280).expect("should produce ICMPv6");
+        let resp = require_icmp(&original, 1280);
 
         // Outer IPv6 header
         assert_eq!(resp[0] >> 4, 6, "IPv6 response");
@@ -281,7 +287,7 @@ mod tests {
         let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
         let original = make_ipv6_packet(9000, src, dst);
-        let resp = compose_icmp_too_large(&original, 1500).expect("should produce ICMPv6");
+        let resp = require_icmp(&original, 1500);
 
         let icmp = &resp[IPV6_HEADER_LEN..];
         // Payload should be capped at 1232 bytes
@@ -296,7 +302,7 @@ mod tests {
         let src = [0; 16];
         let dst = [1; 16];
         let original = make_ipv6_packet(40, src, dst); // header only
-        let resp = compose_icmp_too_large(&original, 1280).expect("should produce ICMPv6");
+        let resp = require_icmp(&original, 1280);
 
         let icmp = &resp[IPV6_HEADER_LEN..];
         assert_eq!(icmp.len() - ICMP_HEADER_LEN, 40);
@@ -324,7 +330,7 @@ mod tests {
     fn icmpv4_checksum_validates() {
         // Ensure the full response (IP + ICMP) has valid checksums
         let original = make_ipv4_packet(1500, [172, 16, 0, 1], [1, 1, 1, 1]);
-        let resp = compose_icmp_too_large(&original, 1280).unwrap();
+        let resp = require_icmp(&original, 1280);
 
         // Validate IP header checksum
         let mut ip_sum: u32 = (0..IPV4_HEADER_LEN)
@@ -359,7 +365,7 @@ mod tests {
         let mut original = make_ipv4_packet(36, [192, 0, 2, 1], [198, 51, 100, 2]);
         original[0] = 0x46;
         original[20..24].copy_from_slice(&[1, 1, 1, 0]);
-        let response = compose_icmp_too_large(&original, 1280).expect("ICMP response");
+        let response = require_icmp(&original, 1280);
         let quoted = &response[IPV4_HEADER_LEN + ICMP_HEADER_LEN..];
         assert_eq!(quoted.len(), 32);
         assert_eq!(&quoted[..24], &original[..24]);

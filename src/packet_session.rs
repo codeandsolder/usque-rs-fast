@@ -832,32 +832,36 @@ mod tests {
         let mut tmp = [0u8; 8];
         let len = {
             let mut builder = octets::OctetsMut::with_slice(&mut tmp);
-            builder.put_varint(value).unwrap();
+            assert!(builder.put_varint(value).is_ok());
             builder.off()
         };
         tmp[..len].to_vec()
     }
 
     #[test]
-    fn parse_datagram_offset_valid() {
+    fn parse_datagram_offset_valid() -> Result<()> {
         let payload = b"hello";
         let mut datagram = Vec::new();
         datagram.extend_from_slice(&encode_varint(0));
         datagram.extend_from_slice(&encode_varint(0));
         datagram.extend_from_slice(payload);
 
-        let offset = parse_datagram_offset(&datagram, 0).unwrap();
+        let offset = parse_datagram_offset(&datagram, 0)
+            .ok_or_else(|| anyhow::anyhow!("test datagram should parse"))?;
         assert_eq!(&datagram[offset..], payload);
+        Ok(())
     }
 
     #[test]
-    fn build_flow_datagram_prepares_ttl() {
-        let flow_prefix = build_flow_prefix(0).expect("test flow ID fits QUIC varint");
+    fn build_flow_datagram_prepares_ttl() -> Result<()> {
+        let flow_prefix = build_flow_prefix(0)?;
         let packet = Bytes::from_static(&[
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 64, 0x11, 0x00, 0x00, 10, 0, 0, 1, 10,
             0, 0, 2,
         ]);
-        let datagram = build_flow_datagram(&flow_prefix, &packet).unwrap();
+        let datagram = build_flow_datagram(&flow_prefix, &packet)
+            .ok_or_else(|| anyhow::anyhow!("test packet should produce a flow datagram"))?;
         assert_eq!(datagram[flow_prefix.len() + 8], 63);
+        Ok(())
     }
 }

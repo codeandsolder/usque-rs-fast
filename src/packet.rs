@@ -282,14 +282,14 @@ mod tests {
     #[test]
     fn test_ipv4_small_mtu_packet() {
         let mut pkt = make_ipv4(68);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
     }
 
     #[test]
     fn test_ipv4_576_mtu_packet() {
         let mut pkt = make_ipv4(576);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
         // Verify checksum is correct after decrement
         let mut sum: u32 = (0..20)
@@ -305,42 +305,42 @@ mod tests {
     #[test]
     fn test_ipv4_1280_mtu_packet() {
         let mut pkt = make_ipv4(1280);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
     }
 
     #[test]
     fn test_ipv4_1500_mtu_packet() {
         let mut pkt = make_ipv4(1500);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
     }
 
     #[test]
     fn test_ipv4_9000_jumbo_mtu_packet() {
         let mut pkt = make_ipv4(9000);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
     }
 
     #[test]
     fn test_ipv6_1280_minimum_mtu() {
         let mut pkt = make_ipv6(1280);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 6);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 6);
         assert_eq!(pkt[7], 63);
     }
 
     #[test]
     fn test_ipv6_1500_mtu_packet() {
         let mut pkt = make_ipv6(1500);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 6);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 6);
         assert_eq!(pkt[7], 63);
     }
 
     #[test]
     fn test_ipv6_9000_jumbo_mtu_packet() {
         let mut pkt = make_ipv6(9000);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 6);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 6);
         assert_eq!(pkt[7], 63);
     }
 
@@ -348,7 +348,11 @@ mod tests {
     fn test_validate_incoming_ipv4_various_sizes() {
         for size in [20, 68, 576, 1280, 1500, 9000] {
             let pkt = make_ipv4(size);
-            assert_eq!(validate_incoming(&pkt).unwrap(), 4, "size={size}");
+            assert_eq!(
+                validate_incoming(&pkt).unwrap_or_default(),
+                4,
+                "size={size}"
+            );
         }
     }
 
@@ -356,7 +360,11 @@ mod tests {
     fn test_validate_incoming_ipv6_various_sizes() {
         for size in [40, 1280, 1500, 9000] {
             let pkt = make_ipv6(size);
-            assert_eq!(validate_incoming(&pkt).unwrap(), 6, "size={size}");
+            assert_eq!(
+                validate_incoming(&pkt).unwrap_or_default(),
+                6,
+                "size={size}"
+            );
         }
     }
 
@@ -373,7 +381,7 @@ mod tests {
         assert_eq!(checksum, 0xfeff);
         pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
 
-        prepare_outgoing(&mut pkt).unwrap();
+        assert!(prepare_outgoing(&mut pkt).is_ok());
 
         let incremental = u16::from_be_bytes([pkt[10], pkt[11]]);
         let recomputed = calculate_ipv4_checksum(&pkt);
@@ -416,7 +424,10 @@ mod tests {
         let checksum = calculate_ipv4_checksum(&pkt);
         pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
 
-        prepare_outgoing(&mut pkt).expect("packet with IPv4 options should be accepted");
+        assert!(
+            prepare_outgoing(&mut pkt).is_ok(),
+            "packet with IPv4 options should be accepted"
+        );
         let mut sum = 0u32;
         for chunk in pkt[..24].as_chunks::<2>().0 {
             sum += u32::from(u16::from_be_bytes(*chunk));

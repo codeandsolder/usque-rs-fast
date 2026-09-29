@@ -250,7 +250,10 @@ mod tests {
 
     #[test]
     fn http_client_builds_with_explicit_ring_and_webpki_roots() {
-        build_client().expect("registration HTTP client should build");
+        assert!(
+            build_client().is_ok(),
+            "registration HTTP client should build"
+        );
     }
 
     #[test]

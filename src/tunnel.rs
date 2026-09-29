@@ -691,7 +691,7 @@ mod tests {
     fn encode_varint(val: u64) -> Vec<u8> {
         let mut tmp = [0u8; 8];
         let mut b = octets::OctetsMut::with_slice(&mut tmp);
-        b.put_varint(val).unwrap();
+        assert!(b.put_varint(val).is_ok());
         let len = b.off();
         tmp[..len].to_vec()
     }
