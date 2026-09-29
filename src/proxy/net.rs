@@ -454,28 +454,30 @@ impl VirtualNet {
         };
         self.shared.activity.notify_one();
 
-        tokio::time::timeout(
-            DNS_TIMEOUT,
-            poll_fn(|cx| {
-                let mut inner = lock_stack(&self.shared);
-                let socket = inner.sockets.get_mut::<dns::Socket>(socket_handle);
-                match socket.get_query_result(query_handle) {
-                    Ok(addresses) => {
-                        Poll::Ready(Ok(addresses.into_iter().map(smoltcp_to_std_ip).collect()))
-                    }
-                    Err(dns::GetQueryResultError::Pending) => {
-                        socket.register_query_waker(query_handle, cx.waker());
-                        Poll::Pending
-                    }
-                    Err(dns::GetQueryResultError::Failed) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("DNS query failed for {host}"),
-                    ))),
+        let query = poll_fn(|cx| {
+            let mut inner = lock_stack(&self.shared);
+            let socket = inner.sockets.get_mut::<dns::Socket>(socket_handle);
+            match socket.get_query_result(query_handle) {
+                Ok(addresses) => {
+                    Poll::Ready(Ok(addresses.into_iter().map(smoltcp_to_std_ip).collect()))
                 }
-            }),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("DNS timeout for {host}")))?
+                Err(dns::GetQueryResultError::Pending) => {
+                    socket.register_query_waker(query_handle, cx.waker());
+                    Poll::Pending
+                }
+                Err(dns::GetQueryResultError::Failed) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("DNS query failed for {host}"),
+                ))),
+            }
+        });
+
+        tokio::select! {
+            result = tokio::time::timeout(DNS_TIMEOUT, query) => result.map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, format!("DNS timeout for {host}"))
+            })?,
+            () = self.wait_closed() => Err(Shared::closed_error()),
+        }
     }
 
     fn dns_servers(&self) -> Vec<IpAddress> {
