@@ -27,6 +27,7 @@ const TCP_BUFFER_SIZE: usize = 256 * 1024;
 const FIRST_EPHEMERAL_PORT: u16 = 49_152;
 const LAST_EPHEMERAL_PORT: u16 = 65_535;
 const DNS_TIMEOUT: Duration = Duration::from_secs(8);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REACTOR_TICK: Duration = Duration::from_millis(10);
 const RETIRED_SOCKET_GRACE: Duration = Duration::from_secs(30);
 
@@ -315,23 +316,32 @@ impl VirtualNet {
             handle: Some(handle),
         };
 
-        poll_fn(|cx| {
-            let mut inner = lock_stack(&self.shared);
-            let socket = inner.sockets.get_mut::<tcp::Socket>(handle);
-            match socket.state() {
-                tcp::State::Established => Poll::Ready(Ok(())),
-                tcp::State::Closed | tcp::State::TimeWait => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "userspace TCP connection closed during handshake",
-                ))),
-                _ => {
-                    socket.register_recv_waker(cx.waker());
-                    socket.register_send_waker(cx.waker());
-                    Poll::Pending
+        tokio::time::timeout(
+            TCP_CONNECT_TIMEOUT,
+            poll_fn(|cx| {
+                let mut inner = lock_stack(&self.shared);
+                let socket = inner.sockets.get_mut::<tcp::Socket>(handle);
+                match socket.state() {
+                    tcp::State::Established => Poll::Ready(Ok(())),
+                    tcp::State::Closed | tcp::State::TimeWait => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "userspace TCP connection closed during handshake",
+                    ))),
+                    _ => {
+                        socket.register_recv_waker(cx.waker());
+                        socket.register_send_waker(cx.waker());
+                        Poll::Pending
+                    }
                 }
-            }
-        })
-        .await?;
+            }),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("userspace TCP connect to {remote} timed out"),
+            )
+        })??;
 
         guard.handle = None;
         Ok(VirtualTcpStream {
@@ -579,7 +589,7 @@ impl Drop for VirtualTcpStream {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             let mut inner = lock_stack(&self.shared);
-            inner.retire(handle, false);
+            inner.retire(handle, true);
             drop(inner);
             self.shared.activity.notify_one();
         }
