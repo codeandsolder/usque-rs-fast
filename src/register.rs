@@ -45,8 +45,6 @@ pub struct AccountData {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Account {
-    #[allow(dead_code)]
-    pub id: String,
     pub license: Option<String>,
 }
 
@@ -86,8 +84,6 @@ pub struct ApiError {
 
 #[derive(Debug, Deserialize)]
 pub struct ErrorInfo {
-    #[allow(dead_code)]
-    pub code: i64,
     pub message: String,
 }
 

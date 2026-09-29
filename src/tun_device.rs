@@ -5,8 +5,6 @@ pub struct TunConfig {
     pub mtu: u32,
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
-    #[allow(dead_code)]
-    pub setup_addresses: bool,
 }
 
 pub fn create_tun(cfg: &TunConfig) -> Result<tun_rs::AsyncDevice> {

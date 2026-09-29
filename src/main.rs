@@ -29,6 +29,18 @@ struct Cli {
     command: Commands,
 }
 
+struct NativeTunOptions {
+    connect_port: u16,
+    use_ipv6: bool,
+    no_tunnel_ipv4: bool,
+    no_tunnel_ipv6: bool,
+    sni: String,
+    keepalive_period: Duration,
+    mtu: u32,
+    no_iproute2: bool,
+    interface_name: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Register a new client and enroll a device key
@@ -96,15 +108,17 @@ async fn main() -> Result<()> {
         } => {
             cmd_nativetun(
                 &cli.config,
-                connect_port,
-                ipv6,
-                no_tunnel_ipv4,
-                no_tunnel_ipv6,
-                &sni_address,
-                Duration::from_secs(keepalive_period),
-                mtu,
-                no_iproute2,
-                interface_name,
+                NativeTunOptions {
+                    connect_port,
+                    use_ipv6: ipv6,
+                    no_tunnel_ipv4,
+                    no_tunnel_ipv6,
+                    sni: sni_address,
+                    keepalive_period: Duration::from_secs(keepalive_period),
+                    mtu,
+                    no_iproute2,
+                    interface_name,
+                },
             )
             .await
         }
@@ -142,19 +156,18 @@ async fn cmd_register(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn cmd_nativetun(
-    config_path: &str,
-    connect_port: u16,
-    use_ipv6: bool,
-    no_tunnel_ipv4: bool,
-    no_tunnel_ipv6: bool,
-    sni: &str,
-    keepalive_period: Duration,
-    mtu: u32,
-    no_iproute2: bool,
-    interface_name: Option<String>,
-) -> Result<()> {
+async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<()> {
+    let NativeTunOptions {
+        connect_port,
+        use_ipv6,
+        no_tunnel_ipv4,
+        no_tunnel_ipv6,
+        sni,
+        keepalive_period,
+        mtu,
+        no_iproute2,
+        interface_name,
+    } = options;
     if keepalive_period.is_zero() {
         anyhow::bail!("keepalive period must be greater than zero");
     }
@@ -187,7 +200,6 @@ async fn cmd_nativetun(
         } else {
             Some(cfg.ipv6.clone())
         },
-        setup_addresses: !no_iproute2,
     };
     let tun_dev = tun_device::create_tun(&tun_cfg)?;
 
@@ -199,7 +211,7 @@ async fn cmd_nativetun(
 
     let tunnel_cfg = tunnel::TunnelConfig {
         endpoint,
-        sni: sni.to_string(),
+        sni,
         keepalive_period,
         mtu,
     };
