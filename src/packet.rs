@@ -24,6 +24,11 @@ const fn ip_version(buf: &[u8]) -> u8 {
 
 /// Validate an IP packet and decrement TTL/Hop Limit in-place.
 /// Returns the IP version (4 or 6) on success.
+///
+/// # Errors
+///
+/// Returns `PacketError` when the packet is empty, malformed, has an unknown
+/// IP version, or has an expired TTL/hop limit.
 pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
     if buf.is_empty() {
         return Err(PacketError::Empty);
@@ -50,7 +55,8 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
             while sum >> 16 != 0 {
                 sum = (sum & 0xFFFF) + (sum >> 16);
             }
-            let checksum = !(sum as u16);
+            let bytes = sum.to_be_bytes();
+            let checksum = !u16::from_be_bytes([bytes[2], bytes[3]]);
             buf[10..12].copy_from_slice(&checksum.to_be_bytes());
             Ok(4)
         }
@@ -73,6 +79,11 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
 }
 
 /// Validate an incoming IP packet (basic checks only).
+///
+/// # Errors
+///
+/// Returns `PacketError` when the packet is empty, malformed, or has an
+/// unknown IP version.
 pub fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
     if buf.is_empty() {
         return Err(PacketError::Empty);
@@ -95,7 +106,7 @@ pub fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
     }
 }
 
-const fn ipv4_header_len(buf: &[u8]) -> Result<usize, PacketError> {
+fn ipv4_header_len(buf: &[u8]) -> Result<usize, PacketError> {
     if buf.len() < IPV4_HEADER_LEN {
         return Err(PacketError::TooShort {
             version: 4,
@@ -103,7 +114,7 @@ const fn ipv4_header_len(buf: &[u8]) -> Result<usize, PacketError> {
         });
     }
 
-    let ihl = ((buf[0] & 0x0F) as usize) * 4;
+    let ihl = usize::from(buf[0] & 0x0F) * 4;
     if ihl < IPV4_HEADER_LEN || ihl > buf.len() {
         return Err(PacketError::InvalidIpv4HeaderLength {
             ihl,
@@ -139,12 +150,18 @@ fn calculate_ipv4_checksum(header: &[u8]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
-    !(sum as u16)
+    let bytes = sum.to_be_bytes();
+    !u16::from_be_bytes([bytes[2], bytes[3]])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn low_u16(value: u32) -> u16 {
+        let bytes = value.to_be_bytes();
+        u16::from_be_bytes([bytes[2], bytes[3]])
+    }
 
     #[test]
     fn test_ipv4_checksum() {
@@ -165,7 +182,7 @@ mod tests {
         while v >> 16 != 0 {
             v = (v & 0xFFFF) + (v >> 16);
         }
-        assert_eq!(v as u16, 0xFFFF);
+        assert_eq!(low_u16(v), 0xFFFF);
     }
 
     #[test]
@@ -254,11 +271,11 @@ mod tests {
 
     // ---- MTU boundary tests ----
 
-    fn make_ipv4(total_len: usize) -> Vec<u8> {
+    fn make_ipv4(total_len: u16) -> Vec<u8> {
         assert!(total_len >= 20);
-        let mut pkt = vec![0u8; total_len];
+        let mut pkt = vec![0u8; usize::from(total_len)];
         pkt[0] = 0x45;
-        pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
         pkt[8] = 64;
         pkt[9] = 17;
         pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
@@ -268,11 +285,11 @@ mod tests {
         pkt
     }
 
-    fn make_ipv6(total_len: usize) -> Vec<u8> {
+    fn make_ipv6(total_len: u16) -> Vec<u8> {
         assert!(total_len >= 40);
-        let mut pkt = vec![0u8; total_len];
+        let mut pkt = vec![0u8; usize::from(total_len)];
         pkt[0] = 0x60;
-        let payload_len = (total_len - 40) as u16;
+        let payload_len = total_len - 40;
         pkt[4..6].copy_from_slice(&payload_len.to_be_bytes());
         pkt[6] = 17;
         pkt[7] = 64;
@@ -282,14 +299,14 @@ mod tests {
     #[test]
     fn test_ipv4_small_mtu_packet() {
         let mut pkt = make_ipv4(68);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
     }
 
     #[test]
     fn test_ipv4_576_mtu_packet() {
         let mut pkt = make_ipv4(576);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
         // Verify checksum is correct after decrement
         let mut sum: u32 = (0..20)
@@ -299,48 +316,48 @@ mod tests {
         while sum >> 16 != 0 {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }
-        assert_eq!(sum as u16, 0xFFFF);
+        assert_eq!(low_u16(sum), 0xFFFF);
     }
 
     #[test]
     fn test_ipv4_1280_mtu_packet() {
         let mut pkt = make_ipv4(1280);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
     }
 
     #[test]
     fn test_ipv4_1500_mtu_packet() {
         let mut pkt = make_ipv4(1500);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
     }
 
     #[test]
     fn test_ipv4_9000_jumbo_mtu_packet() {
         let mut pkt = make_ipv4(9000);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 4);
         assert_eq!(pkt[8], 63);
     }
 
     #[test]
     fn test_ipv6_1280_minimum_mtu() {
         let mut pkt = make_ipv6(1280);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 6);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 6);
         assert_eq!(pkt[7], 63);
     }
 
     #[test]
     fn test_ipv6_1500_mtu_packet() {
         let mut pkt = make_ipv6(1500);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 6);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 6);
         assert_eq!(pkt[7], 63);
     }
 
     #[test]
     fn test_ipv6_9000_jumbo_mtu_packet() {
         let mut pkt = make_ipv6(9000);
-        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 6);
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap_or_default(), 6);
         assert_eq!(pkt[7], 63);
     }
 
@@ -348,7 +365,11 @@ mod tests {
     fn test_validate_incoming_ipv4_various_sizes() {
         for size in [20, 68, 576, 1280, 1500, 9000] {
             let pkt = make_ipv4(size);
-            assert_eq!(validate_incoming(&pkt).unwrap(), 4, "size={size}");
+            assert_eq!(
+                validate_incoming(&pkt).unwrap_or_default(),
+                4,
+                "size={size}"
+            );
         }
     }
 
@@ -356,7 +377,11 @@ mod tests {
     fn test_validate_incoming_ipv6_various_sizes() {
         for size in [40, 1280, 1500, 9000] {
             let pkt = make_ipv6(size);
-            assert_eq!(validate_incoming(&pkt).unwrap(), 6, "size={size}");
+            assert_eq!(
+                validate_incoming(&pkt).unwrap_or_default(),
+                6,
+                "size={size}"
+            );
         }
     }
 
@@ -373,7 +398,7 @@ mod tests {
         assert_eq!(checksum, 0xfeff);
         pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
 
-        prepare_outgoing(&mut pkt).unwrap();
+        assert!(prepare_outgoing(&mut pkt).is_ok());
 
         let incremental = u16::from_be_bytes([pkt[10], pkt[11]]);
         let recomputed = calculate_ipv4_checksum(&pkt);
@@ -401,7 +426,11 @@ mod tests {
             while sum >> 16 != 0 {
                 sum = (sum & 0xFFFF) + (sum >> 16);
             }
-            assert_eq!(sum as u16, 0xFFFF, "checksum invalid at ttl={expected_ttl}");
+            assert_eq!(
+                low_u16(sum),
+                0xFFFF,
+                "checksum invalid at ttl={expected_ttl}"
+            );
         }
     }
     #[test]
@@ -416,7 +445,10 @@ mod tests {
         let checksum = calculate_ipv4_checksum(&pkt);
         pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
 
-        prepare_outgoing(&mut pkt).expect("packet with IPv4 options should be accepted");
+        assert!(
+            prepare_outgoing(&mut pkt).is_ok(),
+            "packet with IPv4 options should be accepted"
+        );
         let mut sum = 0u32;
         for chunk in pkt[..24].as_chunks::<2>().0 {
             sum += u32::from(u16::from_be_bytes(*chunk));
@@ -424,7 +456,7 @@ mod tests {
         while sum >> 16 != 0 {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }
-        assert_eq!(sum as u16, 0xFFFF);
+        assert_eq!(low_u16(sum), 0xFFFF);
     }
 
     #[test]

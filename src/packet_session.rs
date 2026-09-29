@@ -6,7 +6,7 @@ use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use std::collections::VecDeque;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -86,7 +86,31 @@ struct PendingUdpSend {
     to: SocketAddr,
 }
 
+#[derive(Clone, Copy)]
+struct DatagramPath {
+    local_addr: SocketAddr,
+    endpoint: SocketAddr,
+}
+
+fn connect_request_headers() -> Vec<quiche::h3::Header> {
+    vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+        quiche::h3::Header::new(b":path", b"/"),
+        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        quiche::h3::Header::new(b"user-agent", b""),
+    ]
+}
+
 impl MasquePacketStream {
+    /// Establish a reusable MASQUE CONNECT-IP packet stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid session configuration, socket/TLS/QUIC
+    /// failures, endpoint-key mismatch, or CONNECT rejection.
     pub async fn connect(config: Arc<Config>, session_cfg: PacketSessionConfig) -> Result<Self> {
         if session_cfg.keepalive_period.is_zero() {
             bail!("keepalive period must be greater than zero");
@@ -99,8 +123,8 @@ impl MasquePacketStream {
             session_cfg
                 .bind
                 .unwrap_or_else(|| match session_cfg.endpoint {
-                    SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-                    SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+                    SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                    SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
                 });
 
         let socket = bind_udp_socket(bind_addr, "masque-packet-stream")?;
@@ -151,16 +175,7 @@ impl MasquePacketStream {
 
         let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
 
-        let req = vec![
-            quiche::h3::Header::new(b":method", b"CONNECT"),
-            quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
-            quiche::h3::Header::new(b":scheme", b"https"),
-            quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
-            quiche::h3::Header::new(b":path", b"/"),
-            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-            quiche::h3::Header::new(b"user-agent", b""),
-        ];
-
+        let req = connect_request_headers();
         let stream_id = h3_conn.send_request(&mut conn, &req, false)?;
         let flow_id = stream_id / 4;
 
@@ -172,8 +187,10 @@ impl MasquePacketStream {
             &mut h3_conn,
             &mut out,
             &mut buf,
-            local_addr,
-            session_cfg.endpoint,
+            DatagramPath {
+                local_addr,
+                endpoint: session_cfg.endpoint,
+            },
             stream_id,
         )
         .await
@@ -185,7 +202,7 @@ impl MasquePacketStream {
             socket,
             conn,
             h3_conn,
-            flow_prefix: build_flow_prefix(flow_id),
+            flow_prefix: build_flow_prefix(flow_id)?,
             outbound_queue: VecDeque::new(),
             inbound_queue: VecDeque::new(),
             out,
@@ -193,7 +210,8 @@ impl MasquePacketStream {
             local_addr,
             endpoint: session_cfg.endpoint,
             keepalive_period: session_cfg.keepalive_period,
-            mtu: session_cfg.mtu as usize,
+            mtu: usize::try_from(session_cfg.mtu)
+                .map_err(|_| anyhow::anyhow!("MTU does not fit usize"))?,
             state: PacketSessionState::Ready,
             timeout: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
             timer_kind: SessionTimerKind::Keepalive,
@@ -209,6 +227,11 @@ impl MasquePacketStream {
         self.state
     }
 
+    /// Close the packet stream and flush QUIC shutdown traffic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if shutdown or final packet transmission fails.
     pub async fn close(&mut self) -> io::Result<()> {
         futures::future::poll_fn(|cx| Pin::new(&mut *self).poll_close(cx)).await
     }
@@ -374,7 +397,11 @@ impl MasquePacketStream {
                 self.reset_timeout();
             }
 
-            let pending = self.pending_send.as_ref().unwrap();
+            let Some(pending) = self.pending_send.as_ref() else {
+                return Poll::Ready(Err(io::Error::other(
+                    "internal error: pending UDP send missing after initialization",
+                )));
+            };
             if pending.to != self.endpoint {
                 return Poll::Ready(Err(io::Error::other(format!(
                     "unexpected QUIC send target {} (expected {})",
@@ -621,7 +648,10 @@ async fn complete_handshake(
             result = socket.recv(buf) => {
                 match result {
                     Ok(len) => {
-                        let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
+                        let recv_info = quiche::RecvInfo {
+                            to: local_addr,
+                            from: endpoint,
+                        };
                         if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
                             log::debug!("dropping UDP packet rejected by QUIC: {error}");
                         }
@@ -657,8 +687,7 @@ async fn wait_for_connect_response(
     h3_conn: &mut quiche::h3::Connection,
     out: &mut [u8],
     buf: &mut [u8],
-    local_addr: SocketAddr,
-    endpoint: SocketAddr,
+    path: DatagramPath,
     stream_id: u64,
 ) -> Option<SessionLoopOutcome> {
     let mut connect_established = false;
@@ -670,7 +699,10 @@ async fn wait_for_connect_response(
             result = socket.recv(buf) => {
                 match result {
                     Ok(len) => {
-                        let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
+                        let recv_info = quiche::RecvInfo {
+                            to: path.local_addr,
+                            from: path.endpoint,
+                        };
                         if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
                             log::debug!("dropping UDP packet rejected by QUIC: {error}");
                         }
@@ -788,17 +820,19 @@ fn build_flow_datagram(flow_prefix: &[u8], packet: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn build_flow_prefix(flow_id: u64) -> Vec<u8> {
+fn build_flow_prefix(flow_id: u64) -> Result<Vec<u8>> {
     let mut prefix = Vec::with_capacity(16);
     let mut tmp = [0u8; 8];
     let len = {
         let mut builder = octets::OctetsMut::with_slice(&mut tmp);
-        builder.put_varint(flow_id).unwrap();
+        builder
+            .put_varint(flow_id)
+            .map_err(|error| anyhow::anyhow!("flow ID does not fit a QUIC varint: {error}"))?;
         builder.off()
     };
     prefix.extend_from_slice(&tmp[..len]);
     prefix.push(0x00);
-    prefix
+    Ok(prefix)
 }
 
 fn parse_datagram_offset(dgram: &[u8], expected_flow_id: u64) -> Option<usize> {
@@ -826,32 +860,36 @@ mod tests {
         let mut tmp = [0u8; 8];
         let len = {
             let mut builder = octets::OctetsMut::with_slice(&mut tmp);
-            builder.put_varint(value).unwrap();
+            assert!(builder.put_varint(value).is_ok());
             builder.off()
         };
         tmp[..len].to_vec()
     }
 
     #[test]
-    fn parse_datagram_offset_valid() {
+    fn parse_datagram_offset_valid() -> Result<()> {
         let payload = b"hello";
         let mut datagram = Vec::new();
         datagram.extend_from_slice(&encode_varint(0));
         datagram.extend_from_slice(&encode_varint(0));
         datagram.extend_from_slice(payload);
 
-        let offset = parse_datagram_offset(&datagram, 0).unwrap();
+        let offset = parse_datagram_offset(&datagram, 0)
+            .ok_or_else(|| anyhow::anyhow!("test datagram should parse"))?;
         assert_eq!(&datagram[offset..], payload);
+        Ok(())
     }
 
     #[test]
-    fn build_flow_datagram_prepares_ttl() {
-        let flow_prefix = build_flow_prefix(0);
+    fn build_flow_datagram_prepares_ttl() -> Result<()> {
+        let flow_prefix = build_flow_prefix(0)?;
         let packet = Bytes::from_static(&[
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 64, 0x11, 0x00, 0x00, 10, 0, 0, 1, 10,
             0, 0, 2,
         ]);
-        let datagram = build_flow_datagram(&flow_prefix, &packet).unwrap();
+        let datagram = build_flow_datagram(&flow_prefix, &packet)
+            .ok_or_else(|| anyhow::anyhow!("test packet should produce a flow datagram"))?;
         assert_eq!(datagram[flow_prefix.len() + 8], 63);
+        Ok(())
     }
 }

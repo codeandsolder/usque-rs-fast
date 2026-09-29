@@ -1,28 +1,14 @@
-#![warn(
-    clippy::all,
-    clippy::pedantic,
-    clippy::nursery,
-    clippy::cargo,
-    rust_2018_idioms
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented
+    )
 )]
-#![allow(
-    clippy::module_name_repetitions,
-    clippy::must_use_candidate,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    // Transitive dependency duplicates we cannot control:
-    clippy::multiple_crate_versions,
-    clippy::redundant_pub_crate,
-    clippy::similar_names,
-    clippy::fn_params_excessive_bools,
-    clippy::large_futures,
-    clippy::items_after_statements,
-    clippy::too_many_lines,
-    clippy::cargo_common_metadata
-)]
+
 //! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
 
 use anyhow::Result;
@@ -41,6 +27,22 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+struct AddressSelection {
+    use_ipv6_endpoint: bool,
+    no_tunnel_ipv4: bool,
+    no_tunnel_ipv6: bool,
+}
+
+struct NativeTunOptions {
+    connect_port: u16,
+    addresses: AddressSelection,
+    sni: String,
+    keepalive_period: Duration,
+    mtu: u32,
+    no_iproute2: bool,
+    interface_name: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -110,15 +112,19 @@ async fn main() -> Result<()> {
         } => {
             cmd_nativetun(
                 &cli.config,
-                connect_port,
-                ipv6,
-                no_tunnel_ipv4,
-                no_tunnel_ipv6,
-                &sni_address,
-                Duration::from_secs(keepalive_period),
-                mtu,
-                no_iproute2,
-                interface_name,
+                NativeTunOptions {
+                    connect_port,
+                    addresses: AddressSelection {
+                        use_ipv6_endpoint: ipv6,
+                        no_tunnel_ipv4,
+                        no_tunnel_ipv6,
+                    },
+                    sni: sni_address,
+                    keepalive_period: Duration::from_secs(keepalive_period),
+                    mtu,
+                    no_iproute2,
+                    interface_name,
+                },
             )
             .await
         }
@@ -156,19 +162,21 @@ async fn cmd_register(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn cmd_nativetun(
-    config_path: &str,
-    connect_port: u16,
-    use_ipv6: bool,
-    no_tunnel_ipv4: bool,
-    no_tunnel_ipv6: bool,
-    sni: &str,
-    keepalive_period: Duration,
-    mtu: u32,
-    no_iproute2: bool,
-    interface_name: Option<String>,
-) -> Result<()> {
+async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<()> {
+    let NativeTunOptions {
+        connect_port,
+        addresses:
+            AddressSelection {
+                use_ipv6_endpoint,
+                no_tunnel_ipv4,
+                no_tunnel_ipv6,
+            },
+        sni,
+        keepalive_period,
+        mtu,
+        no_iproute2,
+        interface_name,
+    } = options;
     if keepalive_period.is_zero() {
         anyhow::bail!("keepalive period must be greater than zero");
     }
@@ -181,7 +189,7 @@ async fn cmd_nativetun(
     let cfg = config::Config::load(config_path)?;
     eprintln!("Config loaded from {config_path}");
 
-    let endpoint_ip: std::net::IpAddr = if use_ipv6 {
+    let endpoint_ip: std::net::IpAddr = if use_ipv6_endpoint {
         cfg.endpoint_v6.parse()?
     } else {
         cfg.endpoint_v4.parse()?
@@ -201,7 +209,6 @@ async fn cmd_nativetun(
         } else {
             Some(cfg.ipv6.clone())
         },
-        setup_addresses: !no_iproute2,
     };
     let tun_dev = tun_device::create_tun(&tun_cfg)?;
 
@@ -213,7 +220,7 @@ async fn cmd_nativetun(
 
     let tunnel_cfg = tunnel::TunnelConfig {
         endpoint,
-        sni: sni.to_string(),
+        sni,
         keepalive_period,
         mtu,
     };

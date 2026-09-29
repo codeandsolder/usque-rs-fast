@@ -8,6 +8,7 @@ const ICMPV6_TYPE_PACKET_TOO_BIG: u8 = 2;
 
 /// Compose an ICMP "Packet Too Big" / "Fragmentation Needed" response
 /// for an IP packet that was too large to send as a QUIC datagram.
+#[must_use]
 pub fn compose_icmp_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
     if original.is_empty() {
         return None;
@@ -38,7 +39,8 @@ fn compose_icmpv4_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
     let mut pkt = vec![0u8; total_len];
 
     pkt[0] = 0x45;
-    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    let total_len = u16::try_from(total_len).ok()?;
+    pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
     pkt[8] = 64;
     pkt[9] = 1; // ICMP
     pkt[12..16].copy_from_slice(&original[16..20]); // swap src/dst
@@ -74,7 +76,8 @@ fn compose_icmpv6_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
     let mut pkt = vec![0u8; total_len];
 
     pkt[0] = 0x60;
-    pkt[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    let payload_len = u16::try_from(payload_len).ok()?;
+    pkt[4..6].copy_from_slice(&payload_len.to_be_bytes());
     pkt[6] = 58; // ICMPv6
     pkt[7] = 64;
     pkt[8..24].copy_from_slice(&original[24..40]); // swap src/dst
@@ -89,7 +92,7 @@ fn compose_icmpv6_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
         &pkt[8..24],  // src
         &pkt[24..40], // dst
         &pkt[icmp_start..],
-    );
+    )?;
     pkt[icmp_start + 2..icmp_start + 4].copy_from_slice(&cksum.to_be_bytes());
 
     Some(pkt)
@@ -111,10 +114,7 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
         sum += u32::from(word);
         i += 2;
     }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
+    fold_checksum(sum)
 }
 
 fn internet_checksum(data: &[u8]) -> u16 {
@@ -129,13 +129,10 @@ fn internet_checksum(data: &[u8]) -> u16 {
         sum += u32::from(word);
         i += 2;
     }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
+    fold_checksum(sum)
 }
 
-fn icmpv6_checksum(src: &[u8], dst: &[u8], icmpv6_data: &[u8]) -> u16 {
+fn icmpv6_checksum(src: &[u8], dst: &[u8], icmpv6_data: &[u8]) -> Option<u16> {
     let mut sum: u32 = 0;
 
     for i in (0..16).step_by(2) {
@@ -144,7 +141,7 @@ fn icmpv6_checksum(src: &[u8], dst: &[u8], icmpv6_data: &[u8]) -> u16 {
     for i in (0..16).step_by(2) {
         sum += u32::from(u16::from_be_bytes([dst[i], dst[i + 1]]));
     }
-    let len = icmpv6_data.len() as u32;
+    let len = u32::try_from(icmpv6_data.len()).ok()?;
     sum += len >> 16;
     sum += len & 0xFFFF;
     sum += 58u32; // next header
@@ -164,21 +161,31 @@ fn icmpv6_checksum(src: &[u8], dst: &[u8], icmpv6_data: &[u8]) -> u16 {
         i += 2;
     }
 
+    Some(fold_checksum(sum))
+}
+
+const fn fold_checksum(mut sum: u32) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    !(sum as u16)
+    let bytes = sum.to_be_bytes();
+    !u16::from_be_bytes([bytes[2], bytes[3]])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_ipv4_packet(total_len: usize, src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
-        assert!(total_len >= IPV4_HEADER_LEN);
-        let mut pkt = vec![0u8; total_len];
+    fn low_u16(value: u32) -> u16 {
+        let bytes = value.to_be_bytes();
+        u16::from_be_bytes([bytes[2], bytes[3]])
+    }
+
+    fn make_ipv4_packet(total_len: u16, src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+        assert!(usize::from(total_len) >= IPV4_HEADER_LEN);
+        let mut pkt = vec![0u8; usize::from(total_len)];
         pkt[0] = 0x45;
-        pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
         pkt[8] = 64;
         pkt[9] = 17;
         pkt[12..16].copy_from_slice(&src);
@@ -186,11 +193,11 @@ mod tests {
         pkt
     }
 
-    fn make_ipv6_packet(total_len: usize, src: [u8; 16], dst: [u8; 16]) -> Vec<u8> {
-        assert!(total_len >= IPV6_HEADER_LEN);
-        let mut pkt = vec![0u8; total_len];
+    fn make_ipv6_packet(total_len: u16, src: [u8; 16], dst: [u8; 16]) -> Vec<u8> {
+        assert!(usize::from(total_len) >= IPV6_HEADER_LEN);
+        let mut pkt = vec![0u8; usize::from(total_len)];
         pkt[0] = 0x60;
-        let payload_len = (total_len - IPV6_HEADER_LEN) as u16;
+        let payload_len = total_len - 40;
         pkt[4..6].copy_from_slice(&payload_len.to_be_bytes());
         pkt[6] = 17;
         pkt[7] = 64;
@@ -199,10 +206,16 @@ mod tests {
         pkt
     }
 
+    fn require_icmp(original: &[u8], mtu: u16) -> Vec<u8> {
+        let response = compose_icmp_too_large(original, mtu);
+        assert!(response.is_some(), "expected ICMP too-large response");
+        response.unwrap_or_default()
+    }
+
     #[test]
     fn icmpv4_too_large_small_mtu() {
         let original = make_ipv4_packet(576, [10, 0, 0, 1], [10, 0, 0, 2]);
-        let resp = compose_icmp_too_large(&original, 512).expect("should produce ICMP");
+        let resp = require_icmp(&original, 512);
 
         // Outer IP header checks
         assert_eq!(resp[0] >> 4, 4, "IPv4 response");
@@ -227,7 +240,7 @@ mod tests {
     #[test]
     fn icmpv4_too_large_big_mtu() {
         let original = make_ipv4_packet(9000, [192, 168, 1, 1], [8, 8, 8, 8]);
-        let resp = compose_icmp_too_large(&original, 1280).expect("should produce ICMP");
+        let resp = require_icmp(&original, 1280);
 
         let icmp = &resp[IPV4_HEADER_LEN..];
         let mtu_val = u16::from_be_bytes([icmp[6], icmp[7]]);
@@ -240,7 +253,7 @@ mod tests {
     fn icmpv4_minimum_header_only() {
         // Exactly 20-byte packet (header only, no payload beyond header)
         let original = make_ipv4_packet(20, [1, 2, 3, 4], [5, 6, 7, 8]);
-        let resp = compose_icmp_too_large(&original, 576).expect("should produce ICMP");
+        let resp = require_icmp(&original, 576);
 
         let icmp = &resp[IPV4_HEADER_LEN..];
         // ICMP payload = min(20+8, 20) = 20 bytes (just the header)
@@ -258,7 +271,7 @@ mod tests {
         let src = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
         let original = make_ipv6_packet(1500, src, dst);
-        let resp = compose_icmp_too_large(&original, 1280).expect("should produce ICMPv6");
+        let resp = require_icmp(&original, 1280);
 
         // Outer IPv6 header
         assert_eq!(resp[0] >> 4, 6, "IPv6 response");
@@ -281,7 +294,7 @@ mod tests {
         let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
         let original = make_ipv6_packet(9000, src, dst);
-        let resp = compose_icmp_too_large(&original, 1500).expect("should produce ICMPv6");
+        let resp = require_icmp(&original, 1500);
 
         let icmp = &resp[IPV6_HEADER_LEN..];
         // Payload should be capped at 1232 bytes
@@ -296,7 +309,7 @@ mod tests {
         let src = [0; 16];
         let dst = [1; 16];
         let original = make_ipv6_packet(40, src, dst); // header only
-        let resp = compose_icmp_too_large(&original, 1280).expect("should produce ICMPv6");
+        let resp = require_icmp(&original, 1280);
 
         let icmp = &resp[IPV6_HEADER_LEN..];
         assert_eq!(icmp.len() - ICMP_HEADER_LEN, 40);
@@ -324,7 +337,7 @@ mod tests {
     fn icmpv4_checksum_validates() {
         // Ensure the full response (IP + ICMP) has valid checksums
         let original = make_ipv4_packet(1500, [172, 16, 0, 1], [1, 1, 1, 1]);
-        let resp = compose_icmp_too_large(&original, 1280).unwrap();
+        let resp = require_icmp(&original, 1280);
 
         // Validate IP header checksum
         let mut ip_sum: u32 = (0..IPV4_HEADER_LEN)
@@ -334,7 +347,11 @@ mod tests {
         while ip_sum >> 16 != 0 {
             ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
         }
-        assert_eq!(ip_sum as u16, 0xFFFF, "IP header checksum should validate");
+        assert_eq!(
+            low_u16(ip_sum),
+            0xFFFF,
+            "IP header checksum should validate"
+        );
 
         // Validate ICMP checksum (sum entire ICMP message including checksum = 0xFFFF)
         let icmp = &resp[IPV4_HEADER_LEN..];
@@ -352,14 +369,14 @@ mod tests {
         while icmp_sum >> 16 != 0 {
             icmp_sum = (icmp_sum & 0xFFFF) + (icmp_sum >> 16);
         }
-        assert_eq!(icmp_sum as u16, 0xFFFF, "ICMP checksum should validate");
+        assert_eq!(low_u16(icmp_sum), 0xFFFF, "ICMP checksum should validate");
     }
     #[test]
     fn ipv4_too_large_preserves_quoted_options() {
         let mut original = make_ipv4_packet(36, [192, 0, 2, 1], [198, 51, 100, 2]);
         original[0] = 0x46;
         original[20..24].copy_from_slice(&[1, 1, 1, 0]);
-        let response = compose_icmp_too_large(&original, 1280).expect("ICMP response");
+        let response = require_icmp(&original, 1280);
         let quoted = &response[IPV4_HEADER_LEN + ICMP_HEADER_LEN..];
         assert_eq!(quoted.len(), 32);
         assert_eq!(&quoted[..24], &original[..24]);

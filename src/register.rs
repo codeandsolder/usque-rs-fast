@@ -45,8 +45,6 @@ pub struct AccountData {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Account {
-    #[allow(dead_code)]
-    pub id: String,
     pub license: Option<String>,
 }
 
@@ -86,8 +84,6 @@ pub struct ApiError {
 
 #[derive(Debug, Deserialize)]
 pub struct ErrorInfo {
-    #[allow(dead_code)]
-    pub code: i64,
     pub message: String,
 }
 
@@ -156,6 +152,12 @@ fn build_client() -> Result<reqwest::Client> {
         .context("failed to build HTTP client")
 }
 
+/// Register a new WARP device.
+///
+/// # Errors
+///
+/// Returns an error if client construction, randomness, the HTTP request,
+/// or response decoding fails, or if Cloudflare rejects registration.
 pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<AccountData> {
     let client = build_client()?;
     let wg_key = random_wg_pubkey()?;
@@ -192,6 +194,11 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<Ac
         .context("failed to parse registration response")
 }
 
+/// Generate the EC key pair used for MASQUE device enrollment.
+///
+/// # Errors
+///
+/// Returns an error if the generated keys cannot be encoded to DER.
 pub fn generate_ec_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
     let signing_key = SigningKey::generate();
 
@@ -209,6 +216,12 @@ pub fn generate_ec_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
     ))
 }
 
+/// Replace the registration key with the generated MASQUE EC public key.
+///
+/// # Errors
+///
+/// Returns an error if client construction, the enrollment request, or
+/// response decoding fails, or if Cloudflare rejects the update.
 pub async fn enroll_key(
     account: &AccountData,
     pub_key_der: &[u8],
@@ -254,7 +267,10 @@ mod tests {
 
     #[test]
     fn http_client_builds_with_explicit_ring_and_webpki_roots() {
-        build_client().expect("registration HTTP client should build");
+        assert!(
+            build_client().is_ok(),
+            "registration HTTP client should build"
+        );
     }
 
     #[test]

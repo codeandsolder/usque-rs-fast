@@ -5,10 +5,13 @@ pub struct TunConfig {
     pub mtu: u32,
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
-    #[allow(dead_code)]
-    pub setup_addresses: bool,
 }
 
+/// Create the async TUN device with the requested MTU and offload support.
+///
+/// # Errors
+///
+/// Returns an error when the MTU is out of range or the device cannot be created.
 pub fn create_tun(cfg: &TunConfig) -> Result<tun_rs::AsyncDevice> {
     let mtu = u16::try_from(cfg.mtu).context("TUN MTU does not fit u16")?;
     let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu).offload(true);
@@ -28,6 +31,11 @@ pub fn create_tun(cfg: &TunConfig) -> Result<tun_rs::AsyncDevice> {
     Ok(dev)
 }
 
+/// Configure addresses, MTU, and link state through rtnetlink.
+///
+/// # Errors
+///
+/// Returns an error when the device cannot be queried or any netlink operation fails.
 pub async fn configure_tun(cfg: &TunConfig, dev: &tun_rs::AsyncDevice) -> Result<()> {
     use futures::stream::TryStreamExt;
 
