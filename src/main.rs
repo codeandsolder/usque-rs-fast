@@ -11,22 +11,28 @@
 
 //! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 use usque_rs::{
     config,
-    packet_session::PacketSessionConfig,
     proxy::{
         http::{self as http_proxy, HttpConfig},
         net::VirtualNet,
+        session::{self as proxy_session, TransportConfig},
         socks::{self, SocksConfig},
     },
-    register, tun_device, tunnel, MasquePacketStream,
+    proxy_pool::{
+        core::{ChildTransport, ProxyAuth},
+        offline::{self, OfflineConfig},
+        remote::{self, RemoteConfig},
+    },
+    register, tun_device, tunnel,
 };
 
 #[derive(Parser)]
@@ -58,6 +64,8 @@ struct ProxyTransportArgs {
     keepalive_period: u64,
     #[arg(short, long, default_value_t = 1280)]
     mtu: u32,
+    #[arg(long)]
+    source_ip: Option<IpAddr>,
 }
 
 struct AddressSelection {
@@ -142,6 +150,44 @@ enum Commands {
         #[command(flatten)]
         transport: ProxyTransportArgs,
     },
+    /// Run multiple WARP identities as localhost SOCKS5 proxies without a control plane.
+    PoolOffline {
+        #[arg(long, default_value = "usque-pool")]
+        dir: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long, default_value_t = 20_000)]
+        base_port: u16,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(short = 'w', long)]
+        password: Option<String>,
+        #[command(flatten)]
+        transport: ProxyTransportArgs,
+    },
+    /// Run a routed proxy pool and report healthy identities to warp-orchestrator.
+    PoolRemote {
+        #[arg(long, default_value = "/opt/warp-pool")]
+        dir: PathBuf,
+        #[arg(long = "prefix")]
+        prefixes: Vec<String>,
+        #[arg(long)]
+        interface: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        slots_per_prefix: usize,
+        #[arg(long, default_value_t = 20_000)]
+        base_port: u16,
+        #[arg(long, default_value = "https://orchestrator.onhir.com")]
+        orchestrator_url: String,
+        #[arg(long, default_value = "/etc/warp-pool/psk")]
+        psk_file: PathBuf,
+        #[arg(long, default_value = "/etc/warp-pool/auth")]
+        auth_file: PathBuf,
+        #[arg(long)]
+        hostname: Option<String>,
+        #[command(flatten)]
+        transport: ProxyTransportArgs,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -200,6 +246,40 @@ async fn main() -> Result<()> {
             password,
             transport,
         } => cmd_http_proxy(&cli.config, bind, port, username, password, &transport).await,
+        Commands::PoolOffline {
+            dir,
+            count,
+            base_port,
+            username,
+            password,
+            transport,
+        } => cmd_pool_offline(dir, count, base_port, username, password, &transport).await,
+        Commands::PoolRemote {
+            dir,
+            prefixes,
+            interface,
+            slots_per_prefix,
+            base_port,
+            orchestrator_url,
+            psk_file,
+            auth_file,
+            hostname,
+            transport,
+        } => {
+            cmd_pool_remote(
+                dir,
+                prefixes,
+                interface,
+                slots_per_prefix,
+                base_port,
+                orchestrator_url,
+                &psk_file,
+                &auth_file,
+                hostname,
+                &transport,
+            )
+            .await
+        }
     }
 }
 
@@ -342,75 +422,125 @@ async fn cmd_http_proxy(
     .await
 }
 
+async fn cmd_pool_offline(
+    dir: PathBuf,
+    count: usize,
+    base_port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    transport: &ProxyTransportArgs,
+) -> Result<()> {
+    validate_auth_pair(username.as_deref(), password.as_deref())?;
+    let auth = username
+        .zip(password)
+        .map(|(username, password)| ProxyAuth { username, password });
+    offline::run(OfflineConfig {
+        root: dir,
+        count,
+        base_port,
+        port_stride: 1_000,
+        auth,
+        transport: child_transport(transport),
+        registration_delay: Duration::from_secs(8),
+    })
+    .await
+}
+
+async fn cmd_pool_remote(
+    dir: PathBuf,
+    mut prefixes: Vec<String>,
+    interface: Option<String>,
+    slots_per_prefix: usize,
+    base_port: u16,
+    orchestrator_url: String,
+    psk_file: &Path,
+    auth_file: &Path,
+    hostname: Option<String>,
+    transport: &ProxyTransportArgs,
+) -> Result<()> {
+    if prefixes.is_empty() {
+        prefixes = std::env::var("PREFIXES_CSV")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    let psk = std::fs::read_to_string(psk_file)?.trim().to_string();
+    let auth = read_proxy_auth(auth_file)?;
+    let hostname = hostname
+        .or_else(|| std::env::var("VPS_ID").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    remote::run(RemoteConfig {
+        root: dir,
+        prefixes,
+        interface,
+        slots_per_prefix,
+        topup_count: 10,
+        stale_limit: 5,
+        base_port,
+        port_stride: 1_000,
+        auth,
+        transport: child_transport(transport),
+        registration_delay: Duration::from_secs(8),
+        probe_wait: Duration::from_secs(8),
+        heartbeat_interval: Duration::from_secs(15),
+        register_interval: Duration::from_secs(180),
+        drift_interval: Duration::from_secs(15),
+        orchestrator_url,
+        psk,
+        hostname,
+    })
+    .await
+}
+
 async fn create_proxy_net(
     config_path: &str,
     transport: &ProxyTransportArgs,
 ) -> Result<Arc<VirtualNet>> {
-    if transport.keepalive_period == 0 {
-        anyhow::bail!("keepalive period must be greater than zero");
-    }
-    if transport.no_tunnel_ipv4 && transport.no_tunnel_ipv6 {
-        anyhow::bail!("at least one tunnel address family must be enabled");
-    }
-    if transport.mtu != 1280 {
-        log::warn!(
-            "MTU {} differs from the supported/default 1280; packet loss or PMTU issues may occur",
-            transport.mtu
-        );
-    }
-
-    let config = config::Config::load(config_path)?;
-    let endpoint_ip: IpAddr = if transport.ipv6 {
-        config.endpoint_v6.parse()?
-    } else {
-        config.endpoint_v4.parse()?
-    };
-    let endpoint = SocketAddr::new(endpoint_ip, transport.connect_port);
-
-    let local_v4 = if transport.no_tunnel_ipv4 {
-        None
-    } else {
-        Some(parse_assigned_ipv4(&config.ipv4)?)
-    };
-    let local_v6 = if transport.no_tunnel_ipv6 {
-        None
-    } else {
-        Some(parse_assigned_ipv6(&config.ipv6)?)
-    };
-
-    let packet_stream = MasquePacketStream::connect(
-        Arc::new(config),
-        PacketSessionConfig {
-            endpoint,
-            bind: None,
+    proxy_session::connect(
+        config_path,
+        &TransportConfig {
+            connect_port: transport.connect_port,
+            use_ipv6_endpoint: transport.ipv6,
+            no_tunnel_ipv4: transport.no_tunnel_ipv4,
+            no_tunnel_ipv6: transport.no_tunnel_ipv6,
             sni: transport.sni_address.clone(),
             keepalive_period: Duration::from_secs(transport.keepalive_period),
             mtu: transport.mtu,
+            source_ip: transport.source_ip,
         },
     )
-    .await?;
-
-    let mtu = usize::try_from(transport.mtu)
-        .map_err(|_| anyhow::anyhow!("MTU does not fit usize: {}", transport.mtu))?;
-    VirtualNet::start(packet_stream, local_v4, local_v6, mtu).map_err(Into::into)
+    .await
 }
 
-fn parse_assigned_ipv4(value: &str) -> Result<Ipv4Addr> {
-    value
-        .split('/')
-        .next()
-        .unwrap_or(value)
-        .parse()
-        .with_context(|| format!("invalid configured WARP IPv4 address {value:?}"))
+fn child_transport(transport: &ProxyTransportArgs) -> ChildTransport {
+    ChildTransport {
+        connect_port: transport.connect_port,
+        sni: transport.sni_address.clone(),
+        keepalive_period: Duration::from_secs(transport.keepalive_period),
+        mtu: transport.mtu,
+        no_tunnel_ipv4: transport.no_tunnel_ipv4,
+        no_tunnel_ipv6: transport.no_tunnel_ipv6,
+        use_ipv6_endpoint: transport.ipv6,
+    }
 }
 
-fn parse_assigned_ipv6(value: &str) -> Result<Ipv6Addr> {
-    value
-        .split('/')
-        .next()
-        .unwrap_or(value)
-        .parse()
-        .with_context(|| format!("invalid configured WARP IPv6 address {value:?}"))
+fn read_proxy_auth(path: &Path) -> Result<ProxyAuth> {
+    let value = std::fs::read_to_string(path)?;
+    let (username, password) = value
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("proxy auth file must contain username:password"))?;
+    if username.is_empty() || password.is_empty() {
+        anyhow::bail!("proxy auth username/password must not be empty");
+    }
+    Ok(ProxyAuth {
+        username: username.to_string(),
+        password: password.to_string(),
+    })
 }
 
 fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<()> {
@@ -424,6 +554,7 @@ fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn proxy_commands_default_to_loopback() -> Result<()> {
@@ -449,5 +580,45 @@ mod tests {
         assert!(validate_auth_pair(Some("user"), Some("pass")).is_ok());
         assert!(validate_auth_pair(Some("user"), None).is_err());
         assert!(validate_auth_pair(None, Some("pass")).is_err());
+    }
+
+    #[test]
+    fn offline_pool_defaults_to_local_control_plane_free_layout() -> Result<()> {
+        let cli = Cli::try_parse_from(["usque-rs", "pool-offline"])?;
+        let Commands::PoolOffline {
+            dir,
+            count,
+            base_port,
+            username,
+            password,
+            ..
+        } = cli.command
+        else {
+            anyhow::bail!("expected offline pool command");
+        };
+        assert_eq!(dir, PathBuf::from("usque-pool"));
+        assert_eq!(count, 1);
+        assert_eq!(base_port, 20_000);
+        assert!(username.is_none());
+        assert!(password.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_pool_requires_prefixes_at_runtime_not_parse_time() -> Result<()> {
+        let cli = Cli::try_parse_from(["usque-rs", "pool-remote"])?;
+        let Commands::PoolRemote {
+            prefixes,
+            slots_per_prefix,
+            base_port,
+            ..
+        } = cli.command
+        else {
+            anyhow::bail!("expected remote pool command");
+        };
+        assert!(prefixes.is_empty());
+        assert_eq!(slots_per_prefix, 10);
+        assert_eq!(base_port, 20_000);
+        Ok(())
     }
 }
