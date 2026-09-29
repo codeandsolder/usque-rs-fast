@@ -212,6 +212,7 @@ async fn supervise(
             state.save(state_path)?;
         }
     }
+    Ok(())
 }
 
 fn validate_config(config: &RemoteConfig) -> Result<()> {
