@@ -438,16 +438,16 @@ impl VirtualNet {
         };
 
         let mut addresses = Vec::new();
-        if let Ok(v6) = v6 {
-            addresses.extend(v6);
+        if let Ok(v6) = &v6 {
+            addresses.extend(v6.iter().copied());
         }
-        if let Ok(v4) = v4 {
-            addresses.extend(v4);
+        if let Ok(v4) = &v4 {
+            addresses.extend(v4.iter().copied());
         }
 
         if addresses.is_empty() {
-            let v6_error = v6.err().map(|error| error.to_string());
-            let v4_error = v4.err().map(|error| error.to_string());
+            let v6_error = v6.as_ref().err().map(ToString::to_string);
+            let v4_error = v4.as_ref().err().map(ToString::to_string);
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -474,7 +474,9 @@ impl VirtualNet {
             if self.shared.closed.load(Ordering::Acquire) {
                 return Err(Shared::closed_error());
             }
-            inner.sockets.add(dns::Socket::new(&servers, vec![None; 1]))
+            let mut queries = Vec::with_capacity(1);
+            queries.push(None::<dns::DnsQuery>);
+            inner.sockets.add(dns::Socket::new(&servers, queries))
         };
         let _socket_guard = DnsSocketGuard {
             shared: self.shared.clone(),
