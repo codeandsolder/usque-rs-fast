@@ -1,9 +1,7 @@
 use super::net::VirtualNet;
 use anyhow::Result;
 use fast_socks5::{
-    server::Socks5ServerProtocol,
-    util::target_addr::TargetAddr,
-    ReplyError, Socks5Command,
+    server::Socks5ServerProtocol, util::target_addr::TargetAddr, ReplyError, Socks5Command,
 };
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::net::{TcpListener, TcpStream};

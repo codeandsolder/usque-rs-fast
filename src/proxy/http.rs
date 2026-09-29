@@ -2,7 +2,7 @@ use super::net::VirtualNet;
 use anyhow::Result;
 use base64::Engine;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::Incoming,
     client::conn::http1 as client_http1,
@@ -12,12 +12,7 @@ use hyper::{
     Method, Request, Response, StatusCode, Uri,
 };
 use hyper_util::rt::TokioIo;
-use std::{
-    convert::Infallible,
-    error::Error,
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{convert::Infallible, error::Error, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -150,10 +145,7 @@ async fn handle(
     )
 }
 
-async fn handle_connect(
-    request: Request<Incoming>,
-    net: Arc<VirtualNet>,
-) -> Response<ProxyBody> {
+async fn handle_connect(request: Request<Incoming>, net: Arc<VirtualNet>) -> Response<ProxyBody> {
     let (host, port) = match request_target(&request, 443) {
         Ok(target) => target,
         Err(message) => return text_response(StatusCode::BAD_REQUEST, message),
@@ -186,7 +178,10 @@ async fn handle_connect(
         .expect("static CONNECT response")
 }
 
-fn request_target(request: &Request<Incoming>, default_port: u16) -> Result<(String, u16), &'static str> {
+fn request_target(
+    request: &Request<Incoming>,
+    default_port: u16,
+) -> Result<(String, u16), &'static str> {
     if let Some(authority) = request.uri().authority() {
         return parse_authority(authority.as_str(), default_port);
     }
@@ -223,9 +218,7 @@ fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), 
 
     match authority.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => {
-            let port = port
-                .parse()
-                .map_err(|_| "invalid proxy target port")?;
+            let port = port.parse().map_err(|_| "invalid proxy target port")?;
             if host.is_empty() {
                 return Err("empty proxy target host");
             }

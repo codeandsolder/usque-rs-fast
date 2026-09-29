@@ -101,7 +101,7 @@ enum Commands {
     },
     /// Expose WARP as a dual-stack SOCKS5/SOCKS5h TCP proxy.
     Socks {
-        #[arg(short, long, default_value = "0.0.0.0")]
+        #[arg(short, long, default_value = "127.0.0.1")]
         bind: IpAddr,
         #[arg(short, long, default_value_t = 1080)]
         port: u16,
@@ -115,7 +115,7 @@ enum Commands {
     /// Expose WARP as a streaming HTTP/1.1 proxy with CONNECT support.
     #[command(name = "http-proxy")]
     HttpProxy {
-        #[arg(short, long, default_value = "0.0.0.0")]
+        #[arg(short, long, default_value = "127.0.0.1")]
         bind: IpAddr,
         #[arg(short, long, default_value_t = 8000)]
         port: u16,
@@ -279,7 +279,6 @@ async fn cmd_nativetun(
     tunnel::maintain_tunnel(&cfg, &tunnel_cfg, tun_dev).await
 }
 
-
 async fn cmd_socks(
     config_path: &str,
     bind: IpAddr,
@@ -370,8 +369,7 @@ async fn create_proxy_net(
     )
     .await?;
 
-    VirtualNet::start(packet_stream, local_v4, local_v6, transport.mtu as usize)
-        .map_err(Into::into)
+    VirtualNet::start(packet_stream, local_v4, local_v6, transport.mtu as usize).map_err(Into::into)
 }
 
 fn parse_assigned_ipv4(value: &str) -> Result<Ipv4Addr> {
@@ -396,5 +394,40 @@ fn validate_auth_pair(username: &Option<String>, password: &Option<String>) -> R
     match (username, password) {
         (Some(_), Some(_)) | (None, None) => Ok(()),
         _ => anyhow::bail!("username and password must be supplied together"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn proxy_commands_default_to_loopback() {
+        let socks = Cli::try_parse_from(["usque-rs", "socks"]).expect("SOCKS defaults parse");
+        match socks.command {
+            Commands::Socks { bind, port, .. } => {
+                assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS command"),
+        }
+
+        let http = Cli::try_parse_from(["usque-rs", "http-proxy"]).expect("HTTP defaults parse");
+        match http.command {
+            Commands::HttpProxy { bind, port, .. } => {
+                assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_eq!(port, 8000);
+            }
+            _ => panic!("expected HTTP proxy command"),
+        }
+    }
+
+    #[test]
+    fn proxy_authentication_requires_a_complete_pair() {
+        assert!(validate_auth_pair(&None, &None).is_ok());
+        assert!(validate_auth_pair(&Some("user".to_string()), &Some("pass".to_string())).is_ok());
+        assert!(validate_auth_pair(&Some("user".to_string()), &None).is_err());
+        assert!(validate_auth_pair(&None, &Some("pass".to_string())).is_err());
     }
 }
