@@ -6,7 +6,7 @@ use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::Incoming,
     client::conn::http1 as client_http1,
-    header::{CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
+    header::{HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
     server::conn::http1 as server_http1,
     service::service_fn,
     Method, Request, Response, StatusCode, Uri,
@@ -73,11 +73,13 @@ async fn handle(
             .get(PROXY_AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
         if provided != Some(expected) {
-            return Response::builder()
-                .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .header(PROXY_AUTHENTICATE, "Basic realm=\"usque-rs\"")
-                .body(empty_body())
-                .expect("static proxy authentication response");
+            let mut response =
+                response_with_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED, empty_body());
+            response.headers_mut().insert(
+                PROXY_AUTHENTICATE,
+                HeaderValue::from_static("Basic realm=\"usque-rs\""),
+            );
+            return response;
         }
     }
 
@@ -172,10 +174,7 @@ async fn handle_connect(request: Request<Incoming>, net: Arc<VirtualNet>) -> Res
         }
     });
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(empty_body())
-        .expect("static CONNECT response")
+    response_with_status(StatusCode::OK, empty_body())
 }
 
 fn request_target(
@@ -281,15 +280,19 @@ fn empty_body() -> ProxyBody {
         .boxed_unsync()
 }
 
+fn response_with_status(status: StatusCode, body: ProxyBody) -> Response<ProxyBody> {
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response
+}
+
 fn text_response(status: StatusCode, message: &'static str) -> Response<ProxyBody> {
-    Response::builder()
-        .status(status)
-        .body(
-            Full::new(Bytes::from_static(message.as_bytes()))
-                .map_err(|never| match never {})
-                .boxed_unsync(),
-        )
-        .expect("static proxy error response")
+    response_with_status(
+        status,
+        Full::new(Bytes::from_static(message.as_bytes()))
+            .map_err(|never| match never {})
+            .boxed_unsync(),
+    )
 }
 
 #[cfg(test)]

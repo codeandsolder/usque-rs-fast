@@ -33,6 +33,7 @@ const RETIRED_SOCKET_GRACE: Duration = Duration::from_secs(30);
 /// A dual-stack userspace TCP/IP stack carried by a single CONNECT-IP session.
 pub struct VirtualNet {
     shared: Arc<Shared>,
+    reactor: tokio::task::AbortHandle,
 }
 
 struct Shared {
@@ -59,6 +60,13 @@ struct PacketDevice {
 struct PacketRxToken(Bytes);
 
 struct PacketTxToken<'a>(&'a mut VecDeque<Bytes>);
+
+fn lock_stack(shared: &Shared) -> std::sync::MutexGuard<'_, Stack> {
+    shared
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 impl PacketDevice {
     fn new(mtu: usize) -> Self {
@@ -165,6 +173,12 @@ impl Stack {
     }
 }
 
+impl Drop for VirtualNet {
+    fn drop(&mut self) {
+        self.reactor.abort();
+    }
+}
+
 impl VirtualNet {
     pub fn start(
         packet_stream: MasquePacketStream,
@@ -184,18 +198,24 @@ impl VirtualNet {
         iface_config.random_seed = seed();
         let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
 
+        let mut address_table_full = false;
         iface.update_ip_addrs(|addresses| {
             if let Some(address) = local_v4 {
-                addresses
+                address_table_full |= addresses
                     .push(IpCidr::new(IpAddress::Ipv4(address), 32))
-                    .expect("smoltcp address table has room for IPv4 + IPv6");
+                    .is_err();
             }
             if let Some(address) = local_v6 {
-                addresses
+                address_table_full |= addresses
                     .push(IpCidr::new(IpAddress::Ipv6(address), 128))
-                    .expect("smoltcp address table has room for IPv4 + IPv6");
+                    .is_err();
             }
         });
+        if address_table_full {
+            return Err(io::Error::other(
+                "smoltcp address table is too small for configured WARP addresses",
+            ));
+        }
 
         if local_v4.is_some() {
             iface
@@ -226,14 +246,15 @@ impl VirtualNet {
             local_v4,
             local_v6,
         });
-        let net = Arc::new(Self {
-            shared: shared.clone(),
-        });
-
-        tokio::spawn(async move {
-            if let Err(error) = run_reactor(packet_stream, shared).await {
+        let reactor_shared = shared.clone();
+        let reactor = tokio::spawn(async move {
+            if let Err(error) = run_reactor(packet_stream, reactor_shared).await {
                 log::error!("userspace proxy stack stopped: {error}");
             }
+        });
+        let net = Arc::new(Self {
+            shared,
+            reactor: reactor.abort_handle(),
         });
 
         Ok(net)
@@ -276,11 +297,7 @@ impl VirtualNet {
 
         let local_port = self.next_port();
         let handle = {
-            let mut inner = self
-                .shared
-                .inner
-                .lock()
-                .expect("proxy stack mutex poisoned");
+            let mut inner = lock_stack(&self.shared);
             let rx = tcp::SocketBuffer::new(vec![0_u8; TCP_BUFFER_SIZE]);
             let tx = tcp::SocketBuffer::new(vec![0_u8; TCP_BUFFER_SIZE]);
             let mut socket = tcp::Socket::new(rx, tx);
@@ -299,11 +316,7 @@ impl VirtualNet {
         };
 
         poll_fn(|cx| {
-            let mut inner = self
-                .shared
-                .inner
-                .lock()
-                .expect("proxy stack mutex poisoned");
+            let mut inner = lock_stack(&self.shared);
             let socket = inner.sockets.get_mut::<tcp::Socket>(handle);
             match socket.state() {
                 tcp::State::Established => Poll::Ready(Ok(())),
@@ -366,11 +379,7 @@ impl VirtualNet {
         }
 
         let socket_handle = {
-            let mut inner = self
-                .shared
-                .inner
-                .lock()
-                .expect("proxy stack mutex poisoned");
+            let mut inner = lock_stack(&self.shared);
             inner.sockets.add(dns::Socket::new(&servers, vec![None; 1]))
         };
         let _socket_guard = DnsSocketGuard {
@@ -378,11 +387,7 @@ impl VirtualNet {
             handle: socket_handle,
         };
         let query_handle = {
-            let mut inner = self
-                .shared
-                .inner
-                .lock()
-                .expect("proxy stack mutex poisoned");
+            let mut inner = lock_stack(&self.shared);
             let Stack { iface, sockets, .. } = &mut *inner;
             sockets
                 .get_mut::<dns::Socket>(socket_handle)
@@ -394,11 +399,7 @@ impl VirtualNet {
         tokio::time::timeout(
             DNS_TIMEOUT,
             poll_fn(|cx| {
-                let mut inner = self
-                    .shared
-                    .inner
-                    .lock()
-                    .expect("proxy stack mutex poisoned");
+                let mut inner = lock_stack(&self.shared);
                 let socket = inner.sockets.get_mut::<dns::Socket>(socket_handle);
                 match socket.get_query_result(query_handle) {
                     Ok(addresses) => {
@@ -452,7 +453,7 @@ async fn run_reactor(mut packet_stream: MasquePacketStream, shared: Arc<Shared>)
             packet = packet_stream.next() => {
                 match packet {
                     Some(Ok(packet)) => {
-                        let mut inner = shared.inner.lock().expect("proxy stack mutex poisoned");
+                        let mut inner = lock_stack(&shared);
                         inner.device.push_rx(packet);
                     }
                     Some(Err(error)) => return Err(error),
@@ -464,7 +465,7 @@ async fn run_reactor(mut packet_stream: MasquePacketStream, shared: Arc<Shared>)
         }
 
         let outbound = {
-            let mut inner = shared.inner.lock().expect("proxy stack mutex poisoned");
+            let mut inner = lock_stack(&shared);
             inner.poll();
             inner.device.take_tx()
         };
@@ -490,11 +491,7 @@ impl AsyncRead for VirtualTcpStream {
             return Poll::Ready(Ok(()));
         };
 
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("proxy stack mutex poisoned");
+        let mut inner = lock_stack(&self.shared);
         let socket = inner.sockets.get_mut::<tcp::Socket>(handle);
 
         if socket.can_recv() {
@@ -531,11 +528,7 @@ impl AsyncWrite for VirtualTcpStream {
             )));
         };
 
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("proxy stack mutex poisoned");
+        let mut inner = lock_stack(&self.shared);
         let socket = inner.sockets.get_mut::<tcp::Socket>(handle);
         if socket.can_send() {
             let written = socket.send_slice(buffer).map_err(io::Error::other)?;
@@ -559,11 +552,7 @@ impl AsyncWrite for VirtualTcpStream {
             return Poll::Ready(Ok(()));
         };
 
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("proxy stack mutex poisoned");
+        let mut inner = lock_stack(&self.shared);
         let socket = inner.sockets.get_mut::<tcp::Socket>(handle);
         if socket.send_queue() == 0 {
             Poll::Ready(Ok(()))
@@ -577,11 +566,7 @@ impl AsyncWrite for VirtualTcpStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if let Some(handle) = self.handle.take() {
-            let mut inner = self
-                .shared
-                .inner
-                .lock()
-                .expect("proxy stack mutex poisoned");
+            let mut inner = lock_stack(&self.shared);
             inner.retire(handle, false);
             drop(inner);
             self.shared.activity.notify_one();
@@ -593,11 +578,7 @@ impl AsyncWrite for VirtualTcpStream {
 impl Drop for VirtualTcpStream {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            let mut inner = self
-                .shared
-                .inner
-                .lock()
-                .expect("proxy stack mutex poisoned");
+            let mut inner = lock_stack(&self.shared);
             inner.retire(handle, false);
             drop(inner);
             self.shared.activity.notify_one();
@@ -612,11 +593,7 @@ struct DnsSocketGuard {
 
 impl Drop for DnsSocketGuard {
     fn drop(&mut self) {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("proxy stack mutex poisoned");
+        let mut inner = lock_stack(&self.shared);
         let _ = inner.sockets.remove(self.handle);
     }
 }
@@ -629,11 +606,7 @@ struct ConnectGuard {
 impl Drop for ConnectGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            let mut inner = self
-                .shared
-                .inner
-                .lock()
-                .expect("proxy stack mutex poisoned");
+            let mut inner = lock_stack(&self.shared);
             inner.retire(handle, true);
             drop(inner);
             self.shared.activity.notify_one();
