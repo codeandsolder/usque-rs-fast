@@ -234,7 +234,14 @@ pub async fn maintain_tunnel(
 
         eprintln!("\r\x1b[2K[connecting] {} ...", tunnel_cfg.endpoint);
 
-        match run_tunnel_session(config, tunnel_cfg, &tun_dev, &mut pending_packets).await {
+        match Box::pin(run_tunnel_session(
+            config,
+            tunnel_cfg,
+            &tun_dev,
+            &mut pending_packets,
+        ))
+        .await
+        {
             Ok(()) => {
                 eprintln!("\r\x1b[2K[disconnected] Session ended");
             }
@@ -773,18 +780,19 @@ async fn run_tunnel_session(
     pending_packets: &mut VecDeque<Vec<u8>>,
 ) -> Result<()> {
     let quic = open_native_quic(config, tunnel_cfg).await?;
-    let mut session = establish_connect_ip(quic).await?;
+    let session = Box::pin(establish_connect_ip(quic)).await?;
+    let mut session = Box::new(session);
     eprintln!("\r\x1b[2K[connected] MASQUE tunnel established");
 
     let mtu = usize::try_from(tunnel_cfg.mtu)
         .map_err(|_| anyhow::anyhow!("configured MTU does not fit usize"))?;
-    forward_native_session(
+    Box::pin(forward_native_session(
         &mut session,
         tun_dev,
         pending_packets,
         mtu,
         tunnel_cfg.keepalive_period,
-    )
+    ))
     .await
 }
 
