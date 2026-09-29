@@ -1,6 +1,6 @@
 //! Integration tests for tunnel MTU handling.
 //!
-//! **Requires root or CAP_NET_ADMIN** - tests are skipped otherwise.
+//! **Requires root or `CAP_NET_ADMIN`** - tests are skipped otherwise.
 
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
@@ -98,9 +98,8 @@ fn try_create_tun(name: &str, mtu: u16) -> Option<tun_rs::SyncDevice> {
 
 #[test]
 fn tun_device_small_mtu_ipv4_write() {
-    let dev = match try_create_tun("usqt0", 576) {
-        Some(d) => d,
-        None => return, // skip if no permissions
+    let Some(dev) = try_create_tun("usqt0", 576) else {
+        return;
     };
 
     let pkt = make_ipv4_packet(100, 64, [10, 200, 0, 1], [10, 200, 0, 2]);
@@ -111,9 +110,8 @@ fn tun_device_small_mtu_ipv4_write() {
 
 #[test]
 fn tun_device_large_mtu_ipv4_write() {
-    let dev = match try_create_tun("usqt1", 9000) {
-        Some(d) => d,
-        None => return,
+    let Some(dev) = try_create_tun("usqt1", 9000) else {
+        return;
     };
 
     let pkt = make_ipv4_packet(8000, 64, [10, 200, 0, 1], [10, 200, 0, 2]);
@@ -124,9 +122,8 @@ fn tun_device_large_mtu_ipv4_write() {
 
 #[test]
 fn tun_device_small_mtu_ipv6_write() {
-    let dev = match try_create_tun("usqt2", 1280) {
-        Some(d) => d,
-        None => return,
+    let Some(dev) = try_create_tun("usqt2", 1280) else {
+        return;
     };
 
     let src = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
@@ -141,9 +138,8 @@ fn tun_device_small_mtu_ipv6_write() {
 
 #[test]
 fn tun_device_jumbo_mtu_ipv6_write() {
-    let dev = match try_create_tun("usqt3", 9000) {
-        Some(d) => d,
-        None => return,
+    let Some(dev) = try_create_tun("usqt3", 9000) else {
+        return;
     };
 
     let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];

@@ -29,6 +29,10 @@ struct Cli {
     command: Commands,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI carrier preserves four independent user-facing switches"
+)]
 struct NativeTunOptions {
     connect_port: u16,
     use_ipv6: bool,
