@@ -38,7 +38,7 @@ impl CpuPerPacketStats {
         let delta = sample - self.mean_ns;
         self.mean_ns += delta / f64::from(self.samples);
         let delta2 = sample - self.mean_ns;
-        self.m2_ns += delta * delta2;
+        self.m2_ns = delta.mul_add(delta2, self.m2_ns);
     }
 
     fn standard_error(&self) -> f64 {
