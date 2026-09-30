@@ -2,7 +2,7 @@ use super::{
     core::{
         port_for, wait_for_shutdown, ChildSpec, ChildTransport, ProxyAuth, SlotKey, Supervisor,
     },
-    reporter::{Heartbeat, ProxyReport, RemoteReporter},
+    reporter::{client_tls_config, Heartbeat, ProxyReport, RemoteReporter},
     state::{load_suffixes, save_suffixes, PoolState, ProxyRecord},
 };
 use anyhow::{Context, Result};
@@ -13,6 +13,7 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -20,9 +21,6 @@ use tokio::{
     net::TcpStream,
     process::Command,
 };
-
-const PROBE_HOST: &str = "api.ipify.org";
-const PROBE_PORT: u16 = 80;
 
 #[derive(Clone, Debug)]
 pub struct RemoteConfig {
@@ -399,7 +397,7 @@ async fn cycle_one(
     }
 
     let listener = SocketAddr::new(spec.bind_ip, spec.port);
-    let observed = match probe_v4(listener, &config.auth).await {
+    let observed = match probe_v4(listener, &config.auth, &config.orchestrator_url).await {
         Ok(value) => value,
         Err(error) => {
             log::warn!(
@@ -475,7 +473,7 @@ async fn check_drift(
 
     let results = join_all(
         work.iter()
-            .map(|(_, listener, _)| probe_v4(*listener, &config.auth)),
+            .map(|(_, listener, _)| probe_v4(*listener, &config.auth, &config.orchestrator_url)),
     )
     .await;
 
@@ -601,13 +599,56 @@ fn proxy_reports(config: &RemoteConfig, state: &PoolState) -> Result<Vec<ProxyRe
         .collect()
 }
 
-async fn probe_v4(listener: SocketAddr, auth: &ProxyAuth) -> Result<Ipv4Addr> {
-    tokio::time::timeout(Duration::from_secs(10), probe_v4_inner(listener, auth))
-        .await
-        .context("proxy probe timed out")?
+#[derive(Debug)]
+struct ProbeEndpoint {
+    host: String,
+    port: u16,
+    ipv4: Ipv4Addr,
 }
 
-async fn probe_v4_inner(listener: SocketAddr, auth: &ProxyAuth) -> Result<Ipv4Addr> {
+async fn resolve_probe_endpoint(orchestrator_url: &str) -> Result<ProbeEndpoint> {
+    let url = reqwest::Url::parse(orchestrator_url)
+        .with_context(|| format!("invalid orchestrator URL {orchestrator_url:?}"))?;
+    if url.scheme() != "https" {
+        anyhow::bail!("orchestrator URL must use HTTPS");
+    }
+    let host = url
+        .host_str()
+        .context("orchestrator URL has no host")?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .context("orchestrator URL has no known port")?;
+    let ipv4 = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .with_context(|| format!("failed to resolve orchestrator host {host}"))?
+        .find_map(|address| match address.ip() {
+            IpAddr::V4(ipv4) => Some(ipv4),
+            IpAddr::V6(_) => None,
+        })
+        .with_context(|| format!("orchestrator host {host} has no IPv4 address"))?;
+    Ok(ProbeEndpoint { host, port, ipv4 })
+}
+
+async fn probe_v4(
+    listener: SocketAddr,
+    auth: &ProxyAuth,
+    orchestrator_url: &str,
+) -> Result<Ipv4Addr> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        probe_v4_inner(listener, auth, orchestrator_url),
+    )
+    .await
+    .context("proxy probe timed out")?
+}
+
+async fn probe_v4_inner(
+    listener: SocketAddr,
+    auth: &ProxyAuth,
+    orchestrator_url: &str,
+) -> Result<Ipv4Addr> {
+    let target = resolve_probe_endpoint(orchestrator_url).await?;
     let user = auth.username.as_bytes();
     let password = auth.password.as_bytes();
     let user_len = u8::try_from(user.len()).context("SOCKS username exceeds 255 bytes")?;
@@ -633,12 +674,10 @@ async fn probe_v4_inner(listener: SocketAddr, auth: &ProxyAuth) -> Result<Ipv4Ad
         anyhow::bail!("SOCKS authentication failed");
     }
 
-    let host = PROBE_HOST.as_bytes();
-    let host_len = u8::try_from(host.len()).context("probe hostname is too long")?;
-    let mut request = Vec::with_capacity(host.len() + 7);
-    request.extend_from_slice(&[5, 1, 0, 3, host_len]);
-    request.extend_from_slice(host);
-    request.extend_from_slice(&PROBE_PORT.to_be_bytes());
+    let mut request = Vec::with_capacity(10);
+    request.extend_from_slice(&[5, 1, 0, 1]);
+    request.extend_from_slice(&target.ipv4.octets());
+    request.extend_from_slice(&target.port.to_be_bytes());
     stream.write_all(&request).await?;
 
     let mut reply = [0_u8; 4];
@@ -648,18 +687,40 @@ async fn probe_v4_inner(listener: SocketAddr, auth: &ProxyAuth) -> Result<Ipv4Ad
     }
     consume_socks_address(&mut stream, reply[3]).await?;
 
-    stream
-        .write_all(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
-        .await?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls_config()?));
+    let server_name =
+        rustls::pki_types::ServerName::try_from(target.host.clone()).map_err(|error| {
+            anyhow::anyhow!("invalid orchestrator TLS name {:?}: {error}", target.host)
+        })?;
+    let mut stream = connector
+        .connect(server_name, stream)
+        .await
+        .context("TLS handshake with orchestrator probe endpoint failed")?;
+
+    let host_header = if target.port == 443 {
+        target.host.clone()
+    } else {
+        format!("{}:{}", target.host, target.port)
+    };
+    let request = format!(
+        "GET /ip HTTP/1.1\r\nHost: {host_header}\r\nAccept: text/plain\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
-    let response = String::from_utf8(response).context("ipify returned non-UTF8 HTTP")?;
-    let (_, body) = response
+    let response =
+        String::from_utf8(response).context("orchestrator /ip returned non-UTF8 HTTP")?;
+    let (headers, body) = response
         .split_once("\r\n\r\n")
-        .context("ipify returned malformed HTTP")?;
+        .context("orchestrator /ip returned malformed HTTP")?;
+    let status = headers.lines().next().unwrap_or_default();
+    if !status.contains(" 200 ") {
+        anyhow::bail!("orchestrator /ip returned unexpected status {status:?}");
+    }
     body.trim()
         .parse()
-        .with_context(|| format!("ipify returned non-IPv4 body {body:?}"))
+        .with_context(|| format!("orchestrator /ip returned non-IPv4 body {body:?}"))
 }
 
 async fn consume_socks_address(stream: &mut TcpStream, address_type: u8) -> Result<()> {

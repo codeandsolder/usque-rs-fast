@@ -1,3 +1,13 @@
+pub(crate) fn client_tls_config() -> anyhow::Result<rustls::ClientConfig> {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_safe_default_protocol_versions()
+        .context("failed to configure TLS protocol versions")
+        .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
+}
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Serialize;
@@ -64,16 +74,7 @@ impl RemoteReporter {
             anyhow::bail!("orchestrator PSK must not be empty");
         }
 
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let tls = rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into(),
-        )
-        .with_safe_default_protocol_versions()
-        .context("failed to configure TLS protocol versions")?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let tls = client_tls_config()?;
         let client = Client::builder()
             .tls_backend_preconfigured(tls)
             .timeout(Duration::from_secs(10))
