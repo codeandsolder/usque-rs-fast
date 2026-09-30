@@ -93,16 +93,9 @@ async fn initialize_supervisor(
     state_path: &std::path::Path,
 ) -> Result<Supervisor> {
     let mut supervisor = Supervisor::new(config.root.clone())?;
-    for index in 0..state.proxies.len() {
-        let group = state.proxies[index].group;
-        let slot = state.proxies[index].slot;
-        let created = supervisor.ensure_identity(group, slot).await?;
-        state.proxies[index].registered = true;
-        if created && !config.registration_delay.is_zero() {
-            tokio::time::sleep(config.registration_delay).await;
-        }
+    if reconcile_identity_presence(state, &supervisor) {
+        state.save(state_path)?;
     }
-    state.save(state_path)?;
 
     for index in 0..state.proxies.len() {
         if !state.proxies[index].locked {
@@ -113,6 +106,37 @@ async fn initialize_supervisor(
         state.proxies[index].pid = pid;
     }
     Ok(supervisor)
+}
+
+fn reconcile_identity_presence(state: &mut PoolState, supervisor: &Supervisor) -> bool {
+    let mut changed = false;
+    let mut demoted = false;
+    for proxy in &mut state.proxies {
+        let present = supervisor.config_path(proxy.group, proxy.slot).is_file();
+        if proxy.registered != present {
+            proxy.registered = present;
+            changed = true;
+        }
+        if proxy.locked && !present {
+            log::warn!(
+                "demoting locked proxy g{} s{} because its WARP identity config is missing",
+                proxy.group,
+                proxy.slot
+            );
+            proxy.locked = false;
+            proxy.pid = 0;
+            proxy.v4.clear();
+            proxy.v6.clear();
+            proxy.last_keepalive = 0;
+            changed = true;
+            demoted = true;
+        }
+    }
+    if demoted && state.phase != "init" {
+        state.phase = "init".to_string();
+        changed = true;
+    }
+    changed
 }
 
 async fn supervise(
@@ -1015,6 +1039,71 @@ fn read_memory_kb() -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_keeps_unlocked_identities_lazy_and_demotes_missing_locked_configs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let supervisor = Supervisor::new(dir.path().to_path_buf())?;
+
+        let present = supervisor.config_path(0, 1);
+        std::fs::create_dir_all(
+            present
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?,
+        )?;
+        std::fs::write(&present, b"existing")?;
+
+        let mut state = PoolState {
+            phase: "locked".to_string(),
+            proxies: vec![
+                ProxyRecord {
+                    addr: "2001:db8::1".to_string(),
+                    group: 0,
+                    slot: 0,
+                    registered: true,
+                    locked: true,
+                    v6: "2001:db8::1".to_string(),
+                    v4: "104.16.0.1".to_string(),
+                    pid: 1234,
+                    last_keepalive: 42,
+                },
+                ProxyRecord {
+                    addr: "2001:db8::2".to_string(),
+                    group: 0,
+                    slot: 1,
+                    registered: false,
+                    ..ProxyRecord::default()
+                },
+                ProxyRecord {
+                    addr: "2001:db8::3".to_string(),
+                    group: 0,
+                    slot: 2,
+                    registered: false,
+                    ..ProxyRecord::default()
+                },
+            ],
+            ..PoolState::default()
+        };
+
+        assert!(reconcile_identity_presence(&mut state, &supervisor));
+        assert_eq!(state.phase, "init");
+
+        let missing_locked = &state.proxies[0];
+        assert!(!missing_locked.registered);
+        assert!(!missing_locked.locked);
+        assert_eq!(missing_locked.pid, 0);
+        assert!(missing_locked.v4.is_empty());
+        assert!(missing_locked.v6.is_empty());
+        assert_eq!(missing_locked.last_keepalive, 0);
+        assert!(!supervisor.config_path(0, 0).exists());
+
+        assert!(state.proxies[1].registered);
+        assert!(!state.proxies[1].locked);
+
+        assert!(!state.proxies[2].registered);
+        assert!(!supervisor.config_path(0, 2).exists());
+        Ok(())
+    }
 
     #[test]
     fn suffix_composes_inside_prefix() -> Result<()> {
