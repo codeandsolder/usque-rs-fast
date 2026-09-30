@@ -37,7 +37,7 @@ futures = "0.3"
 tempfile = "3"
 time = "0.3"
 socket2 = "0.6"
-nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
+nix = { version = "0.31.3", features = ["net", "socket", "time", "uio"] }
 datagram-socket = "0.8.0"
 fast-socks5 = "1"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "async", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "socket-tcp", "socket-tcp-reno", "socket-udp", "socket-dns", "dns-max-result-count-8", "dns-max-server-count-4"] }

@@ -9,6 +9,8 @@ use tempfile::NamedTempFile;
 
 use crate::config::Config;
 
+pub(crate) const DGRAM_QUEUE_LEN: usize = 1000;
+
 /// Holds temporary PEM files for quiche TLS config and the pinned endpoint key.
 pub struct TlsMaterial {
     pub cert_pem_file: NamedTempFile,
@@ -139,7 +141,7 @@ pub fn build_quic_config(
     quic_config.set_initial_max_streams_bidi(100);
     quic_config.set_initial_max_streams_uni(100);
     quic_config.set_disable_active_migration(true);
-    quic_config.enable_dgram(true, 1000, 1000);
+    quic_config.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
 
     Ok(quic_config)
 }

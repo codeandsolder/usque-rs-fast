@@ -16,6 +16,136 @@ use crate::udp_socket::{bind_udp_socket, detect_udp_gso, send_udp_gso};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const TUN_READY_DRAIN_MAX_READS: usize = 8;
+const TUN_DRAIN_INITIAL_SAMPLES_PER_MODE: u8 = 3;
+const TUN_DRAIN_CHALLENGE_INTERVAL_SECS: u16 = 30;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CpuPerPacketStats {
+    samples: u8,
+    mean_ns: f64,
+    m2_ns: f64,
+}
+
+impl CpuPerPacketStats {
+    fn add(&mut self, cpu_ns: u64, packets: u64) {
+        if packets == 0 {
+            return;
+        }
+
+        let sample = cpu_ns as f64 / packets as f64;
+        self.samples = self.samples.saturating_add(1);
+        let delta = sample - self.mean_ns;
+        self.mean_ns += delta / f64::from(self.samples);
+        let delta2 = sample - self.mean_ns;
+        self.m2_ns = delta.mul_add(delta2, self.m2_ns);
+    }
+
+    fn standard_error(&self) -> f64 {
+        if self.samples < 2 {
+            return f64::INFINITY;
+        }
+
+        let variance = self.m2_ns / f64::from(self.samples - 1);
+        (variance / f64::from(self.samples)).sqrt()
+    }
+}
+
+#[derive(Debug)]
+struct TunDrainTuner {
+    calibrating: bool,
+    selected: bool,
+    off: CpuPerPacketStats,
+    on: CpuPerPacketStats,
+    challenge_countdown: u16,
+    challenge_baseline_ns: Option<f64>,
+}
+
+impl TunDrainTuner {
+    fn new() -> Self {
+        Self {
+            calibrating: true,
+            selected: false,
+            off: CpuPerPacketStats::default(),
+            on: CpuPerPacketStats::default(),
+            challenge_countdown: TUN_DRAIN_CHALLENGE_INTERVAL_SECS,
+            challenge_baseline_ns: None,
+        }
+    }
+
+    fn observe(&mut self, mode: bool, cpu_ns: u64, packets: u64) -> bool {
+        if packets == 0 {
+            return mode;
+        }
+
+        let sample_ns = cpu_ns as f64 / packets as f64;
+
+        if self.calibrating {
+            if mode {
+                self.on.add(cpu_ns, packets);
+            } else {
+                self.off.add(cpu_ns, packets);
+            }
+
+            if self.off.samples >= TUN_DRAIN_INITIAL_SAMPLES_PER_MODE
+                && self.on.samples >= TUN_DRAIN_INITIAL_SAMPLES_PER_MODE
+            {
+                // Prefer ready-drain only when its measured improvement is
+                // larger than the observed sample noise. Ambiguous cases
+                // conservatively stay off.
+                let uncertainty = self.off.standard_error().hypot(self.on.standard_error());
+                self.selected = self.on.mean_ns + uncertainty < self.off.mean_ns;
+                self.calibrating = false;
+                self.challenge_countdown = TUN_DRAIN_CHALLENGE_INTERVAL_SECS;
+                return self.selected;
+            }
+
+            let opposite_needs_sample = if mode {
+                self.off.samples < TUN_DRAIN_INITIAL_SAMPLES_PER_MODE
+            } else {
+                self.on.samples < TUN_DRAIN_INITIAL_SAMPLES_PER_MODE
+            };
+
+            return if opposite_needs_sample { !mode } else { mode };
+        }
+
+        if let Some(baseline_ns) = self.challenge_baseline_ns.take() {
+            // This interval ran in the opposite mode. Switch only if that
+            // immediately-adjacent challenger beat the selected-mode sample.
+            if sample_ns < baseline_ns {
+                self.selected = mode;
+            }
+            self.challenge_countdown = TUN_DRAIN_CHALLENGE_INTERVAL_SECS;
+            return self.selected;
+        }
+
+        if mode == self.selected {
+            if self.challenge_countdown > 0 {
+                self.challenge_countdown -= 1;
+            }
+
+            if self.challenge_countdown == 0 {
+                self.challenge_baseline_ns = Some(sample_ns);
+                return !self.selected;
+            }
+        }
+
+        self.selected
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_time_ns() -> Option<u64> {
+    let ts = nix::time::clock_gettime(nix::time::ClockId::CLOCK_PROCESS_CPUTIME_ID).ok()?;
+    let secs = u64::try_from(ts.tv_sec()).ok()?;
+    let nanos = u64::try_from(ts.tv_nsec()).ok()?;
+    secs.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cpu_time_ns() -> Option<u64> {
+    None
+}
 
 /// Configuration for a MASQUE tunnel session.
 pub struct TunnelConfig {
@@ -88,6 +218,133 @@ fn stage_tun_packet(buf: &mut Vec<u8>, packet: &[u8]) {
     buf.clear();
     buf.resize(VIRTIO_NET_HDR_LEN, 0);
     buf.extend_from_slice(packet);
+}
+
+fn should_flush_tun_write_batch(
+    packet_count: usize,
+    packet_target: usize,
+    deadline_expired: bool,
+    pure_rx_iteration: bool,
+) -> bool {
+    packet_count > 0 && (packet_count >= packet_target || deadline_expired || !pure_rx_iteration)
+}
+
+#[derive(Debug)]
+struct TunWriteBatchGate {
+    adaptive: bool,
+    active: bool,
+    packet_target: usize,
+    activation_span: Duration,
+    last_dense_event: Option<Instant>,
+    dense_events: u8,
+    slow_batches: u8,
+}
+
+impl TunWriteBatchGate {
+    const DENSE_EVENTS_TO_ENABLE: u8 = 3;
+    const SLOW_BATCHES_TO_DISABLE: u8 = 3;
+
+    fn new(adaptive: bool, packet_target: usize, max_delay: Duration) -> Self {
+        Self {
+            adaptive,
+            active: !adaptive && packet_target > 1,
+            packet_target,
+            activation_span: max_delay / 2,
+            last_dense_event: None,
+            dense_events: 0,
+            slow_batches: 0,
+        }
+    }
+
+    fn effective_target(&self) -> usize {
+        if self.packet_target > 1 && self.active {
+            self.packet_target
+        } else {
+            1
+        }
+    }
+
+    fn observe_arrivals(&mut self, packet_count: usize) {
+        if !self.arrivals_can_advance(packet_count) {
+            return;
+        }
+
+        self.observe_dense_event(Instant::now());
+    }
+
+    fn arrivals_can_advance(&mut self, packet_count: usize) -> bool {
+        if !self.adaptive || self.packet_target <= 1 || self.active {
+            return false;
+        }
+
+        // Most low-rate receive events are too small to contribute to
+        // activation. Reject and reset them before reading the monotonic clock;
+        // clock_gettime is measurable on low-end targets such as MT7621.
+        if packet_count < self.packet_target {
+            self.last_dense_event = None;
+            self.dense_events = 0;
+            return false;
+        }
+
+        true
+    }
+
+    fn observe_dense_event(&mut self, now: Instant) {
+        // A single recv_multiple() wake may contain many packets that all share
+        // this observation timestamp. Count it as one dense event rather than
+        // several zero-time packet windows; otherwise one occasional kernel
+        // burst can enable cross-iteration retention at a low sustained rate.
+        if self
+            .last_dense_event
+            .is_some_and(|last| now.saturating_duration_since(last) <= self.activation_span)
+        {
+            self.dense_events = self.dense_events.saturating_add(1);
+        } else {
+            self.dense_events = 1;
+        }
+        self.last_dense_event = Some(now);
+
+        if self.dense_events >= Self::DENSE_EVENTS_TO_ENABLE {
+            self.active = true;
+            self.slow_batches = 0;
+            self.last_dense_event = None;
+            self.dense_events = 0;
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_arrivals_at(&mut self, now: Instant, packet_count: usize) {
+        if self.arrivals_can_advance(packet_count) {
+            self.observe_dense_event(now);
+        }
+    }
+
+    fn observe_flush(
+        &mut self,
+        packet_count: usize,
+        elapsed: Option<Duration>,
+        deadline_expired: bool,
+    ) {
+        if !self.adaptive || !self.active || self.packet_target <= 1 {
+            return;
+        }
+
+        let slow = deadline_expired
+            || (packet_count >= self.packet_target
+                && elapsed.is_some_and(|duration| duration > self.activation_span));
+
+        if slow {
+            self.slow_batches = self.slow_batches.saturating_add(1);
+            if self.slow_batches >= Self::SLOW_BATCHES_TO_DISABLE {
+                self.active = false;
+                self.slow_batches = 0;
+                self.dense_events = 0;
+                self.last_dense_event = None;
+            }
+        } else if packet_count >= self.packet_target {
+            self.slow_batches = 0;
+        }
+    }
 }
 
 const MAX_UDP_BATCH_BYTES: usize = 65_507;
@@ -647,10 +904,21 @@ async fn drain_inbound_datagrams(
     buffers: &mut ForwardBuffers,
     stats: &mut TunnelStats,
     inbound_count: &mut usize,
-) -> Result<()> {
-    // Synchronous DATAGRAM delivery may already have filled the batch. Flush it
-    // before draining any overflow that fell back to quiche's receive queue.
+    tun_write_target: usize,
+    tun_write_gate: &mut TunWriteBatchGate,
+    tun_write_started_at: &mut Option<Instant>,
+    tun_write_deadline: &mut Option<Instant>,
+    tun_write_max_delay: Duration,
+) -> Result<usize> {
     if *inbound_count == buffers.inbound_packets.len() {
+        if tun_write_target > 1 {
+            let now = Instant::now();
+            tun_write_gate.observe_flush(
+                *inbound_count,
+                tun_write_started_at.map(|started| now.saturating_duration_since(started)),
+                false,
+            );
+        }
         send_tun_batch(
             tun_dev,
             &mut buffers.gro_table,
@@ -658,8 +926,11 @@ async fn drain_inbound_datagrams(
         )
         .await?;
         *inbound_count = 0;
+        *tun_write_started_at = None;
+        *tun_write_deadline = None;
     }
 
+    let mut accepted_inbound = 0usize;
     loop {
         match conn.dgram_recv_buf() {
             Ok(datagram) => {
@@ -673,10 +944,26 @@ async fn drain_inbound_datagrams(
                 stats.rx_packets += 1;
                 stats.rx_bytes += u64::try_from(ip_payload.len())
                     .map_err(|_| anyhow::anyhow!("packet length does not fit u64"))?;
+
+                if *inbound_count == 0 && tun_write_target > 1 {
+                    let now = Instant::now();
+                    *tun_write_started_at = Some(now);
+                    *tun_write_deadline = Some(now + tun_write_max_delay);
+                }
                 stage_tun_packet(&mut buffers.inbound_packets[*inbound_count], ip_payload);
                 *inbound_count += 1;
+                accepted_inbound += 1;
 
                 if *inbound_count == buffers.inbound_packets.len() {
+                    if tun_write_target > 1 {
+                        let now = Instant::now();
+                        tun_write_gate.observe_flush(
+                            *inbound_count,
+                            tun_write_started_at
+                                .map(|started| now.saturating_duration_since(started)),
+                            false,
+                        );
+                    }
                     send_tun_batch(
                         tun_dev,
                         &mut buffers.gro_table,
@@ -684,6 +971,8 @@ async fn drain_inbound_datagrams(
                     )
                     .await?;
                     *inbound_count = 0;
+                    *tun_write_started_at = None;
+                    *tun_write_deadline = None;
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -694,16 +983,7 @@ async fn drain_inbound_datagrams(
         }
     }
 
-    if *inbound_count > 0 {
-        send_tun_batch(
-            tun_dev,
-            &mut buffers.gro_table,
-            &mut buffers.inbound_packets[..*inbound_count],
-        )
-        .await?;
-        *inbound_count = 0;
-    }
-    Ok(())
+    Ok(accepted_inbound)
 }
 
 fn handle_session_timeout(
@@ -747,15 +1027,76 @@ async fn forward_native_session(
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     stats_interval.tick().await;
 
+    let mut tun_ready_drain = false;
+    let mut tun_drain_tuner = TunDrainTuner::new();
+    let mut tune_tx_packets = stats.tx_packets;
+    let mut tune_process_cpu_ns = process_cpu_time_ns();
+
+    let tun_write_packets = std::env::var("USQUE_TUN_WRITE_PACKETS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, IDEAL_BATCH_SIZE);
+    let tun_write_max_us = std::env::var("USQUE_TUN_WRITE_MAX_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000)
+        .clamp(1, 1_000);
+    let tun_write_max_delay = Duration::from_micros(tun_write_max_us);
+    let tun_write_adaptive = std::env::var("USQUE_TUN_WRITE_ADAPTIVE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+    let mut tun_write_gate =
+        TunWriteBatchGate::new(tun_write_adaptive, tun_write_packets, tun_write_max_delay);
+    let mut inbound_count = 0usize;
+    let mut tun_write_deadline: Option<Instant> = None;
+    let mut tun_write_started_at: Option<Instant> = None;
+
+    log::info!(
+        "TUN write batching: packet_target={tun_write_packets} max_delay_us={tun_write_max_us} adaptive={tun_write_adaptive}"
+    );
+
     loop {
-        // DATAGRAMs consumed synchronously by quiche are staged directly into
-        // this preallocated batch. Overflow remains queued in quiche and is
-        // drained into the same batch below.
-        let mut inbound_count = 0usize;
+        // The UDP branch is biased and may stay continuously ready. Enforce the
+        // write deadline synchronously so retained packets cannot starve.
+        if inbound_count > 0 {
+            let now = Instant::now();
+            if tun_write_deadline.is_some_and(|deadline| now >= deadline) {
+                tun_write_gate.observe_flush(
+                    inbound_count,
+                    tun_write_started_at.map(|started| now.saturating_duration_since(started)),
+                    true,
+                );
+                send_tun_batch(
+                    tun_dev,
+                    &mut buffers.gro_table,
+                    &mut buffers.inbound_packets[..inbound_count],
+                )
+                .await?;
+                inbound_count = 0;
+                tun_write_deadline = None;
+                tun_write_started_at = None;
+            }
+        }
+
+        let tun_write_target_this_iteration = tun_write_gate.effective_target();
+        let mut pure_rx_iteration = false;
         let quic_timeout = session.quic.conn.timeout();
-        let timeout = quic_timeout
+        let protocol_timeout = quic_timeout
             .unwrap_or(keepalive_interval)
             .min(keepalive_interval);
+        let tun_write_timeout =
+            tun_write_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let wake_timeout = tun_write_timeout.map_or(protocol_timeout, |tun_timeout| {
+            protocol_timeout.min(tun_timeout)
+        });
+        let tun_deadline_wakes_first =
+            tun_write_timeout.is_some_and(|tun_timeout| tun_timeout < protocol_timeout);
 
         tokio::select! {
             biased;
@@ -763,7 +1104,9 @@ async fn forward_native_session(
                 reset_udp_read_bufs(&mut udp_recv_bufs);
                 session.quic.socket.recv_many(&mut udp_recv_bufs).await
             } => {
+                pure_rx_iteration = true;
                 let count = result?;
+                let mut accepted_inbound = 0usize;
                 process_udp_batch(
                     &mut session.quic.conn,
                     &mut udp_recv_bufs,
@@ -771,15 +1114,29 @@ async fn forward_native_session(
                     session.quic.local_addr,
                     session.quic.endpoint,
                     &mut |dgram| {
-                        try_stage_inbound_datagram(
+                        let batch_was_empty = inbound_count == 0;
+                        if !try_stage_inbound_datagram(
                             dgram,
                             session.flow_id,
                             &mut buffers.inbound_packets,
                             &mut inbound_count,
                             &mut stats,
-                        )
+                        ) {
+                            return false;
+                        }
+
+                        if batch_was_empty && tun_write_target_this_iteration > 1 {
+                            let now = Instant::now();
+                            tun_write_started_at = Some(now);
+                            tun_write_deadline = Some(now + tun_write_max_delay);
+                        }
+                        accepted_inbound += 1;
+                        true
                     },
                 );
+                if accepted_inbound > 0 {
+                    tun_write_gate.observe_arrivals(accepted_inbound);
+                }
             }
             result = tun_dev.recv_multiple(
                 &mut buffers.tun_raw,
@@ -787,40 +1144,119 @@ async fn forward_native_session(
                 &mut buffers.tun_sizes,
                 0,
             ) => {
-                let count = result
+                let mut count = result
                     .map_err(|e| anyhow::anyhow!("failed to read packet batch from TUN: {e}"))?;
                 if count == 0 {
                     bail!("TUN device closed");
                 }
-                forward_tun_batch(
-                    &mut session.quic.conn,
-                    tun_dev,
-                    &flow_prefix,
-                    &mut buffers,
-                    count,
-                    &mut stats,
-                ).await?;
+
+                let mut reads = 0usize;
+                loop {
+                    reads += 1;
+                    forward_tun_batch(
+                        &mut session.quic.conn,
+                        tun_dev,
+                        &flow_prefix,
+                        &mut buffers,
+                        count,
+                        &mut stats,
+                    ).await?;
+
+                    if !tun_ready_drain
+                        || reads >= TUN_READY_DRAIN_MAX_READS
+                        || session.quic.conn.dgram_send_queue_len()
+                            > tls::DGRAM_QUEUE_LEN - IDEAL_BATCH_SIZE
+                    {
+                        break;
+                    }
+
+                    match tun_dev.try_recv_multiple(
+                        &mut buffers.tun_raw,
+                        &mut buffers.tun_packets,
+                        &mut buffers.tun_sizes,
+                        0,
+                    ) {
+                        Ok(0) => break,
+                        Ok(next_count) => count = next_count,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(
+                                "failed to drain ready TUN packet batch: {error}"
+                            ));
+                        }
+                    }
+                }
             }
-            () = tokio::time::sleep(timeout) => {
-                handle_session_timeout(
-                    &mut session.quic.conn,
-                    quic_timeout,
-                    keepalive_interval,
-                )?;
+            () = tokio::time::sleep(wake_timeout) => {
+                if !tun_deadline_wakes_first {
+                    handle_session_timeout(
+                        &mut session.quic.conn,
+                        quic_timeout,
+                        keepalive_interval,
+                    )?;
+                }
             }
-            _ = stats_interval.tick() => stats.print(&session.quic.conn),
+            _ = stats_interval.tick() => {
+                let current_cpu_ns = process_cpu_time_ns();
+                if let (Some(previous_cpu_ns), Some(current_cpu_ns)) =
+                    (tune_process_cpu_ns, current_cpu_ns)
+                {
+                    let cpu_delta = current_cpu_ns.saturating_sub(previous_cpu_ns);
+                    let packet_delta = stats.tx_packets.saturating_sub(tune_tx_packets);
+                    tun_ready_drain =
+                        tun_drain_tuner.observe(tun_ready_drain, cpu_delta, packet_delta);
+                }
+                tune_process_cpu_ns = current_cpu_ns;
+                tune_tx_packets = stats.tx_packets;
+                stats.print(&session.quic.conn);
+            }
         }
 
         drain_h3_events(&mut session.h3_conn, &mut session.quic.conn);
-        drain_inbound_datagrams(
+        let fallback_inbound = drain_inbound_datagrams(
             &mut session.quic.conn,
             tun_dev,
             session.flow_id,
             &mut buffers,
             &mut stats,
             &mut inbound_count,
+            tun_write_target_this_iteration,
+            &mut tun_write_gate,
+            &mut tun_write_started_at,
+            &mut tun_write_deadline,
+            tun_write_max_delay,
         )
         .await?;
+        if fallback_inbound > 0 {
+            tun_write_gate.observe_arrivals(fallback_inbound);
+        }
+
+        let now = Instant::now();
+        let tun_write_deadline_expired = tun_write_deadline.is_some_and(|deadline| now >= deadline);
+        if should_flush_tun_write_batch(
+            inbound_count,
+            tun_write_target_this_iteration,
+            tun_write_deadline_expired,
+            pure_rx_iteration,
+        ) {
+            if tun_write_target_this_iteration > 1 {
+                tun_write_gate.observe_flush(
+                    inbound_count,
+                    tun_write_started_at.map(|started| now.saturating_duration_since(started)),
+                    tun_write_deadline_expired,
+                );
+            }
+            send_tun_batch(
+                tun_dev,
+                &mut buffers.gro_table,
+                &mut buffers.inbound_packets[..inbound_count],
+            )
+            .await?;
+            inbound_count = 0;
+            tun_write_deadline = None;
+            tun_write_started_at = None;
+        }
+
         flush_quic_packets(
             &mut session.quic.conn,
             &session.quic.socket,
@@ -830,6 +1266,22 @@ async fn forward_native_session(
         .await?;
 
         if session.quic.conn.is_closed() {
+            if inbound_count > 0 {
+                if tun_write_target_this_iteration > 1 {
+                    let now = Instant::now();
+                    tun_write_gate.observe_flush(
+                        inbound_count,
+                        tun_write_started_at.map(|started| now.saturating_duration_since(started)),
+                        false,
+                    );
+                }
+                send_tun_batch(
+                    tun_dev,
+                    &mut buffers.gro_table,
+                    &mut buffers.inbound_packets[..inbound_count],
+                )
+                .await?;
+            }
             return Ok(());
         }
     }
@@ -947,6 +1399,8 @@ mod tests {
         assert_eq!(parse_datagram(&dgram, 0), None);
     }
 
+    // ---- TUN write batching policy tests ----
+
     fn minimal_ipv4_packet() -> Vec<u8> {
         let mut packet = vec![0u8; 20];
         packet[0] = 0x45;
@@ -1028,6 +1482,86 @@ mod tests {
         assert!(inbound_packets.iter().all(Vec::is_empty));
         assert_eq!(stats.rx_packets, 0);
         assert_eq!(stats.rx_bytes, 0);
+    }
+
+    #[test]
+    fn tun_write_batch_default_flushes_each_packet() {
+        assert!(should_flush_tun_write_batch(1, 1, false, true));
+    }
+
+    #[test]
+    fn tun_write_batch_retains_small_pure_rx_batch() {
+        assert!(!should_flush_tun_write_batch(3, 4, false, true));
+    }
+
+    #[test]
+    fn tun_write_batch_flushes_on_target_deadline_or_non_rx_event() {
+        assert!(should_flush_tun_write_batch(4, 4, false, true));
+        assert!(should_flush_tun_write_batch(1, 4, true, true));
+        assert!(should_flush_tun_write_batch(1, 4, false, false));
+        assert!(!should_flush_tun_write_batch(0, 4, true, false));
+    }
+
+    #[test]
+    fn adaptive_tun_write_gate_stays_off_for_sparse_receive_events() {
+        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let start = Instant::now();
+        for i in 0..6 {
+            gate.observe_arrivals_at(start + Duration::from_micros(i * 750), 4);
+        }
+        assert_eq!(gate.effective_target(), 1);
+    }
+
+    #[test]
+    fn adaptive_tun_write_gate_single_large_receive_does_not_enable() {
+        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        gate.observe_arrivals_at(Instant::now(), 32);
+        assert_eq!(gate.effective_target(), 1);
+    }
+
+    #[test]
+    fn adaptive_tun_write_gate_partial_receive_resets_dense_streak() {
+        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let start = Instant::now();
+        gate.observe_arrivals_at(start, 4);
+        gate.observe_arrivals_at(start + Duration::from_micros(100), 4);
+        gate.observe_arrivals_at(start + Duration::from_micros(200), 3);
+        gate.observe_arrivals_at(start + Duration::from_micros(300), 4);
+        gate.observe_arrivals_at(start + Duration::from_micros(400), 4);
+        assert_eq!(gate.effective_target(), 1);
+    }
+
+    #[test]
+    fn adaptive_tun_write_gate_enables_for_dense_receive_events() {
+        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let start = Instant::now();
+        for i in 0..3 {
+            gate.observe_arrivals_at(start + Duration::from_micros(i * 100), 4);
+        }
+        assert_eq!(gate.effective_target(), 4);
+    }
+
+    #[test]
+    fn adaptive_tun_write_gate_disables_after_repeated_slow_batches() {
+        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let start = Instant::now();
+        for i in 0..3 {
+            gate.observe_arrivals_at(start + Duration::from_micros(i * 100), 4);
+        }
+        assert_eq!(gate.effective_target(), 4);
+
+        for _ in 0..3 {
+            gate.observe_flush(4, Some(Duration::from_micros(700)), false);
+        }
+        assert_eq!(gate.effective_target(), 1);
+    }
+
+    #[test]
+    fn fixed_tun_write_gate_remains_enabled() {
+        let mut gate = TunWriteBatchGate::new(false, 4, Duration::from_micros(1_000));
+        assert_eq!(gate.effective_target(), 4);
+        gate.observe_flush(4, Some(Duration::from_micros(900)), true);
+        assert_eq!(gate.effective_target(), 4);
     }
 
     // ---- format_bytes tests ----
