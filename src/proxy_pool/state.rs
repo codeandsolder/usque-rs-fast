@@ -40,7 +40,7 @@ pub struct PoolState {
     pub seen_v4: BTreeSet<String>,
     #[serde(default)]
     pub stale_count: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_started_at")]
     pub started_at: i64,
     #[serde(default)]
     pub proxies: Vec<ProxyRecord>,
@@ -48,6 +48,30 @@ pub struct PoolState {
 
 fn default_phase() -> String {
     "init".to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StartedAt {
+    Integer(i64),
+    Float(f64),
+}
+
+fn deserialize_started_at<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match StartedAt::deserialize(deserializer)? {
+        StartedAt::Integer(value) => Ok(value),
+        StartedAt::Float(value)
+            if value.is_finite() && value >= i64::MIN as f64 && value <= i64::MAX as f64 =>
+        {
+            Ok(value.trunc() as i64)
+        }
+        StartedAt::Float(_) => Err(serde::de::Error::custom(
+            "started_at float must be finite and fit in i64 Unix seconds",
+        )),
+    }
 }
 
 impl Default for PoolState {
@@ -204,6 +228,39 @@ mod tests {
         assert_eq!(loaded.proxies[0].last_keepalive, 123);
         assert_eq!(loaded.proxies[0].pid, 0);
         assert!(loaded.proxies[0].locked);
+        Ok(())
+    }
+
+    #[test]
+    fn loads_legacy_float_started_at_and_ignores_unknown_fields() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.json");
+        fs::write(
+            &path,
+            br#"{
+                "phase": "locked",
+                "started_at": 123.75,
+                "port": 20000,
+                "proxies": [{
+                    "addr": "2001:db8::1:2",
+                    "group": 0,
+                    "slot": 3,
+                    "registered": true,
+                    "locked": true,
+                    "v6": "2001:db8::1:2",
+                    "v4": "104.16.1.2",
+                    "pid": 4242,
+                    "last_keepalive": 123
+                }]
+            }"#,
+        )?;
+
+        let loaded = PoolState::load(&path)?;
+        assert_eq!(loaded.started_at, 123);
+        assert_eq!(loaded.phase, "locked");
+        assert_eq!(loaded.proxies.len(), 1);
+        assert!(loaded.proxies[0].locked);
+        assert_eq!(loaded.proxies[0].pid, 0);
         Ok(())
     }
 
