@@ -1,10 +1,9 @@
 use super::net::VirtualNet;
 use anyhow::Result;
 use fast_socks5::{
-    new_udp_header, parse_udp_request,
-    server::{states::CommandRead, Socks5ServerProtocol},
+    ReplyError, Socks5Command, new_udp_header, parse_udp_request,
+    server::{Socks5ServerProtocol, states::CommandRead},
     util::target_addr::TargetAddr,
-    ReplyError, Socks5Command,
 };
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::{

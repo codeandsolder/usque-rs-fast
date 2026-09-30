@@ -1,7 +1,7 @@
 [package]
 name = "usque-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.88"
 description = "Tiny Rust MASQUE (CONNECT-IP) client for Cloudflare WARP (unofficial)"
 license = "MIT"
@@ -48,13 +48,32 @@ http-body-util = "0.1"
 
 [lints.rust]
 unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unfulfilled_lint_expectations = "deny"
+unexpected_cfgs = "deny"
+rust_2024_compatibility = { level = "deny", priority = -1 }
 rust_2018_idioms = { level = "warn", priority = -1 }
 
 [lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
 cargo = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+await_holding_lock = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
 
 module_name_repetitions = "allow"
 must_use_candidate = "allow"

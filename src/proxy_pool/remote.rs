@@ -1,9 +1,9 @@
 use super::{
     core::{
-        port_for, wait_for_shutdown, ChildSpec, ChildTransport, ProxyAuth, SlotKey, Supervisor,
+        ChildSpec, ChildTransport, ProxyAuth, SlotKey, Supervisor, port_for, wait_for_shutdown,
     },
-    reporter::{client_tls_config, Heartbeat, ProxyReport, RemoteReporter},
-    state::{load_suffixes, save_suffixes, PoolState, ProxyRecord},
+    reporter::{Heartbeat, ProxyReport, RemoteReporter, client_tls_config},
+    state::{PoolState, ProxyRecord, load_suffixes, save_suffixes},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;

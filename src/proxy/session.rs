@@ -1,4 +1,4 @@
-use crate::{config, packet_session::PacketSessionConfig, MasquePacketStream};
+use crate::{MasquePacketStream, config, packet_session::PacketSessionConfig};
 use anyhow::{Context, Result};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},

@@ -1,6 +1,6 @@
 use super::{
     core::{
-        port_for, wait_for_shutdown, ChildSpec, ChildTransport, ProxyAuth, SlotKey, Supervisor,
+        ChildSpec, ChildTransport, ProxyAuth, SlotKey, Supervisor, port_for, wait_for_shutdown,
     },
     state::identity_config_path,
 };

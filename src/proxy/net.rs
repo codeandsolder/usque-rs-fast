@@ -1,6 +1,6 @@
 use crate::MasquePacketStream;
 use bytes::Bytes;
-use futures::{future::poll_fn, stream::FuturesUnordered, SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, future::poll_fn, stream::FuturesUnordered};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -14,14 +14,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 
 const TCP_BUFFER_SIZE: usize = 256 * 1024;
 const UDP_PACKET_SLOTS: usize = 64;

@@ -2,14 +2,14 @@ use super::net::VirtualNet;
 use anyhow::Result;
 use base64::Engine;
 use bytes::Bytes;
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
 use hyper::{
+    Method, Request, Response, StatusCode, Uri,
     body::Incoming,
     client::conn::http1 as client_http1,
-    header::{HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
+    header::{CONNECTION, HOST, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
     server::conn::http1 as server_http1,
     service::service_fn,
-    Method, Request, Response, StatusCode, Uri,
 };
 use hyper_util::rt::TokioIo;
 use std::{convert::Infallible, error::Error, net::SocketAddr, sync::Arc};
