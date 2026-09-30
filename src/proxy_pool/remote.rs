@@ -177,7 +177,7 @@ impl CyclePass {
     }
 }
 
-fn apply_cycle_pass(state: &mut PoolState, summary: CyclePassSummary) -> bool {
+const fn apply_cycle_pass(state: &mut PoolState, summary: CyclePassSummary) -> bool {
     if summary.new_locked > 0 {
         if state.stale_count == 0 {
             return false;
