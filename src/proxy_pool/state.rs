@@ -63,14 +63,13 @@ where
 {
     match StartedAt::deserialize(deserializer)? {
         StartedAt::Integer(value) => Ok(value),
-        StartedAt::Float(value)
-            if value.is_finite() && value >= i64::MIN as f64 && value <= i64::MAX as f64 =>
-        {
-            Ok(value.trunc() as i64)
-        }
-        StartedAt::Float(_) => Err(serde::de::Error::custom(
-            "started_at float must be finite and fit in i64 Unix seconds",
-        )),
+        StartedAt::Float(value) => time::SignedDuration::checked_seconds_f64(value)
+            .map(|duration| duration.whole_seconds())
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "started_at float must be finite and fit in i64 Unix seconds",
+                )
+            }),
     }
 }
 
