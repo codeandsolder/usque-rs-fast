@@ -123,6 +123,36 @@ fn process_udp_batch<H>(
     }
 }
 
+// Returning false is part of the correctness contract: quiche then queues the
+// DATAGRAM and suppresses direct handling of newer DATAGRAMs until that queue is
+// drained, preserving FIFO order across the direct and fallback paths.
+fn try_stage_inbound_datagram(
+    dgram: &[u8],
+    expected_flow_id: u64,
+    inbound_packets: &mut [Vec<u8>],
+    inbound_count: &mut usize,
+    stats: &mut TunnelStats,
+) -> bool {
+    let Some(slot) = inbound_packets.get_mut(*inbound_count) else {
+        return false;
+    };
+    let Some(ip_payload) = parse_datagram(dgram, expected_flow_id) else {
+        return false;
+    };
+    if packet::validate_incoming(ip_payload).is_err() {
+        return false;
+    }
+    let Ok(packet_len) = u64::try_from(ip_payload.len()) else {
+        return false;
+    };
+
+    stage_tun_packet(slot, ip_payload);
+    *inbound_count += 1;
+    stats.rx_packets += 1;
+    stats.rx_bytes += packet_len;
+    true
+}
+
 async fn flush_quic_packets(
     conn: &mut quiche::Connection,
     socket: &tokio::net::UdpSocket,
@@ -741,27 +771,13 @@ async fn forward_native_session(
                     session.quic.local_addr,
                     session.quic.endpoint,
                     &mut |dgram| {
-                        if inbound_count == buffers.inbound_packets.len() {
-                            return false;
-                        }
-                        let Some(ip_payload) = parse_datagram(dgram, session.flow_id) else {
-                            return false;
-                        };
-                        if packet::validate_incoming(ip_payload).is_err() {
-                            return false;
-                        }
-                        let Ok(packet_len) = u64::try_from(ip_payload.len()) else {
-                            return false;
-                        };
-
-                        stats.rx_packets += 1;
-                        stats.rx_bytes += packet_len;
-                        stage_tun_packet(
-                            &mut buffers.inbound_packets[inbound_count],
-                            ip_payload,
-                        );
-                        inbound_count += 1;
-                        true
+                        try_stage_inbound_datagram(
+                            dgram,
+                            session.flow_id,
+                            &mut buffers.inbound_packets,
+                            &mut inbound_count,
+                            &mut stats,
+                        )
                     },
                 );
             }
@@ -929,6 +945,87 @@ mod tests {
         // Just a single byte - can't even decode flow_id
         let dgram = vec![0xFF];
         assert_eq!(parse_datagram(&dgram, 0), None);
+    }
+
+    fn minimal_ipv4_packet() -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet
+    }
+
+    #[test]
+    fn direct_datagram_stages_valid_payload_and_updates_stats_once() {
+        let packet = minimal_ipv4_packet();
+        let dgram = make_datagram(7, 0, &packet);
+        let mut inbound_packets = vec![Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet.len()); 2];
+        let mut inbound_count = 0;
+        let mut stats = TunnelStats::new();
+
+        assert!(try_stage_inbound_datagram(
+            &dgram,
+            7,
+            &mut inbound_packets,
+            &mut inbound_count,
+            &mut stats,
+        ));
+        assert_eq!(inbound_count, 1);
+        assert_eq!(stats.rx_packets, 1);
+        assert_eq!(stats.rx_bytes, 20);
+        assert_eq!(&inbound_packets[0][VIRTIO_NET_HDR_LEN..], packet.as_slice());
+        assert!(inbound_packets[0][..VIRTIO_NET_HDR_LEN]
+            .iter()
+            .all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn direct_datagram_full_batch_falls_back_without_mutation() {
+        let packet = minimal_ipv4_packet();
+        let dgram = make_datagram(7, 0, &packet);
+        let mut inbound_packets = vec![vec![0xA5; VIRTIO_NET_HDR_LEN + packet.len()]];
+        let original = inbound_packets.clone();
+        let mut inbound_count = inbound_packets.len();
+        let mut stats = TunnelStats::new();
+
+        assert!(!try_stage_inbound_datagram(
+            &dgram,
+            7,
+            &mut inbound_packets,
+            &mut inbound_count,
+            &mut stats,
+        ));
+        assert_eq!(inbound_packets, original);
+        assert_eq!(inbound_count, 1);
+        assert_eq!(stats.rx_packets, 0);
+        assert_eq!(stats.rx_bytes, 0);
+    }
+
+    #[test]
+    fn direct_datagram_rejected_payload_falls_back_without_mutation() {
+        let invalid_ip = [0x10, 0, 0, 0];
+        let wrong_flow = make_datagram(8, 0, &minimal_ipv4_packet());
+        let invalid_packet = make_datagram(7, 0, &invalid_ip);
+        let mut inbound_packets = vec![Vec::new(); 2];
+        let mut inbound_count = 0;
+        let mut stats = TunnelStats::new();
+
+        assert!(!try_stage_inbound_datagram(
+            &wrong_flow,
+            7,
+            &mut inbound_packets,
+            &mut inbound_count,
+            &mut stats,
+        ));
+        assert!(!try_stage_inbound_datagram(
+            &invalid_packet,
+            7,
+            &mut inbound_packets,
+            &mut inbound_count,
+            &mut stats,
+        ));
+        assert_eq!(inbound_count, 0);
+        assert!(inbound_packets.iter().all(Vec::is_empty));
+        assert_eq!(stats.rx_packets, 0);
+        assert_eq!(stats.rx_bytes, 0);
     }
 
     // ---- format_bytes tests ----
