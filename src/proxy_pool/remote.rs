@@ -253,6 +253,9 @@ fn validate_config(config: &RemoteConfig) -> Result<()> {
     if config.auth.username.is_empty() || config.auth.password.is_empty() {
         anyhow::bail!("remote proxy authentication must not be empty");
     }
+    if config.transport.no_tunnel_ipv4 {
+        anyhow::bail!("remote pool requires tunneled IPv4 for egress diversity and drift probes");
+    }
     for prefix in &config.prefixes {
         let _ = parse_prefix64(prefix)?;
     }
@@ -1114,6 +1117,37 @@ mod tests {
         );
         assert_eq!(prefix.network_text(), "2001:db8:1234:5678");
         Ok(())
+    }
+
+    #[test]
+    fn remote_mode_requires_tunneled_ipv4() {
+        let config = RemoteConfig {
+            root: PathBuf::from("/tmp/usque-test"),
+            prefixes: vec!["2001:db8::/64".to_string()],
+            interface: None,
+            slots_per_prefix: 1,
+            topup_count: 1,
+            stale_limit: 1,
+            base_port: 20_000,
+            port_stride: 1_000,
+            auth: ProxyAuth {
+                username: "user".to_string(),
+                password: "password".to_string(),
+            },
+            transport: ChildTransport {
+                no_tunnel_ipv4: true,
+                ..ChildTransport::default()
+            },
+            registration_delay: Duration::ZERO,
+            probe_wait: Duration::ZERO,
+            heartbeat_interval: Duration::from_secs(15),
+            register_interval: Duration::from_secs(180),
+            drift_interval: Duration::from_secs(15),
+            orchestrator_url: "https://orchestrator.example".to_string(),
+            psk: "test-psk".to_string(),
+            hostname: "test-host".to_string(),
+        };
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]
