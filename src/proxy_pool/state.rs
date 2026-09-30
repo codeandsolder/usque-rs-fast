@@ -64,7 +64,7 @@ where
     match StartedAt::deserialize(deserializer)? {
         StartedAt::Integer(value) => Ok(value),
         StartedAt::Float(value) => time::SignedDuration::checked_seconds_f64(value)
-            .map(|duration| duration.whole_seconds())
+            .map(time::SignedDuration::whole_seconds)
             .ok_or_else(|| {
                 serde::de::Error::custom(
                     "started_at float must be finite and fit in i64 Unix seconds",
