@@ -70,6 +70,11 @@ large_futures = "allow"
 items_after_statements = "allow"
 cargo_common_metadata = "allow"
 
+[patch.crates-io]
+quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f539155b38778b8e058710bc7f6f0e2e7dfb1df2" }
+octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f539155b38778b8e058710bc7f6f0e2e7dfb1df2" }
+tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "2fbed52d52028f1851e558d05f66ba7c6560c401" }
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -100,22 +100,57 @@ fn reset_udp_read_bufs(bufs: &mut [ReadBuf<'_>]) {
     }
 }
 
-fn process_udp_batch(
+fn process_udp_batch<H>(
     conn: &mut quiche::Connection,
     bufs: &mut [ReadBuf<'_>],
     count: usize,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
-) {
+    datagram_handler: &mut H,
+) where
+    H: FnMut(&[u8]) -> bool,
+{
     for buf in &mut bufs[..count] {
         let recv_info = quiche::RecvInfo {
             to: local_addr,
             from: peer_addr,
         };
-        if let Err(error) = conn.recv(buf.filled_mut(), recv_info) {
+        if let Err(error) =
+            conn.recv_with_dgram_handler(buf.filled_mut(), recv_info, datagram_handler)
+        {
             log::debug!("dropping UDP packet rejected by QUIC: {error}");
         }
     }
+}
+
+// Returning false is part of the correctness contract: quiche then queues the
+// DATAGRAM and suppresses direct handling of newer DATAGRAMs until that queue is
+// drained, preserving FIFO order across the direct and fallback paths.
+fn try_stage_inbound_datagram(
+    dgram: &[u8],
+    expected_flow_id: u64,
+    inbound_packets: &mut [Vec<u8>],
+    inbound_count: &mut usize,
+    stats: &mut TunnelStats,
+) -> bool {
+    let Some(slot) = inbound_packets.get_mut(*inbound_count) else {
+        return false;
+    };
+    let Some(ip_payload) = parse_datagram(dgram, expected_flow_id) else {
+        return false;
+    };
+    if packet::validate_incoming(ip_payload).is_err() {
+        return false;
+    }
+    let Ok(packet_len) = u64::try_from(ip_payload.len()) else {
+        return false;
+    };
+
+    stage_tun_packet(slot, ip_payload);
+    *inbound_count += 1;
+    stats.rx_packets += 1;
+    stats.rx_bytes += packet_len;
+    true
 }
 
 async fn flush_quic_packets(
@@ -611,8 +646,20 @@ async fn drain_inbound_datagrams(
     flow_id: u64,
     buffers: &mut ForwardBuffers,
     stats: &mut TunnelStats,
+    inbound_count: &mut usize,
 ) -> Result<()> {
-    let mut inbound_count = 0usize;
+    // Synchronous DATAGRAM delivery may already have filled the batch. Flush it
+    // before draining any overflow that fell back to quiche's receive queue.
+    if *inbound_count == buffers.inbound_packets.len() {
+        send_tun_batch(
+            tun_dev,
+            &mut buffers.gro_table,
+            &mut buffers.inbound_packets[..*inbound_count],
+        )
+        .await?;
+        *inbound_count = 0;
+    }
+
     loop {
         match conn.dgram_recv_buf() {
             Ok(datagram) => {
@@ -626,17 +673,17 @@ async fn drain_inbound_datagrams(
                 stats.rx_packets += 1;
                 stats.rx_bytes += u64::try_from(ip_payload.len())
                     .map_err(|_| anyhow::anyhow!("packet length does not fit u64"))?;
-                stage_tun_packet(&mut buffers.inbound_packets[inbound_count], ip_payload);
-                inbound_count += 1;
+                stage_tun_packet(&mut buffers.inbound_packets[*inbound_count], ip_payload);
+                *inbound_count += 1;
 
-                if inbound_count == buffers.inbound_packets.len() {
+                if *inbound_count == buffers.inbound_packets.len() {
                     send_tun_batch(
                         tun_dev,
                         &mut buffers.gro_table,
-                        &mut buffers.inbound_packets[..inbound_count],
+                        &mut buffers.inbound_packets[..*inbound_count],
                     )
                     .await?;
-                    inbound_count = 0;
+                    *inbound_count = 0;
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -647,13 +694,14 @@ async fn drain_inbound_datagrams(
         }
     }
 
-    if inbound_count > 0 {
+    if *inbound_count > 0 {
         send_tun_batch(
             tun_dev,
             &mut buffers.gro_table,
-            &mut buffers.inbound_packets[..inbound_count],
+            &mut buffers.inbound_packets[..*inbound_count],
         )
         .await?;
+        *inbound_count = 0;
     }
     Ok(())
 }
@@ -700,6 +748,10 @@ async fn forward_native_session(
     stats_interval.tick().await;
 
     loop {
+        // DATAGRAMs consumed synchronously by quiche are staged directly into
+        // this preallocated batch. Overflow remains queued in quiche and is
+        // drained into the same batch below.
+        let mut inbound_count = 0usize;
         let quic_timeout = session.quic.conn.timeout();
         let timeout = quic_timeout
             .unwrap_or(keepalive_interval)
@@ -718,6 +770,15 @@ async fn forward_native_session(
                     count,
                     session.quic.local_addr,
                     session.quic.endpoint,
+                    &mut |dgram| {
+                        try_stage_inbound_datagram(
+                            dgram,
+                            session.flow_id,
+                            &mut buffers.inbound_packets,
+                            &mut inbound_count,
+                            &mut stats,
+                        )
+                    },
                 );
             }
             result = tun_dev.recv_multiple(
@@ -757,6 +818,7 @@ async fn forward_native_session(
             session.flow_id,
             &mut buffers,
             &mut stats,
+            &mut inbound_count,
         )
         .await?;
         flush_quic_packets(
@@ -883,6 +945,89 @@ mod tests {
         // Just a single byte - can't even decode flow_id
         let dgram = vec![0xFF];
         assert_eq!(parse_datagram(&dgram, 0), None);
+    }
+
+    fn minimal_ipv4_packet() -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet
+    }
+
+    #[test]
+    fn direct_datagram_stages_valid_payload_and_updates_stats_once() {
+        let packet = minimal_ipv4_packet();
+        let dgram = make_datagram(7, 0, &packet);
+        let mut inbound_packets = (0..2)
+            .map(|_| Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet.len()))
+            .collect::<Vec<_>>();
+        let mut inbound_count = 0;
+        let mut stats = TunnelStats::new();
+
+        assert!(try_stage_inbound_datagram(
+            &dgram,
+            7,
+            &mut inbound_packets,
+            &mut inbound_count,
+            &mut stats,
+        ));
+        assert_eq!(inbound_count, 1);
+        assert_eq!(stats.rx_packets, 1);
+        assert_eq!(stats.rx_bytes, 20);
+        assert_eq!(&inbound_packets[0][VIRTIO_NET_HDR_LEN..], packet.as_slice());
+        assert!(inbound_packets[0][..VIRTIO_NET_HDR_LEN]
+            .iter()
+            .all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn direct_datagram_full_batch_falls_back_without_mutation() {
+        let packet = minimal_ipv4_packet();
+        let dgram = make_datagram(7, 0, &packet);
+        let mut inbound_packets = vec![vec![0xA5; VIRTIO_NET_HDR_LEN + packet.len()]];
+        let original = inbound_packets.clone();
+        let mut inbound_count = inbound_packets.len();
+        let mut stats = TunnelStats::new();
+
+        assert!(!try_stage_inbound_datagram(
+            &dgram,
+            7,
+            &mut inbound_packets,
+            &mut inbound_count,
+            &mut stats,
+        ));
+        assert_eq!(inbound_packets, original);
+        assert_eq!(inbound_count, 1);
+        assert_eq!(stats.rx_packets, 0);
+        assert_eq!(stats.rx_bytes, 0);
+    }
+
+    #[test]
+    fn direct_datagram_rejected_payload_falls_back_without_mutation() {
+        let invalid_ip = [0x10, 0, 0, 0];
+        let wrong_flow = make_datagram(8, 0, &minimal_ipv4_packet());
+        let invalid_packet = make_datagram(7, 0, &invalid_ip);
+        let mut inbound_packets = vec![Vec::new(); 2];
+        let mut inbound_count = 0;
+        let mut stats = TunnelStats::new();
+
+        assert!(!try_stage_inbound_datagram(
+            &wrong_flow,
+            7,
+            &mut inbound_packets,
+            &mut inbound_count,
+            &mut stats,
+        ));
+        assert!(!try_stage_inbound_datagram(
+            &invalid_packet,
+            7,
+            &mut inbound_packets,
+            &mut inbound_count,
+            &mut stats,
+        ));
+        assert_eq!(inbound_count, 0);
+        assert!(inbound_packets.iter().all(Vec::is_empty));
+        assert_eq!(stats.rx_packets, 0);
+        assert_eq!(stats.rx_bytes, 0);
     }
 
     // ---- format_bytes tests ----
