@@ -329,25 +329,44 @@ async fn supervise(
             last_register = Instant::now();
         }
 
-        if last_heartbeat.elapsed() >= config.heartbeat_interval {
-            let system_sample = cpu.sample();
-            cpu_history.push(system_sample.cpu_pct);
-            if cpu_history.len() > 10 {
-                cpu_history.remove(0);
-            }
-            if let Err(error) =
-                send_heartbeat(config, state, reporter, system_sample, &cpu_history).await
-            {
-                log::warn!("orchestrator heartbeat failed: {error:#}");
-            }
-            last_heartbeat = Instant::now();
-        }
+        maybe_send_heartbeat(
+            config,
+            state,
+            reporter,
+            &mut last_heartbeat,
+            &mut cpu,
+            &mut cpu_history,
+        )
+        .await;
 
         if changed {
             state.save(state_path)?;
         }
     }
     Ok(())
+}
+
+async fn maybe_send_heartbeat(
+    config: &RemoteConfig,
+    state: &PoolState,
+    reporter: &RemoteReporter,
+    last_heartbeat: &mut Instant,
+    cpu: &mut CpuSampler,
+    cpu_history: &mut Vec<f64>,
+) {
+    if last_heartbeat.elapsed() < config.heartbeat_interval {
+        return;
+    }
+
+    let system_sample = cpu.sample();
+    cpu_history.push(system_sample.cpu_pct);
+    if cpu_history.len() > 10 {
+        cpu_history.remove(0);
+    }
+    if let Err(error) = send_heartbeat(config, state, reporter, system_sample, cpu_history).await {
+        log::warn!("orchestrator heartbeat failed: {error:#}");
+    }
+    *last_heartbeat = Instant::now();
 }
 
 fn validate_config(config: &RemoteConfig) -> Result<()> {
