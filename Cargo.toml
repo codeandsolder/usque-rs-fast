@@ -40,7 +40,7 @@ socket2 = "0.6"
 nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
 datagram-socket = "0.8.0"
 fast-socks5 = "1"
-smoltcp = { version = "0.12", default-features = false, features = ["std", "async", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "socket-tcp", "socket-tcp-reno", "socket-udp", "socket-dns", "dns-max-result-count-8", "dns-max-server-count-4"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "async", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "socket-tcp", "socket-tcp-reno", "socket-udp", "socket-dns", "dns-max-result-count-8", "dns-max-server-count-4"] }
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
