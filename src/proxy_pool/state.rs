@@ -22,7 +22,7 @@ pub struct ProxyRecord {
     pub v4: String,
     #[serde(default)]
     pub pid: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unix_seconds")]
     pub last_keepalive: i64,
 }
 
@@ -40,7 +40,7 @@ pub struct PoolState {
     pub seen_v4: BTreeSet<String>,
     #[serde(default)]
     pub stale_count: usize,
-    #[serde(default, deserialize_with = "deserialize_started_at")]
+    #[serde(default, deserialize_with = "deserialize_unix_seconds")]
     pub started_at: i64,
     #[serde(default)]
     pub proxies: Vec<ProxyRecord>,
@@ -57,7 +57,7 @@ enum StartedAt {
     Float(f64),
 }
 
-fn deserialize_started_at<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+fn deserialize_unix_seconds<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -67,7 +67,7 @@ where
             .map(time::SignedDuration::whole_seconds)
             .ok_or_else(|| {
                 serde::de::Error::custom(
-                    "started_at float must be finite and fit in i64 Unix seconds",
+                    "timestamp float must be finite and fit in i64 Unix seconds",
                 )
             }),
     }
@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_legacy_float_started_at_and_ignores_unknown_fields() -> Result<()> {
+    fn loads_legacy_float_timestamps_and_ignores_unknown_fields() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.json");
         fs::write(
@@ -249,13 +249,14 @@ mod tests {
                     "v6": "2001:db8::1:2",
                     "v4": "104.16.1.2",
                     "pid": 4242,
-                    "last_keepalive": 123
+                    "last_keepalive": 123.875
                 }]
             }"#,
         )?;
 
         let loaded = PoolState::load(&path)?;
         assert_eq!(loaded.started_at, 123);
+        assert_eq!(loaded.proxies[0].last_keepalive, 123);
         assert_eq!(loaded.phase, "locked");
         assert_eq!(loaded.proxies.len(), 1);
         assert!(loaded.proxies[0].locked);
