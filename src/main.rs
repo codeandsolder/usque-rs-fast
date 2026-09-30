@@ -60,6 +60,12 @@ struct ProxyTransportArgs {
     mtu: u32,
     #[arg(long)]
     source_ip: Option<IpAddr>,
+    /// DNS resolver IPs to race inside the WARP userspace stack.
+    ///
+    /// Repeat this option to supply multiple resolvers. When omitted, the
+    /// proxy races a provider-diverse unfiltered default set.
+    #[arg(long = "dns-server", value_name = "IP")]
+    dns_servers: Vec<IpAddr>,
 }
 
 struct AddressSelection {
@@ -358,6 +364,7 @@ async fn create_proxy_net(
             keepalive_period: Duration::from_secs(transport.keepalive_period),
             mtu: transport.mtu,
             source_ip: transport.source_ip,
+            dns_servers: transport.dns_servers.clone(),
         },
     )
     .await

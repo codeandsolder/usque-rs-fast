@@ -44,6 +44,7 @@ smoltcp = { version = "0.14", default-features = false, features = ["std", "asyn
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+quick_cache = "0.7.0"
 
 [lints.rust]
 unsafe_code = "deny"

@@ -18,6 +18,7 @@ pub struct TransportConfig {
     pub keepalive_period: Duration,
     pub mtu: u32,
     pub source_ip: Option<IpAddr>,
+    pub dns_servers: Vec<IpAddr>,
 }
 
 /// Create the userspace WARP network used by the proxy frontends.
@@ -75,7 +76,8 @@ pub async fn connect(config_path: &str, transport: &TransportConfig) -> Result<A
 
     let mtu = usize::try_from(transport.mtu)
         .map_err(|_| anyhow::anyhow!("MTU does not fit usize: {}", transport.mtu))?;
-    VirtualNet::start(packet_stream, local_v4, local_v6, mtu).map_err(Into::into)
+    VirtualNet::start(packet_stream, local_v4, local_v6, mtu, &transport.dns_servers)
+        .map_err(Into::into)
 }
 
 fn validate(transport: &TransportConfig) -> Result<()> {
@@ -127,6 +129,7 @@ mod tests {
             keepalive_period: Duration::from_secs(30),
             mtu: 1280,
             source_ip: None,
+            dns_servers: Vec::new(),
         };
         assert!(validate(&cfg).is_err());
     }

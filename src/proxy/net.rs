@@ -1,6 +1,7 @@
 use crate::MasquePacketStream;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, future::poll_fn, stream::FuturesUnordered};
+use quick_cache::sync::Cache;
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -15,7 +16,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -29,6 +30,10 @@ const UDP_BUFFER_SIZE: usize = 256 * 1024;
 const FIRST_EPHEMERAL_PORT: u16 = 49_152;
 const LAST_EPHEMERAL_PORT: u16 = 65_535;
 const DNS_TIMEOUT: Duration = Duration::from_secs(8);
+const DNS_CACHE_TTL: Duration = Duration::from_secs(30);
+const DNS_CACHE_CAPACITY: usize = 2_048;
+const EGRESS_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+const EGRESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 const REACTOR_IDLE_SLEEP: Duration = Duration::from_secs(60);
@@ -38,6 +43,7 @@ const RETIRED_SOCKET_GRACE: Duration = Duration::from_secs(30);
 pub struct VirtualNet {
     shared: Arc<Shared>,
     reactor: tokio::task::AbortHandle,
+    egress_watcher: tokio::task::AbortHandle,
 }
 
 struct Shared {
@@ -48,6 +54,16 @@ struct Shared {
     next_port: AtomicU16,
     local_v4: Option<Ipv4Addr>,
     local_v6: Option<Ipv6Addr>,
+    dns_servers: Vec<IpAddress>,
+    dns_cache: Cache<String, CachedDns>,
+    egress_generation: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedDns {
+    addresses: Vec<IpAddr>,
+    expires_at: Instant,
+    egress_generation: u64,
 }
 
 struct Stack {
@@ -82,6 +98,54 @@ const fn dns_family_plan(local_v4: Option<Ipv4Addr>, local_v6: Option<Ipv6Addr>)
         (false, true) => DnsFamilyPlan::Ipv6Only,
         (false, false) => DnsFamilyPlan::None,
     }
+}
+
+fn dns_servers_for(
+    local_v4: Option<Ipv4Addr>,
+    local_v6: Option<Ipv6Addr>,
+    configured: &[IpAddr],
+) -> Vec<IpAddress> {
+    if !configured.is_empty() {
+        return configured
+            .iter()
+            .filter_map(|address| match address {
+                IpAddr::V4(address) if local_v4.is_some() => {
+                    Some(IpAddress::Ipv4((*address).into()))
+                }
+                IpAddr::V6(address) if local_v6.is_some() => {
+                    Some(IpAddress::Ipv6((*address).into()))
+                }
+                _ => None,
+            })
+            .collect();
+    }
+
+    // Keep raced defaults semantically equivalent: all are unfiltered
+    // recursive resolvers. Prefer their IPv4 endpoints when the WARP stack
+    // has IPv4 so a dual-stack proxy does not double DNS fanout.
+    let mut servers = Vec::with_capacity(3);
+    if local_v4.is_some() {
+        // Cloudflare 1.1.1.1.
+        servers.push(IpAddress::Ipv4(Ipv4Address::new(1, 1, 1, 1)));
+        // Quad9 no-threat-blocking service.
+        servers.push(IpAddress::Ipv4(Ipv4Address::new(9, 9, 9, 10)));
+        // Control D unfiltered service.
+        servers.push(IpAddress::Ipv4(Ipv4Address::new(76, 76, 2, 0)));
+    } else if local_v6.is_some() {
+        // Cloudflare 1.1.1.1.
+        servers.push(IpAddress::Ipv6(Ipv6Address::new(
+            0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111,
+        )));
+        // Quad9 no-threat-blocking service.
+        servers.push(IpAddress::Ipv6(Ipv6Address::new(
+            0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0010,
+        )));
+        // Control D unfiltered service.
+        servers.push(IpAddress::Ipv6(Ipv6Address::new(
+            0x2606, 0x1a40, 0, 0, 0, 0, 0, 0,
+        )));
+    }
+    servers
 }
 
 fn should_reap_retired(state: tcp::State, age: Duration) -> bool {
@@ -292,6 +356,7 @@ impl Drop for VirtualNet {
     fn drop(&mut self) {
         self.shared.shutdown();
         self.reactor.abort();
+        self.egress_watcher.abort();
     }
 }
 
@@ -306,11 +371,20 @@ impl VirtualNet {
         local_v4: Option<Ipv4Addr>,
         local_v6: Option<Ipv6Addr>,
         mtu: usize,
+        configured_dns_servers: &[IpAddr],
     ) -> io::Result<Arc<Self>> {
         if local_v4.is_none() && local_v6.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "proxy stack requires at least one local WARP address",
+            ));
+        }
+
+        let dns_servers = dns_servers_for(local_v4, local_v6, configured_dns_servers);
+        if dns_servers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "configured DNS servers do not match any enabled WARP address family",
             ));
         }
 
@@ -369,6 +443,9 @@ impl VirtualNet {
             next_port: AtomicU16::new(FIRST_EPHEMERAL_PORT),
             local_v4,
             local_v6,
+            dns_servers,
+            dns_cache: Cache::new(DNS_CACHE_CAPACITY),
+            egress_generation: AtomicU64::new(0),
         });
         let reactor_shared = shared.clone();
         let reactor = tokio::spawn(async move {
@@ -378,9 +455,14 @@ impl VirtualNet {
                 log::error!("userspace proxy stack stopped: {error}");
             }
         });
+        let watcher_shared = shared.clone();
+        let egress_watcher = tokio::spawn(async move {
+            run_egress_watcher(watcher_shared).await;
+        });
         let net = Arc::new(Self {
             shared,
             reactor: reactor.abort_handle(),
+            egress_watcher: egress_watcher.abort_handle(),
         });
 
         Ok(net)
@@ -553,6 +635,39 @@ impl VirtualNet {
     /// Returns an error when no WARP address family is enabled or all DNS
     /// queries fail or return no usable addresses.
     pub async fn resolve_all(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        let cache_key = dns_cache_key(host);
+
+        loop {
+            let generation = self.shared.egress_generation.load(Ordering::Acquire);
+            if let Some(cached) = self.shared.dns_cache.get(&cache_key) {
+                if cached.expires_at > Instant::now() && cached.egress_generation == generation {
+                    return Ok(cached.addresses);
+                }
+                self.shared.dns_cache.remove(&cache_key);
+            }
+
+            let cached = self
+                .shared
+                .dns_cache
+                .get_or_insert_async(&cache_key, async {
+                    let (addresses, cacheable) = self.resolve_all_uncached(host).await?;
+                    let now = Instant::now();
+                    Ok::<_, io::Error>(CachedDns {
+                        addresses,
+                        expires_at: if cacheable { now + DNS_CACHE_TTL } else { now },
+                        egress_generation: generation,
+                    })
+                })
+                .await?;
+
+            if cached.egress_generation == self.shared.egress_generation.load(Ordering::Acquire) {
+                return Ok(cached.addresses);
+            }
+            self.shared.dns_cache.remove(&cache_key);
+        }
+    }
+
+    async fn resolve_all_uncached(&self, host: &str) -> io::Result<(Vec<IpAddr>, bool)> {
         let (v6, v4) = match dns_family_plan(self.shared.local_v4, self.shared.local_v6) {
             DnsFamilyPlan::DualStack => tokio::join!(
                 self.resolve_type(host, DnsQueryType::Aaaa),
@@ -574,6 +689,12 @@ impl VirtualNet {
             }
         };
 
+        let cacheable = match dns_family_plan(self.shared.local_v4, self.shared.local_v6) {
+            DnsFamilyPlan::DualStack => v6.is_ok() && v4.is_ok(),
+            DnsFamilyPlan::Ipv6Only => v6.is_ok(),
+            DnsFamilyPlan::Ipv4Only => v4.is_ok(),
+            DnsFamilyPlan::None => false,
+        };
         let v6_error = v6.as_ref().err().map(ToString::to_string);
         let v4_error = v4.as_ref().err().map(ToString::to_string);
         let addresses = interleave_address_families(v6.unwrap_or_default(), v4.unwrap_or_default());
@@ -588,7 +709,16 @@ impl VirtualNet {
                 ),
             ));
         }
-        Ok(addresses)
+        Ok((addresses, cacheable))
+    }
+
+    /// Drop all cached DNS answers.
+    ///
+    /// Replacing a WARP session naturally drops its cache with the
+    /// VirtualNet. Higher-level supervisors should call this when they
+    /// observe an egress change without replacing the session.
+    pub fn clear_dns_cache(&self) {
+        invalidate_dns_cache(&self.shared);
     }
 
     async fn resolve_type(&self, host: &str, query_type: DnsQueryType) -> io::Result<Vec<IpAddr>> {
@@ -688,16 +818,7 @@ impl VirtualNet {
     }
 
     fn dns_servers(&self) -> Vec<IpAddress> {
-        let mut servers = Vec::with_capacity(2);
-        if self.shared.local_v6.is_some() {
-            servers.push(IpAddress::Ipv6(Ipv6Address::new(
-                0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111,
-            )));
-        }
-        if self.shared.local_v4.is_some() {
-            servers.push(IpAddress::Ipv4(Ipv4Address::new(1, 1, 1, 1)));
-        }
-        servers
+        self.shared.dns_servers.clone()
     }
 
     fn next_port(&self) -> u16 {
@@ -740,6 +861,259 @@ impl VirtualNet {
             "userspace ephemeral port range exhausted",
         ))
     }
+}
+
+fn invalidate_dns_cache(shared: &Shared) {
+    shared.egress_generation.fetch_add(1, Ordering::AcqRel);
+    shared.dns_cache.clear();
+}
+
+async fn run_egress_watcher(shared: Arc<Shared>) {
+    let mut previous = None;
+
+    loop {
+        if shared.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        match tokio::time::timeout(EGRESS_PROBE_TIMEOUT, probe_warp_egress(shared.clone())).await {
+            Ok(Ok(current)) => {
+                if let Some(old) = previous.replace(current) {
+                    if old != current {
+                        invalidate_dns_cache(&shared);
+                        log::info!("WARP egress changed {old} -> {current}; DNS cache cleared");
+                    }
+                }
+            }
+            Ok(Err(error)) => log::debug!("WARP egress probe failed: {error}"),
+            Err(_) => log::debug!("WARP egress probe timed out"),
+        }
+
+        tokio::time::sleep(EGRESS_PROBE_INTERVAL).await;
+    }
+}
+
+async fn probe_warp_egress(shared: Arc<Shared>) -> io::Result<IpAddr> {
+    let server = if shared.local_v4.is_some() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)
+    } else if shared.local_v6.is_some() {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+            53,
+        )
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no WARP address family available for egress probe",
+        ));
+    };
+
+    let socket = bind_udp_shared(shared)?;
+    let seed_bytes = seed().to_le_bytes();
+    let transaction_id = u16::from_le_bytes([seed_bytes[0], seed_bytes[1]]);
+    let query = build_whoami_query(transaction_id);
+    socket.send_to(&query, server).await?;
+
+    let mut response = [0_u8; 512];
+    loop {
+        let (size, source) = socket.recv_from(&mut response).await?;
+        if source != server {
+            continue;
+        }
+        match parse_whoami_response(&response[..size], transaction_id) {
+            Ok(address) => return Ok(address),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn build_whoami_query(transaction_id: u16) -> Vec<u8> {
+    let mut query = Vec::with_capacity(40);
+    query.extend_from_slice(&transaction_id.to_be_bytes());
+    query.extend_from_slice(&0x0100_u16.to_be_bytes());
+    query.extend_from_slice(&1_u16.to_be_bytes());
+    query.extend_from_slice(&[0_u8; 6]);
+    query.extend_from_slice(b"\x06whoami\x0acloudflare\x00");
+    query.extend_from_slice(&16_u16.to_be_bytes());
+    query.extend_from_slice(&3_u16.to_be_bytes());
+    query
+}
+
+fn parse_whoami_response(packet: &[u8], transaction_id: u16) -> io::Result<IpAddr> {
+    if packet.len() < 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short whoami DNS response",
+        ));
+    }
+    if u16::from_be_bytes([packet[0], packet[1]]) != transaction_id {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "unrelated DNS response",
+        ));
+    }
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    if flags & 0x8000 == 0 || flags & 0x000f != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid whoami DNS response flags",
+        ));
+    }
+    let question_count = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+    let answer_count = usize::from(u16::from_be_bytes([packet[6], packet[7]]));
+    let mut offset = 12;
+
+    for _ in 0..question_count {
+        offset = skip_dns_name(packet, offset)?;
+        offset = offset
+            .checked_add(4)
+            .filter(|next| *next <= packet.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated DNS question"))?;
+    }
+
+    for _ in 0..answer_count {
+        offset = skip_dns_name(packet, offset)?;
+        let header_end = offset
+            .checked_add(10)
+            .filter(|next| *next <= packet.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated DNS answer"))?;
+        let record_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let class = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+        let rdlength = usize::from(u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]));
+        offset = header_end;
+        let rdata_end = offset
+            .checked_add(rdlength)
+            .filter(|next| *next <= packet.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated DNS RDATA"))?;
+
+        if record_type == 16 && class == 3 && rdlength > 1 {
+            let text_len = usize::from(packet[offset]);
+            let text_start = offset + 1;
+            let text_end = text_start
+                .checked_add(text_len)
+                .filter(|next| *next <= rdata_end)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "truncated DNS TXT record")
+                })?;
+            let text = std::str::from_utf8(&packet[text_start..text_end]).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid DNS TXT UTF-8: {error}"),
+                )
+            })?;
+            return text.parse().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid whoami IP {text:?}: {error}"),
+                )
+            });
+        }
+        offset = rdata_end;
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "whoami DNS response had no IP TXT answer",
+    ))
+}
+
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> io::Result<usize> {
+    loop {
+        let Some(&length) = packet.get(offset) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated DNS name",
+            ));
+        };
+        if length & 0xc0 == 0xc0 {
+            return offset
+                .checked_add(2)
+                .filter(|next| *next <= packet.len())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "truncated DNS name pointer")
+                });
+        }
+        offset += 1;
+        if length == 0 {
+            return Ok(offset);
+        }
+        if length & 0xc0 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid DNS label length",
+            ));
+        }
+        offset = offset
+            .checked_add(usize::from(length))
+            .filter(|next| *next <= packet.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated DNS label"))?;
+    }
+}
+
+fn bind_udp_shared(shared: Arc<Shared>) -> io::Result<VirtualUdpSocket> {
+    let (handle, local_port) = {
+        let mut inner = lock_stack(&shared);
+        if shared.closed.load(Ordering::Acquire) {
+            return Err(Shared::closed_error());
+        }
+        let local_port = allocate_port_shared(&shared, &inner)?;
+        let mut socket = new_udp_socket();
+        socket
+            .bind(local_port)
+            .map_err(|error| io::Error::other(format!("UDP bind failed: {error}")))?;
+        let handle = inner.sockets.add(socket);
+        drop(inner);
+        (handle, local_port)
+    };
+
+    shared.activity.notify_one();
+    Ok(VirtualUdpSocket {
+        shared,
+        handle: Some(handle),
+        local_port,
+    })
+}
+
+fn next_port_shared(shared: &Shared) -> u16 {
+    let mut port = shared.next_port.load(Ordering::Relaxed);
+    loop {
+        let next = if port == LAST_EPHEMERAL_PORT {
+            FIRST_EPHEMERAL_PORT
+        } else {
+            port + 1
+        };
+        match shared.next_port.compare_exchange_weak(
+            port,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return port,
+            Err(observed) => port = observed,
+        }
+    }
+}
+
+fn allocate_port_shared(shared: &Shared, stack: &Stack) -> io::Result<u16> {
+    for _ in FIRST_EPHEMERAL_PORT..=LAST_EPHEMERAL_PORT {
+        let candidate = next_port_shared(shared);
+        let in_use = stack.sockets.iter().any(|(_, socket)| match socket {
+            smoltcp::socket::Socket::Tcp(socket) => socket
+                .local_endpoint()
+                .is_some_and(|endpoint| endpoint.port == candidate),
+            smoltcp::socket::Socket::Udp(socket) => socket.endpoint().port == candidate,
+            smoltcp::socket::Socket::Dns(_) => false,
+        });
+        if !in_use {
+            return Ok(candidate);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "userspace ephemeral port range exhausted",
+    ))
 }
 
 async fn run_reactor(mut packet_stream: MasquePacketStream, shared: Arc<Shared>) -> io::Result<()> {
@@ -1040,6 +1414,10 @@ const fn smoltcp_to_std_ip(address: IpAddress) -> IpAddr {
     }
 }
 
+fn dns_cache_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
 fn seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -1061,6 +1439,54 @@ mod tests {
         assert_eq!(dns_family_plan(v4, None), DnsFamilyPlan::Ipv4Only);
         assert_eq!(dns_family_plan(None, v6), DnsFamilyPlan::Ipv6Only);
         assert_eq!(dns_family_plan(None, None), DnsFamilyPlan::None);
+    }
+
+    #[test]
+    fn dns_cache_key_normalizes_case_and_root_dot() {
+        assert_eq!(dns_cache_key("Example.COM."), "example.com");
+    }
+
+    #[test]
+    fn parses_cloudflare_whoami_response() -> io::Result<()> {
+        let packet = [
+            0xa0, 0x1b, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x06, b'w',
+            b'h', b'o', b'a', b'm', b'i', 0x0a, b'c', b'l', b'o', b'u', b'd', b'f', b'l', b'a',
+            b'r', b'e', 0x00, 0x00, 0x10, 0x00, 0x03, 0xc0, 0x0c, 0x00, 0x10, 0x00, 0x03, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x0f, 0x0e, b'1', b'0', b'4', b'.', b'2', b'8', b'.', b'1',
+            b'9', b'3', b'.', b'1', b'8', b'3',
+        ];
+        assert_eq!(
+            parse_whoami_response(&packet, 0xa01b)?,
+            IpAddr::V4(Ipv4Addr::new(104, 28, 193, 183))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raced_dns_servers_follow_available_address_families() {
+        let v4 = Some(Ipv4Addr::new(172, 16, 0, 2));
+        let v6 = Some(Ipv6Addr::LOCALHOST);
+
+        assert_eq!(dns_servers_for(v4, None, &[]).len(), 3);
+        assert!(dns_servers_for(v4, None, &[])
+            .iter()
+            .all(|server| matches!(server, IpAddress::Ipv4(_))));
+        assert_eq!(dns_servers_for(None, v6, &[]).len(), 3);
+        assert!(dns_servers_for(None, v6, &[])
+            .iter()
+            .all(|server| matches!(server, IpAddress::Ipv6(_))));
+        assert_eq!(dns_servers_for(v4, v6, &[]).len(), 3);
+        assert!(dns_servers_for(v4, v6, &[])
+            .iter()
+            .all(|server| matches!(server, IpAddress::Ipv4(_))));
+
+        let configured = [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        assert_eq!(dns_servers_for(v4, None, &configured).len(), 1);
+        assert_eq!(dns_servers_for(None, v6, &configured).len(), 1);
+        assert_eq!(dns_servers_for(v4, v6, &configured).len(), 2);
     }
 
     #[test]
