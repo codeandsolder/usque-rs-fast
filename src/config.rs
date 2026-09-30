@@ -28,8 +28,8 @@ impl Config {
     ///
     /// Returns an error if the file cannot be inspected/read, its permissions
     /// cannot be tightened on Unix, or the JSON is invalid.
-    pub fn load(path: &str) -> Result<Self> {
-        let path = Path::new(path);
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
 
         #[cfg(unix)]
         {
@@ -49,18 +49,30 @@ impl Config {
         serde_json::from_str(&data).with_context(|| "failed to parse config JSON")
     }
 
+    /// Load a saved WARP configuration without blocking an async runtime worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task cannot be joined or configuration loading fails.
+    pub async fn load_async(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || Self::load(path))
+            .await
+            .context("config load task failed")?
+    }
+
     /// Persist the configuration, creating parent directories as needed.
     ///
     /// # Errors
     ///
     /// Returns an error if serialization or any filesystem operation fails.
-    pub fn save(&self, path: &str) -> Result<()> {
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        let path = Path::new(path);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
 
         let mut options = OpenOptions::new();
@@ -89,6 +101,19 @@ impl Config {
             .with_context(|| format!("failed to truncate config {}", path.display()))?;
         file.write_all(json.as_bytes())
             .with_context(|| format!("failed to write config to {}", path.display()))
+    }
+
+    /// Persist the configuration without blocking an async runtime worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task cannot be joined or persistence fails.
+    pub async fn save_async(&self, path: impl AsRef<Path>) -> Result<()> {
+        let config = self.clone();
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || config.save(path))
+            .await
+            .context("config save task failed")?
     }
 
     /// Build a local configuration from a successful registration response.

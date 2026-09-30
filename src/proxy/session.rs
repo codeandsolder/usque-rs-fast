@@ -32,7 +32,7 @@ pub struct TransportConfig {
 pub async fn connect(config_path: &str, transport: &TransportConfig) -> Result<Arc<VirtualNet>> {
     validate(transport)?;
 
-    let config = config::Config::load(config_path)?;
+    let config = config::Config::load_async(config_path).await?;
     let endpoint_ip: IpAddr = if transport.use_ipv6_endpoint {
         config.endpoint_v6.parse()?
     } else {

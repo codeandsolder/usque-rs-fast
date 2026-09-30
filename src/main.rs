@@ -11,7 +11,7 @@
 
 //! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -285,11 +285,15 @@ async fn cmd_register(
     device_name: Option<String>,
     jwt: Option<String>,
 ) -> Result<()> {
-    if let Ok(existing) = config::Config::load(config_path) {
-        let _ = existing;
-        eprint!("Config already exists. Overwrite? (y/n): ");
-        let mut response = String::new();
-        std::io::stdin().read_line(&mut response)?;
+    if config::Config::load_async(config_path).await.is_ok() {
+        let response = tokio::task::spawn_blocking(|| {
+            eprint!("Config already exists. Overwrite? (y/n): ");
+            let mut response = String::new();
+            std::io::stdin().read_line(&mut response)?;
+            Ok::<_, std::io::Error>(response)
+        })
+        .await
+        .context("overwrite prompt task failed")??;
         if response.trim() != "y" {
             log::info!("Aborted.");
             return Ok(());
@@ -304,7 +308,7 @@ async fn cmd_register(
     let updated = register::enroll_key(&account_data, &pub_key_der, device_name.as_deref()).await?;
 
     let cfg = config::Config::from_account_data(&updated, &account_data.token, &priv_key_der)?;
-    cfg.save(config_path)?;
+    cfg.save_async(config_path).await?;
     log::info!("Config saved to {config_path}");
     Ok(())
 }
@@ -333,7 +337,7 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
         );
     }
 
-    let cfg = config::Config::load(config_path)?;
+    let cfg = config::Config::load_async(config_path).await?;
     eprintln!("Config loaded from {config_path}");
 
     let endpoint_ip: std::net::IpAddr = if use_ipv6_endpoint {
@@ -468,11 +472,14 @@ async fn cmd_pool_remote(options: RemoteCommandOptions) -> Result<()> {
         transport,
     } = options;
 
-    let psk = std::fs::read_to_string(&psk_file)?.trim().to_string();
+    let psk = tokio::fs::read_to_string(&psk_file)
+        .await?
+        .trim()
+        .to_string();
     if psk.is_empty() {
         anyhow::bail!("orchestrator PSK file is empty: {}", psk_file.display());
     }
-    let auth = read_proxy_auth(&auth_file)?;
+    let auth = read_proxy_auth(&auth_file).await?;
     let hostname = hostname
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "unknown".to_string());
@@ -532,8 +539,8 @@ fn child_transport(transport: &ProxyTransportArgs) -> ChildTransport {
     }
 }
 
-fn read_proxy_auth(path: &Path) -> Result<ProxyAuth> {
-    let value = std::fs::read_to_string(path)?;
+async fn read_proxy_auth(path: &Path) -> Result<ProxyAuth> {
+    let value = tokio::fs::read_to_string(path).await?;
     let (username, password) = value
         .trim()
         .split_once(':')

@@ -7,7 +7,6 @@ use super::{
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{
-    fs,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     time::Duration,
@@ -40,7 +39,7 @@ pub async fn run(config: OfflineConfig) -> Result<()> {
     if config.count == 0 {
         anyhow::bail!("offline pool count must be greater than zero");
     }
-    fs::create_dir_all(&config.root)?;
+    tokio::fs::create_dir_all(&config.root).await?;
 
     let mut supervisor = Supervisor::new(config.root.clone())?;
     let mut specs = Vec::with_capacity(config.count);
@@ -73,7 +72,7 @@ pub async fn run(config: OfflineConfig) -> Result<()> {
         specs.push(spec);
     }
 
-    write_inventory(&config.root, &inventory)?;
+    write_inventory(&config.root, &inventory).await?;
     log::info!(
         "offline proxy pool ready: {} listener(s), inventory={}",
         specs.len(),
@@ -113,10 +112,11 @@ pub async fn run(config: OfflineConfig) -> Result<()> {
     Ok(())
 }
 
-fn write_inventory(root: &std::path::Path, inventory: &[InventoryEntry]) -> Result<()> {
+async fn write_inventory(root: &std::path::Path, inventory: &[InventoryEntry]) -> Result<()> {
     let path = root.join("inventory.json");
     let tmp = root.join("inventory.json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(inventory)?)?;
-    fs::rename(&tmp, &path)
+    tokio::fs::write(&tmp, serde_json::to_vec_pretty(inventory)?).await?;
+    tokio::fs::rename(&tmp, &path)
+        .await
         .with_context(|| format!("failed to replace offline inventory {}", path.display()))
 }

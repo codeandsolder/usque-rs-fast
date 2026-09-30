@@ -98,17 +98,21 @@ impl Supervisor {
     /// Returns an error if registration, key enrollment, or config persistence fails.
     pub async fn ensure_identity(&self, group: usize, slot: usize) -> Result<bool> {
         let path = self.config_path(group, slot);
-        if path.exists() {
-            Config::load(path_to_str(&path)?)?;
+        if tokio::fs::try_exists(&path).await? {
+            let _ = Config::load_async(&path).await?;
             return Ok(false);
         }
 
         let identities_dir = self.root.join("identities");
         let group_dir = identities_dir.join(format!("group-{group}"));
         let slot_dir = group_dir.join(format!("slot-{slot}"));
-        create_identity_dir(&identities_dir)?;
-        create_identity_dir(&group_dir)?;
-        create_identity_dir(&slot_dir)?;
+        tokio::task::spawn_blocking(move || {
+            create_identity_dir(&identities_dir)?;
+            create_identity_dir(&group_dir)?;
+            create_identity_dir(&slot_dir)
+        })
+        .await
+        .context("identity directory creation task failed")??;
 
         let name = format!("g{group}-s{slot}");
         log::info!("registering WARP identity {name}");
@@ -116,7 +120,7 @@ impl Supervisor {
         let (private_key, public_key) = register::generate_ec_keypair()?;
         let enrolled = register::enroll_key(&account, &public_key, Some(&name)).await?;
         let config = Config::from_account_data(&enrolled, &account.token, &private_key)?;
-        config.save(path_to_str(&path)?)?;
+        config.save_async(&path).await?;
         Ok(true)
     }
 
@@ -299,11 +303,6 @@ fn create_identity_dir(path: &Path) -> Result<()> {
         )?;
     }
     Ok(())
-}
-
-fn path_to_str(path: &Path) -> Result<&str> {
-    path.to_str()
-        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {}", path.display()))
 }
 
 #[cfg(test)]

@@ -89,6 +89,29 @@ impl Default for PoolState {
 }
 
 impl PoolState {
+    /// Load persisted proxy-pool state without blocking an async runtime worker.
+    ///
+    /// # Errors
+    /// Returns an error when the blocking task cannot be joined or state loading fails.
+    pub async fn load_async(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::load(&path))
+            .await
+            .context("pool-state load task failed")?
+    }
+
+    /// Persist proxy-pool state without blocking an async runtime worker.
+    ///
+    /// # Errors
+    /// Returns an error when the blocking task cannot be joined or state persistence fails.
+    pub async fn save_async(&self, path: &Path) -> Result<()> {
+        let state = self.clone();
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || state.save(&path))
+            .await
+            .context("pool-state save task failed")?
+    }
+
     /// Load persisted proxy-pool state.
     ///
     /// # Errors
@@ -184,6 +207,29 @@ pub fn save_suffixes(root: &Path, group: usize, suffixes: &[String]) -> Result<(
     }
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+/// Load suffix state without blocking an async runtime worker.
+///
+/// # Errors
+/// Returns an error when the blocking task cannot be joined or suffix loading fails.
+pub async fn load_suffixes_async(root: &Path, group: usize) -> Result<Vec<String>> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || load_suffixes(&root, group))
+        .await
+        .context("suffix load task failed")?
+}
+
+/// Persist suffix state without blocking an async runtime worker.
+///
+/// # Errors
+/// Returns an error when the blocking task cannot be joined or suffix persistence fails.
+pub async fn save_suffixes_async(root: &Path, group: usize, suffixes: &[String]) -> Result<()> {
+    let root = root.to_path_buf();
+    let suffixes = suffixes.to_vec();
+    tokio::task::spawn_blocking(move || save_suffixes(&root, group, &suffixes))
+        .await
+        .context("suffix save task failed")?
 }
 
 fn temporary_sibling(path: &Path) -> PathBuf {

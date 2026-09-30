@@ -3,14 +3,13 @@ use super::{
         ChildSpec, ChildTransport, ProxyAuth, SlotKey, Supervisor, port_for, wait_for_shutdown,
     },
     reporter::{Heartbeat, ProxyReport, RemoteReporter, client_tls_config},
-    state::{PoolState, ProxyRecord, load_suffixes, save_suffixes},
+    state::{PoolState, ProxyRecord, load_suffixes_async, save_suffixes_async},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use ring::rand::SecureRandom;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
@@ -51,7 +50,7 @@ pub struct RemoteConfig {
 /// WARP identity/session failures, child-process failures, or shutdown-signal errors.
 pub async fn run(config: RemoteConfig) -> Result<()> {
     validate_config(&config)?;
-    fs::create_dir_all(&config.root)?;
+    tokio::fs::create_dir_all(&config.root).await?;
 
     let reporter = RemoteReporter::new(&config.orchestrator_url, config.psk.clone())?;
     let state_path = config.root.join("state.json");
@@ -60,7 +59,7 @@ pub async fn run(config: RemoteConfig) -> Result<()> {
 
     supervise(&config, &state_path, &reporter, &mut state, &mut supervisor).await?;
 
-    state.save(&state_path)?;
+    state.save_async(&state_path).await?;
     supervisor.stop_all().await;
     Ok(())
 }
@@ -69,7 +68,7 @@ async fn initialize_state(
     config: &RemoteConfig,
     state_path: &std::path::Path,
 ) -> Result<PoolState> {
-    let mut state = PoolState::load(state_path)?;
+    let mut state = PoolState::load_async(state_path).await?;
     let (box_v6, box_v4) = discover_box_addresses(&config.prefixes).await;
     state.box_v6 = box_v6;
     state.box_v4 = box_v4;
@@ -83,7 +82,7 @@ async fn initialize_state(
     } else if !state.proxies.iter().any(|proxy| proxy.locked) {
         state.phase = "init".to_string();
     }
-    state.save(state_path)?;
+    state.save_async(state_path).await?;
     Ok(state)
 }
 
@@ -93,8 +92,8 @@ async fn initialize_supervisor(
     state_path: &std::path::Path,
 ) -> Result<Supervisor> {
     let mut supervisor = Supervisor::new(config.root.clone())?;
-    if reconcile_identity_presence(state, &supervisor) {
-        state.save(state_path)?;
+    if reconcile_identity_presence(state, &supervisor).await? {
+        state.save_async(state_path).await?;
     }
 
     for index in 0..state.proxies.len() {
@@ -192,11 +191,15 @@ const fn apply_cycle_pass(state: &mut PoolState, summary: CyclePassSummary) -> b
     true
 }
 
-fn reconcile_identity_presence(state: &mut PoolState, supervisor: &Supervisor) -> bool {
+async fn reconcile_identity_presence(
+    state: &mut PoolState,
+    supervisor: &Supervisor,
+) -> Result<bool> {
     let mut changed = false;
     let mut demoted = false;
     for proxy in &mut state.proxies {
-        let present = supervisor.config_path(proxy.group, proxy.slot).is_file();
+        let present =
+            tokio::fs::try_exists(supervisor.config_path(proxy.group, proxy.slot)).await?;
         if proxy.registered != present {
             proxy.registered = present;
             changed = true;
@@ -220,7 +223,7 @@ fn reconcile_identity_presence(state: &mut PoolState, supervisor: &Supervisor) -
         state.phase = "init".to_string();
         changed = true;
     }
-    changed
+    Ok(changed)
 }
 
 async fn supervise(
@@ -290,7 +293,7 @@ async fn supervise(
         .await;
 
         if changed {
-            state.save(state_path)?;
+            state.save_async(state_path).await?;
         }
     }
     Ok(())
@@ -414,7 +417,7 @@ async fn maybe_send_heartbeat(
         return;
     }
 
-    let system_sample = cpu.sample();
+    let system_sample = cpu.sample().await;
     cpu_history.push(system_sample.cpu_pct);
     if cpu_history.len() > 10 {
         cpu_history.remove(0);
@@ -473,7 +476,7 @@ async fn prepare_proxy_records(config: &RemoteConfig, state: &mut PoolState) -> 
             Some(interface) => interface.clone(),
             None => discover_interface(prefix_text).await?,
         };
-        let mut suffixes = load_suffixes(&config.root, group)?;
+        let mut suffixes = load_suffixes_async(&config.root, group).await?;
         let mut known: HashSet<_> = suffixes.iter().cloned().collect();
         while suffixes.len() < config.slots_per_prefix {
             let suffix = random_suffix()?;
@@ -481,7 +484,7 @@ async fn prepare_proxy_records(config: &RemoteConfig, state: &mut PoolState) -> 
                 suffixes.push(suffix);
             }
         }
-        save_suffixes(&config.root, group, &suffixes)?;
+        save_suffixes_async(&config.root, group, &suffixes).await?;
 
         for (slot, suffix) in suffixes.iter().enumerate() {
             let address = compose_address(prefix, suffix)?;
@@ -514,7 +517,7 @@ async fn top_up_candidates(config: &RemoteConfig, state: &mut PoolState) -> Resu
             Some(interface) => interface.clone(),
             None => discover_interface(prefix_text).await?,
         };
-        let mut suffixes = load_suffixes(&config.root, group)?;
+        let mut suffixes = load_suffixes_async(&config.root, group).await?;
         let start = suffixes.len();
         let target = start
             .checked_add(config.topup_count)
@@ -526,7 +529,7 @@ async fn top_up_candidates(config: &RemoteConfig, state: &mut PoolState) -> Resu
                 suffixes.push(suffix);
             }
         }
-        save_suffixes(&config.root, group, &suffixes)?;
+        save_suffixes_async(&config.root, group, &suffixes).await?;
         for (slot, suffix) in suffixes.iter().enumerate().skip(start) {
             let address = compose_address(prefix, suffix)?;
             ensure_host_address(&interface, address).await?;
@@ -1269,8 +1272,8 @@ struct CpuSampler {
 }
 
 impl CpuSampler {
-    fn sample(&mut self) -> SystemStats {
-        let current = read_cpu_ticks();
+    async fn sample(&mut self) -> SystemStats {
+        let current = read_cpu_ticks().await;
         let cpu_pct = match (self.previous, current) {
             (Some((old_busy, old_total)), Some((busy, total))) if total > old_total => {
                 let busy_delta = busy.saturating_sub(old_busy);
@@ -1287,7 +1290,7 @@ impl CpuSampler {
         if current.is_some() {
             self.previous = current;
         }
-        let (used_kb, total_kb) = read_memory_kb().unwrap_or_default();
+        let (used_kb, total_kb) = read_memory_kb().await.unwrap_or_default();
         SystemStats {
             cpu_pct,
             mem_used_mb: used_kb / 1024,
@@ -1296,8 +1299,8 @@ impl CpuSampler {
     }
 }
 
-fn read_cpu_ticks() -> Option<(u64, u64)> {
-    let data = fs::read_to_string("/proc/stat").ok()?;
+async fn read_cpu_ticks() -> Option<(u64, u64)> {
+    let data = tokio::fs::read_to_string("/proc/stat").await.ok()?;
     let line = data.lines().next()?;
     let values: Vec<u64> = line
         .split_whitespace()
@@ -1314,8 +1317,8 @@ fn read_cpu_ticks() -> Option<(u64, u64)> {
     Some((total.saturating_sub(idle), total))
 }
 
-fn read_memory_kb() -> Option<(u64, u64)> {
-    let data = fs::read_to_string("/proc/meminfo").ok()?;
+async fn read_memory_kb() -> Option<(u64, u64)> {
+    let data = tokio::fs::read_to_string("/proc/meminfo").await.ok()?;
     let mut total: Option<u64> = None;
     let mut available: Option<u64> = None;
     for line in data.lines() {
@@ -1334,8 +1337,9 @@ fn read_memory_kb() -> Option<(u64, u64)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn startup_keeps_unlocked_identities_lazy_and_demotes_missing_locked_configs() -> Result<()> {
+    #[tokio::test]
+    async fn startup_keeps_unlocked_identities_lazy_and_demotes_missing_locked_configs()
+    -> Result<()> {
         let dir = tempfile::tempdir()?;
         let supervisor = Supervisor::new(dir.path().to_path_buf())?;
 
@@ -1379,7 +1383,7 @@ mod tests {
             ..PoolState::default()
         };
 
-        assert!(reconcile_identity_presence(&mut state, &supervisor));
+        assert!(reconcile_identity_presence(&mut state, &supervisor).await?);
         assert_eq!(state.phase, "init");
 
         let missing_locked = &state.proxies[0];
