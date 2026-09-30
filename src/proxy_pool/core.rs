@@ -289,7 +289,7 @@ fn create_identity_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).with_context(
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(
             || {
                 format!(
                     "failed to restore traversable permissions on {}",
