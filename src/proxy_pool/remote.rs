@@ -1095,8 +1095,8 @@ mod tests {
         assert!(!missing_locked.registered);
         assert!(!missing_locked.locked);
         assert_eq!(missing_locked.pid, 0);
-        assert!(missing_locked.v4.is_empty());
-        assert!(missing_locked.v6.is_empty());
+        assert_eq!(missing_locked.v4, "");
+        assert_eq!(missing_locked.v6, "");
         assert_eq!(missing_locked.last_keepalive, 0);
         assert!(!supervisor.config_path(0, 0).exists());
 
