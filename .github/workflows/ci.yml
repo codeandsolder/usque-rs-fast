@@ -62,6 +62,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
+    if: github.event_name == 'pull_request'
     name: Test
     runs-on: ubuntu-24.04
     env:
@@ -86,6 +87,22 @@ jobs:
 
       - name: Run tests
         run: cargo test --all
+
+
+  test-shared-cache:
+    name: Test (shared sccache)
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@main
+    with:
+      command: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go perl pkg-config clang libclang-dev nasm
+        cargo +1.98.1 test --all
+      rust-toolchain: "1.98.1"
+      rustflags: "-C target-cpu=x86-64-v2"
 
   msrv:
     name: Rust 1.88 MSRV
