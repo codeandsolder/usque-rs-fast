@@ -255,79 +255,29 @@ async fn supervise(
         let mut changed = restart_dead_locked(config, state, supervisor).await?;
 
         if state.phase == "init" {
-            if cycle_pass.remaining.is_empty() {
-                let cycling = state.proxies.iter().filter(|proxy| !proxy.locked).count();
-                if cycling < config.topup_count {
-                    changed |= top_up_candidates(config, state).await?;
-                }
-                cycle_pass.begin(state);
-            }
-
-            let outcome = cycle_one(
+            changed |= run_init_tick(
                 config,
                 state,
                 supervisor,
+                reporter,
+                &mut last_register,
                 &mut cycle_cursor,
-                &cycle_pass.remaining,
+                &mut cycle_pass,
             )
             .await?;
-            changed |= outcome.changed;
-            cycle_pass.record(outcome);
-            if outcome.locked {
-                if let Err(error) = send_register(config, state, reporter).await {
-                    log::warn!("orchestrator register after new lock failed: {error:#}");
-                }
-                last_register = Instant::now();
-            }
-
-            if cycle_pass.remaining.is_empty() {
-                let summary = cycle_pass.finish();
-                changed |= apply_cycle_pass(state, summary);
-                if summary.stale_attempts > 0 && summary.new_locked == 0 {
-                    log::info!(
-                        "remote pool stale {}/{} (+{} failed candidates, no new unique v4)",
-                        state.stale_count,
-                        config.stale_limit,
-                        summary.stale_attempts
-                    );
-                }
-
-                let locked_count = state.proxies.iter().filter(|proxy| proxy.locked).count();
-                let cycling = state.proxies.len().saturating_sub(locked_count);
-                if locked_count > 0 && (cycling == 0 || state.stale_count >= config.stale_limit) {
-                    state.phase = "locked".to_string();
-                    changed = true;
-                    log::info!(
-                        "remote pool entering locked phase: {locked_count} locked, {cycling} spare candidates"
-                    );
-                    if let Err(error) = send_register(config, state, reporter).await {
-                        log::warn!("orchestrator register on lock transition failed: {error:#}");
-                    }
-                    last_register = Instant::now();
-                }
-            }
         }
 
-        if state.phase == "locked" && last_drift.elapsed() >= config.drift_interval {
-            let drifted = check_drift(config, state, supervisor).await?;
-            if drifted {
-                state.phase = "init".to_string();
-                state.stale_count = 0;
-                changed = true;
-                if let Err(error) = send_register(config, state, reporter).await {
-                    log::warn!("orchestrator register after drift failed: {error:#}");
-                }
-                last_register = Instant::now();
-            }
-            last_drift = Instant::now();
-        }
+        changed |= maybe_handle_drift(
+            config,
+            state,
+            supervisor,
+            reporter,
+            &mut last_drift,
+            &mut last_register,
+        )
+        .await?;
 
-        if last_register.elapsed() >= config.register_interval {
-            if let Err(error) = send_register(config, state, reporter).await {
-                log::warn!("orchestrator register failed: {error:#}");
-            }
-            last_register = Instant::now();
-        }
+        maybe_send_register(config, state, reporter, &mut last_register).await;
 
         maybe_send_heartbeat(
             config,
@@ -344,6 +294,112 @@ async fn supervise(
         }
     }
     Ok(())
+}
+
+async fn run_init_tick(
+    config: &RemoteConfig,
+    state: &mut PoolState,
+    supervisor: &mut Supervisor,
+    reporter: &RemoteReporter,
+    last_register: &mut Instant,
+    cycle_cursor: &mut usize,
+    cycle_pass: &mut CyclePass,
+) -> Result<bool> {
+    let mut changed = false;
+    if cycle_pass.remaining.is_empty() {
+        let cycling = state.proxies.iter().filter(|proxy| !proxy.locked).count();
+        if cycling < config.topup_count {
+            changed |= top_up_candidates(config, state).await?;
+        }
+        cycle_pass.begin(state);
+    }
+
+    let outcome = cycle_one(
+        config,
+        state,
+        supervisor,
+        cycle_cursor,
+        &cycle_pass.remaining,
+    )
+    .await?;
+    changed |= outcome.changed;
+    cycle_pass.record(outcome);
+    if outcome.locked {
+        if let Err(error) = send_register(config, state, reporter).await {
+            log::warn!("orchestrator register after new lock failed: {error:#}");
+        }
+        *last_register = Instant::now();
+    }
+
+    if !cycle_pass.remaining.is_empty() {
+        return Ok(changed);
+    }
+
+    let summary = cycle_pass.finish();
+    changed |= apply_cycle_pass(state, summary);
+    if summary.stale_attempts > 0 && summary.new_locked == 0 {
+        log::info!(
+            "remote pool stale {}/{} (+{} failed candidates, no new unique v4)",
+            state.stale_count,
+            config.stale_limit,
+            summary.stale_attempts
+        );
+    }
+
+    let locked_count = state.proxies.iter().filter(|proxy| proxy.locked).count();
+    let cycling = state.proxies.len().saturating_sub(locked_count);
+    if locked_count > 0 && (cycling == 0 || state.stale_count >= config.stale_limit) {
+        state.phase = "locked".to_string();
+        changed = true;
+        log::info!(
+            "remote pool entering locked phase: {locked_count} locked, {cycling} spare candidates"
+        );
+        if let Err(error) = send_register(config, state, reporter).await {
+            log::warn!("orchestrator register on lock transition failed: {error:#}");
+        }
+        *last_register = Instant::now();
+    }
+    Ok(changed)
+}
+
+async fn maybe_handle_drift(
+    config: &RemoteConfig,
+    state: &mut PoolState,
+    supervisor: &mut Supervisor,
+    reporter: &RemoteReporter,
+    last_drift: &mut Instant,
+    last_register: &mut Instant,
+) -> Result<bool> {
+    if state.phase != "locked" || last_drift.elapsed() < config.drift_interval {
+        return Ok(false);
+    }
+
+    let drifted = check_drift(config, state, supervisor).await?;
+    if drifted {
+        state.phase = "init".to_string();
+        state.stale_count = 0;
+        if let Err(error) = send_register(config, state, reporter).await {
+            log::warn!("orchestrator register after drift failed: {error:#}");
+        }
+        *last_register = Instant::now();
+    }
+    *last_drift = Instant::now();
+    Ok(drifted)
+}
+
+async fn maybe_send_register(
+    config: &RemoteConfig,
+    state: &PoolState,
+    reporter: &RemoteReporter,
+    last_register: &mut Instant,
+) {
+    if last_register.elapsed() < config.register_interval {
+        return;
+    }
+    if let Err(error) = send_register(config, state, reporter).await {
+        log::warn!("orchestrator register failed: {error:#}");
+    }
+    *last_register = Instant::now();
 }
 
 async fn maybe_send_heartbeat(
