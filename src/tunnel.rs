@@ -385,7 +385,7 @@ impl TunWriteState {
         }
     }
 
-    fn clear_batch(&mut self) {
+    const fn clear_batch(&mut self) {
         self.inbound_count = 0;
         self.started_at = None;
         self.deadline = None;
