@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use futures::future::join_all;
 use ring::rand::SecureRandom;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
@@ -119,57 +119,23 @@ async fn initialize_supervisor(
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CycleOutcome {
-    key: Option<SlotKey>,
     locked: bool,
     stale: bool,
     changed: bool,
 }
 
-#[derive(Debug, Default)]
-struct CyclePass {
-    attempted: BTreeSet<SlotKey>,
-    had_stale: bool,
-}
-
-impl CyclePass {
-    fn reset(&mut self) {
-        self.attempted.clear();
-        self.had_stale = false;
+fn apply_cycle_outcome(state: &mut PoolState, outcome: CycleOutcome) -> bool {
+    let mut changed = outcome.changed;
+    if outcome.locked {
+        if state.stale_count != 0 {
+            state.stale_count = 0;
+            changed = true;
+        }
+    } else if outcome.stale {
+        state.stale_count = state.stale_count.saturating_add(1);
+        changed = true;
     }
-
-    fn record(&mut self, outcome: CycleOutcome) {
-        if let Some(key) = outcome.key {
-            self.attempted.insert(key);
-        }
-        self.had_stale |= outcome.stale;
-    }
-
-    fn finish_if_complete(&mut self, state: &mut PoolState) -> bool {
-        if self.attempted.is_empty() {
-            return false;
-        }
-        let complete = state
-            .proxies
-            .iter()
-            .filter(|proxy| !proxy.locked)
-            .all(|proxy| {
-                self.attempted.contains(&SlotKey {
-                    group: proxy.group,
-                    slot: proxy.slot,
-                })
-            });
-        if !complete {
-            return false;
-        }
-
-        let had_stale = self.had_stale;
-        self.reset();
-        if had_stale {
-            state.stale_count = state.stale_count.saturating_add(1);
-            return true;
-        }
-        false
-    }
+    changed
 }
 
 fn reconcile_identity_presence(state: &mut PoolState, supervisor: &Supervisor) -> bool {
@@ -218,7 +184,6 @@ async fn supervise(
         .unwrap_or_else(Instant::now);
     let mut last_drift = Instant::now();
     let mut cycle_cursor = 0usize;
-    let mut cycle_pass = CyclePass::default();
     let mut cpu = CpuSampler::default();
     let mut cpu_history = Vec::with_capacity(10);
     let mut shutdown = Box::pin(wait_for_shutdown());
@@ -241,24 +206,18 @@ async fn supervise(
             }
 
             let outcome = cycle_one(config, state, supervisor, &mut cycle_cursor).await?;
-            changed |= outcome.changed;
+            changed |= apply_cycle_outcome(state, outcome);
             if outcome.locked {
-                state.stale_count = 0;
-                cycle_pass.reset();
                 if let Err(error) = send_register(config, state, reporter).await {
                     log::warn!("orchestrator register after new lock failed: {error:#}");
                 }
                 last_register = Instant::now();
-            } else {
-                cycle_pass.record(outcome);
-                if cycle_pass.finish_if_complete(state) {
-                    changed = true;
-                    log::info!(
-                        "remote pool completed stale pass {}/{} without a new unique v4",
-                        state.stale_count,
-                        config.stale_limit
-                    );
-                }
+            } else if outcome.stale {
+                log::info!(
+                    "remote pool stale attempt {}/{} without a new unique v4",
+                    state.stale_count,
+                    config.stale_limit
+                );
             }
 
             let locked_count = state.proxies.iter().filter(|proxy| proxy.locked).count();
@@ -281,8 +240,11 @@ async fn supervise(
             if drifted {
                 state.phase = "init".to_string();
                 state.stale_count = 0;
-                cycle_pass.reset();
                 changed = true;
+                if let Err(error) = send_register(config, state, reporter).await {
+                    log::warn!("orchestrator register after drift failed: {error:#}");
+                }
+                last_register = Instant::now();
             }
             last_drift = Instant::now();
         }
@@ -492,20 +454,39 @@ async fn cycle_one(
     };
     *cursor = (index + 1) % len;
 
-    let group = state.proxies[index].group;
-    let slot = state.proxies[index].slot;
-    let key = SlotKey { group, slot };
+    let key = SlotKey {
+        group: state.proxies[index].group,
+        slot: state.proxies[index].slot,
+    };
+    let (spec, changed) = prepare_cycle_candidate(config, state, supervisor, index, key).await?;
+    let Some(spec) = spec else {
+        return Ok(CycleOutcome {
+            changed,
+            ..CycleOutcome::default()
+        });
+    };
+
+    tokio::time::sleep(config.probe_wait).await;
+    probe_cycle_candidate(config, state, supervisor, index, key, &spec, changed).await
+}
+
+async fn prepare_cycle_candidate(
+    config: &RemoteConfig,
+    state: &mut PoolState,
+    supervisor: &mut Supervisor,
+    index: usize,
+    key: SlotKey,
+) -> Result<(Option<ChildSpec>, bool)> {
     let was_registered = state.proxies[index].registered;
-    let created = match supervisor.ensure_identity(group, slot).await {
+    let created = match supervisor.ensure_identity(key.group, key.slot).await {
         Ok(created) => created,
         Err(error) => {
             log::warn!(
-                "WARP identity unavailable g{group} s{slot}; will retry in a later pass: {error:#}"
+                "WARP identity unavailable g{} s{}; will retry in a later pass: {error:#}",
+                key.group,
+                key.slot
             );
-            return Ok(CycleOutcome {
-                key: Some(key),
-                ..CycleOutcome::default()
-            });
+            return Ok((None, false));
         }
     };
     state.proxies[index].registered = true;
@@ -515,8 +496,11 @@ async fn cycle_one(
     }
 
     let spec = child_spec(config, &state.proxies[index])?;
-    let pid = match supervisor.start(&spec).await {
-        Ok(pid) => pid,
+    match supervisor.start(&spec).await {
+        Ok(pid) => {
+            state.proxies[index].pid = pid;
+            Ok((Some(spec), changed))
+        }
         Err(error) => {
             log::warn!(
                 "proxy child start failed g{} s{} port={}: {error:#}; will retry in a later pass",
@@ -528,16 +512,20 @@ async fn cycle_one(
                 state.proxies[index].pid = 0;
                 changed = true;
             }
-            return Ok(CycleOutcome {
-                key: Some(key),
-                changed,
-                ..CycleOutcome::default()
-            });
+            Ok((None, changed))
         }
-    };
-    state.proxies[index].pid = pid;
-    tokio::time::sleep(config.probe_wait).await;
+    }
+}
 
+async fn probe_cycle_candidate(
+    config: &RemoteConfig,
+    state: &mut PoolState,
+    supervisor: &mut Supervisor,
+    index: usize,
+    key: SlotKey,
+    spec: &ChildSpec,
+    mut changed: bool,
+) -> Result<CycleOutcome> {
     if !supervisor.is_running(key)? {
         state.proxies[index].pid = 0;
         log::warn!(
@@ -547,7 +535,6 @@ async fn cycle_one(
             spec.port
         );
         return Ok(CycleOutcome {
-            key: Some(key),
             changed,
             ..CycleOutcome::default()
         });
@@ -566,7 +553,6 @@ async fn cycle_one(
             supervisor.stop(key).await?;
             state.proxies[index].pid = 0;
             return Ok(CycleOutcome {
-                key: Some(key),
                 stale: true,
                 changed,
                 ..CycleOutcome::default()
@@ -584,7 +570,6 @@ async fn cycle_one(
         supervisor.stop(key).await?;
         state.proxies[index].pid = 0;
         return Ok(CycleOutcome {
-            key: Some(key),
             stale: true,
             changed,
             ..CycleOutcome::default()
@@ -607,7 +592,6 @@ async fn cycle_one(
         spec.port
     );
     Ok(CycleOutcome {
-        key: Some(key),
         locked: true,
         changed,
         stale: false,
@@ -1252,103 +1236,40 @@ mod tests {
     }
 
     #[test]
-    fn stale_count_advances_only_after_a_complete_candidate_pass() {
+    fn stale_count_tracks_failed_candidate_attempts_and_resets_on_lock() {
         let mut state = PoolState {
-            proxies: (0..6)
-                .map(|slot| ProxyRecord {
-                    group: 0,
-                    slot,
-                    ..ProxyRecord::default()
-                })
-                .collect(),
+            stale_count: 3,
             ..PoolState::default()
         };
-        let mut pass = CyclePass::default();
 
-        for slot in 0..5 {
-            pass.record(CycleOutcome {
-                key: Some(SlotKey { group: 0, slot }),
+        assert!(apply_cycle_outcome(
+            &mut state,
+            CycleOutcome {
                 stale: true,
                 ..CycleOutcome::default()
-            });
-            assert!(!pass.finish_if_complete(&mut state));
-            assert_eq!(state.stale_count, 0);
-        }
+            }
+        ));
+        assert_eq!(state.stale_count, 4);
 
-        pass.record(CycleOutcome {
-            key: Some(SlotKey { group: 0, slot: 5 }),
-            stale: true,
-            ..CycleOutcome::default()
-        });
-        assert!(pass.finish_if_complete(&mut state));
-        assert_eq!(state.stale_count, 1);
-    }
-
-    #[test]
-    fn retryable_only_pass_does_not_advance_stale_count() {
-        let mut state = PoolState {
-            proxies: (0..3)
-                .map(|slot| ProxyRecord {
-                    group: 0,
-                    slot,
-                    ..ProxyRecord::default()
-                })
-                .collect(),
-            ..PoolState::default()
-        };
-        let mut pass = CyclePass::default();
-
-        for slot in 0..3 {
-            pass.record(CycleOutcome {
-                key: Some(SlotKey { group: 0, slot }),
+        assert!(apply_cycle_outcome(
+            &mut state,
+            CycleOutcome {
+                locked: true,
+                changed: true,
                 ..CycleOutcome::default()
-            });
-        }
-
-        assert!(!pass.finish_if_complete(&mut state));
+            }
+        ));
         assert_eq!(state.stale_count, 0);
-        assert_eq!(pass.attempted, BTreeSet::new());
-        assert!(!pass.had_stale);
     }
 
     #[test]
-    fn top_up_extends_the_current_candidate_pass() {
+    fn retryable_candidate_failure_does_not_count_as_stale() {
         let mut state = PoolState {
-            proxies: (0..2)
-                .map(|slot| ProxyRecord {
-                    group: 0,
-                    slot,
-                    ..ProxyRecord::default()
-                })
-                .collect(),
+            stale_count: 2,
             ..PoolState::default()
         };
-        let mut pass = CyclePass::default();
-        pass.record(CycleOutcome {
-            key: Some(SlotKey { group: 0, slot: 0 }),
-            stale: true,
-            ..CycleOutcome::default()
-        });
-
-        state.proxies.push(ProxyRecord {
-            group: 0,
-            slot: 2,
-            ..ProxyRecord::default()
-        });
-        pass.record(CycleOutcome {
-            key: Some(SlotKey { group: 0, slot: 1 }),
-            stale: true,
-            ..CycleOutcome::default()
-        });
-        assert!(!pass.finish_if_complete(&mut state));
-
-        pass.record(CycleOutcome {
-            key: Some(SlotKey { group: 0, slot: 2 }),
-            stale: true,
-            ..CycleOutcome::default()
-        });
-        assert!(pass.finish_if_complete(&mut state));
-        assert_eq!(state.stale_count, 1);
+        assert!(!apply_cycle_outcome(&mut state, CycleOutcome::default()));
+        assert_eq!(state.stale_count, 2);
     }
 
     #[test]
