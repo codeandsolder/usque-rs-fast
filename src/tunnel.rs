@@ -957,7 +957,9 @@ mod tests {
     fn direct_datagram_stages_valid_payload_and_updates_stats_once() {
         let packet = minimal_ipv4_packet();
         let dgram = make_datagram(7, 0, &packet);
-        let mut inbound_packets = vec![Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet.len()); 2];
+        let mut inbound_packets = (0..2)
+            .map(|_| Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet.len()))
+            .collect::<Vec<_>>();
         let mut inbound_count = 0;
         let mut stats = TunnelStats::new();
 
