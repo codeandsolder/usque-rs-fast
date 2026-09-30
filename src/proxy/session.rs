@@ -76,8 +76,14 @@ pub async fn connect(config_path: &str, transport: &TransportConfig) -> Result<A
 
     let mtu = usize::try_from(transport.mtu)
         .map_err(|_| anyhow::anyhow!("MTU does not fit usize: {}", transport.mtu))?;
-    VirtualNet::start(packet_stream, local_v4, local_v6, mtu, &transport.dns_servers)
-        .map_err(Into::into)
+    VirtualNet::start(
+        packet_stream,
+        local_v4,
+        local_v6,
+        mtu,
+        &transport.dns_servers,
+    )
+    .map_err(Into::into)
 }
 
 fn validate(transport: &TransportConfig) -> Result<()> {

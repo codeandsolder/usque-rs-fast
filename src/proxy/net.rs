@@ -109,12 +109,8 @@ fn dns_servers_for(
         return configured
             .iter()
             .filter_map(|address| match address {
-                IpAddr::V4(address) if local_v4.is_some() => {
-                    Some(IpAddress::Ipv4((*address).into()))
-                }
-                IpAddr::V6(address) if local_v6.is_some() => {
-                    Some(IpAddress::Ipv6((*address).into()))
-                }
+                IpAddr::V4(address) if local_v4.is_some() => Some(IpAddress::Ipv4(*address)),
+                IpAddr::V6(address) if local_v6.is_some() => Some(IpAddress::Ipv6(*address)),
                 _ => None,
             })
             .collect();
@@ -715,7 +711,7 @@ impl VirtualNet {
     /// Drop all cached DNS answers.
     ///
     /// Replacing a WARP session naturally drops its cache with the
-    /// VirtualNet. Higher-level supervisors should call this when they
+    /// `VirtualNet`. Higher-level supervisors should call this when they
     /// observe an egress change without replacing the session.
     pub fn clear_dns_cache(&self) {
         invalidate_dns_cache(&self.shared);
@@ -878,11 +874,11 @@ async fn run_egress_watcher(shared: Arc<Shared>) {
 
         match tokio::time::timeout(EGRESS_PROBE_TIMEOUT, probe_warp_egress(shared.clone())).await {
             Ok(Ok(current)) => {
-                if let Some(old) = previous.replace(current) {
-                    if old != current {
-                        invalidate_dns_cache(&shared);
-                        log::info!("WARP egress changed {old} -> {current}; DNS cache cleared");
-                    }
+                if let Some(old) = previous.replace(current)
+                    && old != current
+                {
+                    invalidate_dns_cache(&shared);
+                    log::info!("WARP egress changed {old} -> {current}; DNS cache cleared");
                 }
             }
             Ok(Err(error)) => log::debug!("WARP egress probe failed: {error}"),
@@ -922,7 +918,7 @@ async fn probe_warp_egress(shared: Arc<Shared>) -> io::Result<IpAddr> {
         }
         match parse_whoami_response(&response[..size], transaction_id) {
             Ok(address) => return Ok(address),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
     }
@@ -1468,17 +1464,23 @@ mod tests {
         let v6 = Some(Ipv6Addr::LOCALHOST);
 
         assert_eq!(dns_servers_for(v4, None, &[]).len(), 3);
-        assert!(dns_servers_for(v4, None, &[])
-            .iter()
-            .all(|server| matches!(server, IpAddress::Ipv4(_))));
+        assert!(
+            dns_servers_for(v4, None, &[])
+                .iter()
+                .all(|server| matches!(server, IpAddress::Ipv4(_)))
+        );
         assert_eq!(dns_servers_for(None, v6, &[]).len(), 3);
-        assert!(dns_servers_for(None, v6, &[])
-            .iter()
-            .all(|server| matches!(server, IpAddress::Ipv6(_))));
+        assert!(
+            dns_servers_for(None, v6, &[])
+                .iter()
+                .all(|server| matches!(server, IpAddress::Ipv6(_)))
+        );
         assert_eq!(dns_servers_for(v4, v6, &[]).len(), 3);
-        assert!(dns_servers_for(v4, v6, &[])
-            .iter()
-            .all(|server| matches!(server, IpAddress::Ipv4(_))));
+        assert!(
+            dns_servers_for(v4, v6, &[])
+                .iter()
+                .all(|server| matches!(server, IpAddress::Ipv4(_)))
+        );
 
         let configured = [
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
