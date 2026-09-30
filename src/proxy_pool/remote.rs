@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use futures::future::join_all;
 use ring::rand::SecureRandom;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
@@ -119,23 +119,77 @@ async fn initialize_supervisor(
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CycleOutcome {
+    key: Option<SlotKey>,
     locked: bool,
     stale: bool,
     changed: bool,
 }
 
-fn apply_cycle_outcome(state: &mut PoolState, outcome: CycleOutcome) -> bool {
-    let mut changed = outcome.changed;
-    if outcome.locked {
-        if state.stale_count != 0 {
-            state.stale_count = 0;
-            changed = true;
-        }
-    } else if outcome.stale {
-        state.stale_count = state.stale_count.saturating_add(1);
-        changed = true;
+#[derive(Clone, Copy, Debug, Default)]
+struct CyclePassSummary {
+    new_locked: usize,
+    stale_attempts: usize,
+}
+
+#[derive(Debug, Default)]
+struct CyclePass {
+    remaining: BTreeSet<SlotKey>,
+    new_locked: usize,
+    stale_attempts: usize,
+}
+
+impl CyclePass {
+    fn begin(&mut self, state: &PoolState) {
+        self.remaining = state
+            .proxies
+            .iter()
+            .filter(|proxy| !proxy.locked)
+            .map(|proxy| SlotKey {
+                group: proxy.group,
+                slot: proxy.slot,
+            })
+            .collect();
+        self.new_locked = 0;
+        self.stale_attempts = 0;
     }
-    changed
+
+    fn record(&mut self, outcome: CycleOutcome) {
+        if let Some(key) = outcome.key {
+            self.remaining.remove(&key);
+        }
+        if outcome.locked {
+            self.new_locked = self.new_locked.saturating_add(1);
+        }
+        if outcome.stale {
+            self.stale_attempts = self.stale_attempts.saturating_add(1);
+        }
+    }
+
+    fn finish(&mut self) -> CyclePassSummary {
+        let summary = CyclePassSummary {
+            new_locked: self.new_locked,
+            stale_attempts: self.stale_attempts,
+        };
+        self.remaining.clear();
+        self.new_locked = 0;
+        self.stale_attempts = 0;
+        summary
+    }
+}
+
+fn apply_cycle_pass(state: &mut PoolState, summary: CyclePassSummary) -> bool {
+    if summary.new_locked > 0 {
+        if state.stale_count == 0 {
+            return false;
+        }
+        state.stale_count = 0;
+        return true;
+    }
+    if summary.stale_attempts == 0 {
+        return false;
+    }
+    state.stale_count = state.stale_count.saturating_add(summary.stale_attempts);
+    true
 }
 
 fn reconcile_identity_presence(state: &mut PoolState, supervisor: &Supervisor) -> bool {
@@ -184,6 +238,7 @@ async fn supervise(
         .unwrap_or_else(Instant::now);
     let mut last_drift = Instant::now();
     let mut cycle_cursor = 0usize;
+    let mut cycle_pass = CyclePass::default();
     let mut cpu = CpuSampler::default();
     let mut cpu_history = Vec::with_capacity(10);
     let mut shutdown = Box::pin(wait_for_shutdown());
@@ -200,42 +255,60 @@ async fn supervise(
         let mut changed = restart_dead_locked(config, state, supervisor).await?;
 
         if state.phase == "init" {
-            let cycling = state.proxies.iter().filter(|proxy| !proxy.locked).count();
-            if cycling < config.topup_count {
-                changed |= top_up_candidates(config, state).await?;
+            if cycle_pass.remaining.is_empty() {
+                let cycling = state.proxies.iter().filter(|proxy| !proxy.locked).count();
+                if cycling < config.topup_count {
+                    changed |= top_up_candidates(config, state).await?;
+                }
+                cycle_pass.begin(state);
             }
 
-            let outcome = cycle_one(config, state, supervisor, &mut cycle_cursor).await?;
-            changed |= apply_cycle_outcome(state, outcome);
+            let outcome = cycle_one(
+                config,
+                state,
+                supervisor,
+                &mut cycle_cursor,
+                &cycle_pass.remaining,
+            )
+            .await?;
+            changed |= outcome.changed;
+            cycle_pass.record(outcome);
             if outcome.locked {
                 if let Err(error) = send_register(config, state, reporter).await {
                     log::warn!("orchestrator register after new lock failed: {error:#}");
                 }
                 last_register = Instant::now();
-            } else if outcome.stale {
-                log::info!(
-                    "remote pool stale attempt {}/{} without a new unique v4",
-                    state.stale_count,
-                    config.stale_limit
-                );
             }
 
-            let locked_count = state.proxies.iter().filter(|proxy| proxy.locked).count();
-            let cycling = state.proxies.len().saturating_sub(locked_count);
-            if locked_count > 0 && (cycling == 0 || state.stale_count >= config.stale_limit) {
-                state.phase = "locked".to_string();
-                changed = true;
-                log::info!(
-                    "remote pool entering locked phase: {locked_count} locked, {cycling} spare candidates"
-                );
-                if let Err(error) = send_register(config, state, reporter).await {
-                    log::warn!("orchestrator register on lock transition failed: {error:#}");
+            if cycle_pass.remaining.is_empty() {
+                let summary = cycle_pass.finish();
+                changed |= apply_cycle_pass(state, summary);
+                if summary.stale_attempts > 0 && summary.new_locked == 0 {
+                    log::info!(
+                        "remote pool stale {}/{} (+{} failed candidates, no new unique v4)",
+                        state.stale_count,
+                        config.stale_limit,
+                        summary.stale_attempts
+                    );
                 }
-                last_register = Instant::now();
+
+                let locked_count = state.proxies.iter().filter(|proxy| proxy.locked).count();
+                let cycling = state.proxies.len().saturating_sub(locked_count);
+                if locked_count > 0 && (cycling == 0 || state.stale_count >= config.stale_limit) {
+                    state.phase = "locked".to_string();
+                    changed = true;
+                    log::info!(
+                        "remote pool entering locked phase: {locked_count} locked, {cycling} spare candidates"
+                    );
+                    if let Err(error) = send_register(config, state, reporter).await {
+                        log::warn!("orchestrator register on lock transition failed: {error:#}");
+                    }
+                    last_register = Instant::now();
+                }
             }
         }
 
-        if last_drift.elapsed() >= config.drift_interval {
+        if state.phase == "locked" && last_drift.elapsed() >= config.drift_interval {
             let drifted = check_drift(config, state, supervisor).await?;
             if drifted {
                 state.phase = "init".to_string();
@@ -440,17 +513,28 @@ async fn cycle_one(
     state: &mut PoolState,
     supervisor: &mut Supervisor,
     cursor: &mut usize,
+    allowed: &BTreeSet<SlotKey>,
 ) -> Result<CycleOutcome> {
-    if state.proxies.is_empty() {
+    if allowed.is_empty() {
         return Ok(CycleOutcome::default());
     }
 
     let len = state.proxies.len();
     let Some(index) = (0..len)
         .map(|offset| (*cursor + offset) % len)
-        .find(|index| !state.proxies[*index].locked)
+        .find(|index| {
+            let proxy = &state.proxies[*index];
+            !proxy.locked
+                && allowed.contains(&SlotKey {
+                    group: proxy.group,
+                    slot: proxy.slot,
+                })
+        })
     else {
-        return Ok(CycleOutcome::default());
+        anyhow::bail!(
+            "cycle pass has {} pending candidates but none are selectable",
+            allowed.len()
+        );
     };
     *cursor = (index + 1) % len;
 
@@ -461,6 +545,7 @@ async fn cycle_one(
     let (spec, changed) = prepare_cycle_candidate(config, state, supervisor, index, key).await?;
     let Some(spec) = spec else {
         return Ok(CycleOutcome {
+            key: Some(key),
             changed,
             ..CycleOutcome::default()
         });
@@ -535,6 +620,7 @@ async fn probe_cycle_candidate(
             spec.port
         );
         return Ok(CycleOutcome {
+            key: Some(key),
             changed,
             ..CycleOutcome::default()
         });
@@ -553,6 +639,7 @@ async fn probe_cycle_candidate(
             supervisor.stop(key).await?;
             state.proxies[index].pid = 0;
             return Ok(CycleOutcome {
+                key: Some(key),
                 stale: true,
                 changed,
                 ..CycleOutcome::default()
@@ -570,6 +657,7 @@ async fn probe_cycle_candidate(
         supervisor.stop(key).await?;
         state.proxies[index].pid = 0;
         return Ok(CycleOutcome {
+            key: Some(key),
             stale: true,
             changed,
             ..CycleOutcome::default()
@@ -592,6 +680,7 @@ async fn probe_cycle_candidate(
         spec.port
     );
     Ok(CycleOutcome {
+        key: Some(key),
         locked: true,
         changed,
         stale: false,
@@ -1236,39 +1325,66 @@ mod tests {
     }
 
     #[test]
-    fn stale_count_tracks_failed_candidate_attempts_and_resets_on_lock() {
+    fn cycle_pass_applies_stale_attempts_only_when_the_pass_finishes() {
         let mut state = PoolState {
-            stale_count: 3,
+            stale_count: 2,
+            proxies: (0..6)
+                .map(|slot| ProxyRecord {
+                    group: 0,
+                    slot,
+                    ..ProxyRecord::default()
+                })
+                .collect(),
             ..PoolState::default()
         };
+        let mut pass = CyclePass::default();
+        pass.begin(&state);
 
-        assert!(apply_cycle_outcome(
-            &mut state,
-            CycleOutcome {
+        for slot in 0..5 {
+            pass.record(CycleOutcome {
+                key: Some(SlotKey { group: 0, slot }),
                 stale: true,
                 ..CycleOutcome::default()
-            }
-        ));
-        assert_eq!(state.stale_count, 4);
+            });
+            assert_eq!(state.stale_count, 2);
+            assert!(!pass.remaining.is_empty());
+        }
 
-        assert!(apply_cycle_outcome(
-            &mut state,
-            CycleOutcome {
-                locked: true,
-                changed: true,
-                ..CycleOutcome::default()
-            }
-        ));
+        pass.record(CycleOutcome {
+            key: Some(SlotKey { group: 0, slot: 5 }),
+            stale: true,
+            ..CycleOutcome::default()
+        });
+        assert!(pass.remaining.is_empty());
+        let summary = pass.finish();
+        assert_eq!(summary.new_locked, 0);
+        assert_eq!(summary.stale_attempts, 6);
+        assert!(apply_cycle_pass(&mut state, summary));
+        assert_eq!(state.stale_count, 8);
+    }
+
+    #[test]
+    fn cycle_pass_with_any_new_lock_resets_prior_staleness() {
+        let mut state = PoolState {
+            stale_count: 4,
+            ..PoolState::default()
+        };
+        let summary = CyclePassSummary {
+            new_locked: 1,
+            stale_attempts: 5,
+        };
+        assert!(apply_cycle_pass(&mut state, summary));
         assert_eq!(state.stale_count, 0);
     }
 
     #[test]
-    fn retryable_candidate_failure_does_not_count_as_stale() {
+    fn retryable_only_cycle_pass_does_not_change_staleness() {
         let mut state = PoolState {
             stale_count: 2,
             ..PoolState::default()
         };
-        assert!(!apply_cycle_outcome(&mut state, CycleOutcome::default()));
+        let summary = CyclePassSummary::default();
+        assert!(!apply_cycle_pass(&mut state, summary));
         assert_eq!(state.stale_count, 2);
     }
 
