@@ -15,7 +15,6 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::{
     net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -26,11 +25,6 @@ use usque_rs::{
         net::VirtualNet,
         session::{self as proxy_session, TransportConfig},
         socks::{self, SocksConfig},
-    },
-    proxy_pool::{
-        core::{ChildTransport, ProxyAuth},
-        offline::{self, OfflineConfig},
-        remote::{self, RemoteConfig},
     },
     register, tun_device, tunnel,
 };
@@ -146,44 +140,6 @@ enum Commands {
         #[command(flatten)]
         transport: ProxyTransportArgs,
     },
-    /// Run multiple WARP identities as localhost SOCKS5 proxies without a control plane.
-    PoolOffline {
-        #[arg(long, default_value = "usque-pool")]
-        dir: PathBuf,
-        #[arg(long, default_value_t = 1)]
-        count: usize,
-        #[arg(long, default_value_t = 20_000)]
-        base_port: u16,
-        #[arg(long)]
-        username: Option<String>,
-        #[arg(short = 'w', long)]
-        password: Option<String>,
-        #[command(flatten)]
-        transport: ProxyTransportArgs,
-    },
-    /// Run a routed proxy pool and report healthy identities to warp-orchestrator.
-    PoolRemote {
-        #[arg(long, default_value = "/var/lib/usque-pool")]
-        dir: PathBuf,
-        #[arg(long = "prefix", required = true)]
-        prefixes: Vec<String>,
-        #[arg(long)]
-        interface: Option<String>,
-        #[arg(long, default_value_t = 10)]
-        slots_per_prefix: usize,
-        #[arg(long, default_value_t = 20_000)]
-        base_port: u16,
-        #[arg(long)]
-        orchestrator_url: String,
-        #[arg(long, default_value = "/etc/usque-pool/orchestrator.psk")]
-        psk_file: PathBuf,
-        #[arg(long, default_value = "/etc/usque-pool/proxy.auth")]
-        auth_file: PathBuf,
-        #[arg(long)]
-        hostname: Option<String>,
-        #[command(flatten)]
-        transport: ProxyTransportArgs,
-    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -241,40 +197,6 @@ async fn main() -> Result<()> {
             password,
             transport,
         } => cmd_http_proxy(&cli.config, bind, port, username, password, &transport).await,
-        Commands::PoolOffline {
-            dir,
-            count,
-            base_port,
-            username,
-            password,
-            transport,
-        } => cmd_pool_offline(dir, count, base_port, username, password, &transport).await,
-        Commands::PoolRemote {
-            dir,
-            prefixes,
-            interface,
-            slots_per_prefix,
-            base_port,
-            orchestrator_url,
-            psk_file,
-            auth_file,
-            hostname,
-            transport,
-        } => {
-            cmd_pool_remote(RemoteCommandOptions {
-                dir,
-                prefixes,
-                interface,
-                slots_per_prefix,
-                base_port,
-                orchestrator_url,
-                psk_file,
-                auth_file,
-                hostname,
-                transport,
-            })
-            .await
-        }
     }
 }
 
@@ -421,92 +343,6 @@ async fn cmd_http_proxy(
     .await
 }
 
-async fn cmd_pool_offline(
-    dir: PathBuf,
-    count: usize,
-    base_port: u16,
-    username: Option<String>,
-    password: Option<String>,
-    transport: &ProxyTransportArgs,
-) -> Result<()> {
-    validate_auth_pair(username.as_deref(), password.as_deref())?;
-    let auth = username
-        .zip(password)
-        .map(|(username, password)| ProxyAuth { username, password });
-    offline::run(OfflineConfig {
-        root: dir,
-        count,
-        base_port,
-        port_stride: 1_000,
-        auth,
-        transport: child_transport(transport),
-        registration_delay: Duration::from_secs(8),
-    })
-    .await
-}
-
-struct RemoteCommandOptions {
-    dir: PathBuf,
-    prefixes: Vec<String>,
-    interface: Option<String>,
-    slots_per_prefix: usize,
-    base_port: u16,
-    orchestrator_url: String,
-    psk_file: PathBuf,
-    auth_file: PathBuf,
-    hostname: Option<String>,
-    transport: ProxyTransportArgs,
-}
-
-async fn cmd_pool_remote(options: RemoteCommandOptions) -> Result<()> {
-    let RemoteCommandOptions {
-        dir,
-        prefixes,
-        interface,
-        slots_per_prefix,
-        base_port,
-        orchestrator_url,
-        psk_file,
-        auth_file,
-        hostname,
-        transport,
-    } = options;
-
-    let psk = tokio::fs::read_to_string(&psk_file)
-        .await?
-        .trim()
-        .to_string();
-    if psk.is_empty() {
-        anyhow::bail!("orchestrator PSK file is empty: {}", psk_file.display());
-    }
-    let auth = read_proxy_auth(&auth_file).await?;
-    let hostname = hostname
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    remote::run(RemoteConfig {
-        root: dir,
-        prefixes,
-        interface,
-        slots_per_prefix,
-        topup_count: 10,
-        stale_limit: 5,
-        base_port,
-        port_stride: 1_000,
-        auth,
-        transport: child_transport(&transport),
-        registration_delay: Duration::from_secs(8),
-        probe_wait: Duration::from_secs(8),
-        heartbeat_interval: Duration::from_secs(15),
-        register_interval: Duration::from_secs(180),
-        drift_interval: Duration::from_secs(15),
-        orchestrator_url,
-        psk,
-        hostname,
-    })
-    .await
-}
-
 async fn create_proxy_net(
     config_path: &str,
     transport: &ProxyTransportArgs,
@@ -525,33 +361,6 @@ async fn create_proxy_net(
         },
     )
     .await
-}
-
-fn child_transport(transport: &ProxyTransportArgs) -> ChildTransport {
-    ChildTransport {
-        connect_port: transport.connect_port,
-        sni: transport.sni_address.clone(),
-        keepalive_period: Duration::from_secs(transport.keepalive_period),
-        mtu: transport.mtu,
-        no_tunnel_ipv4: transport.no_tunnel_ipv4,
-        no_tunnel_ipv6: transport.no_tunnel_ipv6,
-        use_ipv6_endpoint: transport.ipv6,
-    }
-}
-
-async fn read_proxy_auth(path: &Path) -> Result<ProxyAuth> {
-    let value = tokio::fs::read_to_string(path).await?;
-    let (username, password) = value
-        .trim()
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("proxy auth file must contain username:password"))?;
-    if username.is_empty() || password.is_empty() {
-        anyhow::bail!("proxy auth username/password must not be empty");
-    }
-    Ok(ProxyAuth {
-        username: username.to_string(),
-        password: password.to_string(),
-    })
 }
 
 fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<()> {
@@ -591,63 +400,5 @@ mod tests {
         assert!(validate_auth_pair(Some("user"), Some("pass")).is_ok());
         assert!(validate_auth_pair(Some("user"), None).is_err());
         assert!(validate_auth_pair(None, Some("pass")).is_err());
-    }
-
-    #[test]
-    fn offline_pool_defaults_to_local_control_plane_free_layout() -> Result<()> {
-        let cli = Cli::try_parse_from(["usque-rs", "pool-offline"])?;
-        let Commands::PoolOffline {
-            dir,
-            count,
-            base_port,
-            username,
-            password,
-            ..
-        } = cli.command
-        else {
-            anyhow::bail!("expected offline pool command");
-        };
-        assert_eq!(dir, PathBuf::from("usque-pool"));
-        assert_eq!(count, 1);
-        assert_eq!(base_port, 20_000);
-        assert!(username.is_none());
-        assert!(password.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn remote_pool_requires_explicit_remote_inputs() -> Result<()> {
-        assert!(Cli::try_parse_from(["usque-rs", "pool-remote"]).is_err());
-
-        let cli = Cli::try_parse_from([
-            "usque-rs",
-            "pool-remote",
-            "--prefix",
-            "2001:db8:1:2::/64",
-            "--orchestrator-url",
-            "https://orchestrator.example",
-        ])?;
-        let Commands::PoolRemote {
-            dir,
-            prefixes,
-            slots_per_prefix,
-            base_port,
-            orchestrator_url,
-            psk_file,
-            auth_file,
-            ..
-        } = cli.command
-        else {
-            anyhow::bail!("expected remote pool command");
-        };
-
-        assert_eq!(dir, PathBuf::from("/var/lib/usque-pool"));
-        assert_eq!(prefixes, ["2001:db8:1:2::/64"]);
-        assert_eq!(slots_per_prefix, 10);
-        assert_eq!(base_port, 20_000);
-        assert_eq!(orchestrator_url, "https://orchestrator.example");
-        assert_eq!(psk_file, PathBuf::from("/etc/usque-pool/orchestrator.psk"));
-        assert_eq!(auth_file, PathBuf::from("/etc/usque-pool/proxy.auth"));
-        Ok(())
     }
 }

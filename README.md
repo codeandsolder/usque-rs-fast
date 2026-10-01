@@ -56,35 +56,7 @@ The proxy transport accepts the same WARP-side family controls as the native tun
 
 After building the binary, `tests/proxy_smoke.sh` runs authenticated SOCKS5, SOCKS5h, HTTP-forwarding, and HTTPS-CONNECT checks against a real WARP config. Set `USQUE_BIN` if the binary is outside `target/debug/usque-rs`, and pass a config path readable by the account running the test.
 
-`--source-ip` pins the outer MASQUE UDP socket to a specific host address. Normal single-proxy use does not need it; remote pool mode uses it to preserve one routed source `/128` per WARP identity.
-
-## Proxy pools
-
-Pool operation is split into two explicit modes. Both reuse the same SOCKS5 userspace dataplane and keep one child process per WARP identity so one failed identity does not take the whole pool down.
-
-`pool-offline` means **no central control plane**; it still needs Internet access to register and use WARP. It maintains the requested number of identities and exposes them only on localhost:
-
-```sh
-usque-rs pool-offline --dir ./usque-pool --count 4 --base-port 20000
-```
-
-The listeners are `127.0.0.1:20000`, `127.0.0.1:20001`, and so on. Re-running the command reuses identity configs under the pool directory instead of registering fresh identities. `inventory.json` records the local listeners. Add `--username` and `--password` if local clients should authenticate.
-
-`pool-remote` ports the routed-`/128` lifecycle from `warpproxy`. It expects one or more routed IPv6 `/64` prefixes, adds per-slot `/128` addresses to the selected interface, pins both the listener and outer MASQUE socket to that `/128`, keeps only distinct observed WARP IPv4 egresses, and reports healthy proxies to the existing warp-orchestrator heartbeat/register API:
-
-```sh
-sudo usque-rs pool-remote \
-  --prefix 2001:db8:1234:5678::/64 \
-  --slots-per-prefix 10 \
-  --auth-file /etc/usque-pool/proxy.auth \
-  --psk-file /etc/usque-pool/orchestrator.psk \
-  --orchestrator-url https://orchestrator.example
-```
-
-Remote mode requires root or equivalent `CAP_NET_ADMIN` permission to add routed `/128` addresses. `--prefix` and `--orchestrator-url` are required inputs. The proxy-auth file contains `username:password`; the orchestrator PSK is stored separately. Runtime state defaults to `/var/lib/usque-pool`.
-
-The Rust pool owns its identity configs, generated address suffixes, and state directly. There is no Python supervisor or self-update compatibility layer; binary deployment/versioning owns upgrades.
-
+`--source-ip` pins the outer MASQUE UDP socket to a specific host address. It is a standalone transport option for deployments that need explicit source-address selection.
 
 ## Why the rewrite?
 
