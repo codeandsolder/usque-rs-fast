@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::Generate;

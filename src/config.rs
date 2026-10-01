@@ -28,8 +28,8 @@ impl Config {
     ///
     /// Returns an error if the file cannot be inspected/read, its permissions
     /// cannot be tightened on Unix, or the JSON is invalid.
-    pub fn load(path: &str) -> Result<Self> {
-        let path = Path::new(path);
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
 
         #[cfg(unix)]
         {
@@ -49,22 +49,40 @@ impl Config {
         serde_json::from_str(&data).with_context(|| "failed to parse config JSON")
     }
 
+    /// Load a saved WARP configuration without blocking an async runtime worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task cannot be joined or configuration loading fails.
+    pub async fn load_async(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || Self::load(path))
+            .await
+            .context("config load task failed")?
+    }
+
     /// Persist the configuration, creating parent directories as needed.
     ///
     /// # Errors
     ///
     /// Returns an error if serialization or any filesystem operation fails.
-    pub fn save(&self, path: &str) -> Result<()> {
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        let path = Path::new(path);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+
+        let mut tmp_name = path
+            .file_name()
+            .map_or_else(|| "config.json".into(), std::ffi::OsStr::to_os_string);
+        tmp_name.push(".tmp");
+        let tmp = path.with_file_name(tmp_name);
 
         let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(false);
+        options.create(true).write(true).truncate(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -72,23 +90,46 @@ impl Config {
         }
 
         let mut file = options
-            .open(path)
-            .with_context(|| format!("failed to open config {}", path.display()))?;
+            .open(&tmp)
+            .with_context(|| format!("failed to open temporary config {}", tmp.display()))?;
 
-        // OpenOptionsExt::mode only affects newly-created files. Tighten an existing config too.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .with_context(|| {
-                    format!("failed to secure config permissions for {}", path.display())
+                    format!("failed to secure config permissions for {}", tmp.display())
                 })?;
         }
 
-        file.set_len(0)
-            .with_context(|| format!("failed to truncate config {}", path.display()))?;
         file.write_all(json.as_bytes())
-            .with_context(|| format!("failed to write config to {}", path.display()))
+            .with_context(|| format!("failed to write config to {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync config {}", tmp.display()))?;
+        drop(file);
+
+        fs::rename(&tmp, path)
+            .with_context(|| format!("failed to atomically replace config {}", path.display()))?;
+
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync config directory {}", parent.display()))?;
+
+        Ok(())
+    }
+
+    /// Persist the configuration without blocking an async runtime worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task cannot be joined or persistence fails.
+    pub async fn save_async(&self, path: impl AsRef<Path>) -> Result<()> {
+        let config = self.clone();
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || config.save(path))
+            .await
+            .context("config save task failed")?
     }
 
     /// Build a local configuration from a successful registration response.
@@ -236,6 +277,32 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
         cfg.save(&path_string)?;
         assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn save_replaces_existing_config_without_leaving_a_temporary_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.json");
+        let mut cfg = Config {
+            private_key: "secret-key".to_string(),
+            endpoint_v4: "192.0.2.1".to_string(),
+            endpoint_v6: "2001:db8::1".to_string(),
+            endpoint_pub_key: "public-key".to_string(),
+            license: String::new(),
+            id: "id".to_string(),
+            access_token: "first-token".to_string(),
+            ipv4: "172.16.0.2".to_string(),
+            ipv6: "2606:4700:110::2".to_string(),
+        };
+
+        cfg.save(&path)?;
+        cfg.access_token = "second-token".to_string();
+        cfg.save(&path)?;
+
+        let loaded = Config::load(&path)?;
+        assert_eq!(loaded.access_token, "second-token");
+        assert!(!path.with_file_name("config.json.tmp").exists());
         Ok(())
     }
 

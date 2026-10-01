@@ -58,7 +58,7 @@ pub async fn send_udp_gso(
     segment_size: usize,
     to: SocketAddr,
 ) -> io::Result<usize> {
-    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, SockaddrStorage};
+    use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage, sendmsg};
     use std::io::IoSlice;
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;

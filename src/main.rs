@@ -14,19 +14,19 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 use usque_rs::{
     config,
-    packet_session::PacketSessionConfig,
     proxy::{
         http::{self as http_proxy, HttpConfig},
         net::VirtualNet,
+        session::{self as proxy_session, TransportConfig},
         socks::{self, SocksConfig},
     },
-    register, tun_device, tunnel, MasquePacketStream,
+    register, tun_device, tunnel,
 };
 
 #[derive(Parser)]
@@ -58,6 +58,8 @@ struct ProxyTransportArgs {
     keepalive_period: u64,
     #[arg(short, long, default_value_t = 1280)]
     mtu: u32,
+    #[arg(long)]
+    source_ip: Option<IpAddr>,
 }
 
 struct AddressSelection {
@@ -88,10 +90,6 @@ enum Commands {
         name: Option<String>,
         #[arg(long)]
         jwt: Option<String>,
-        // Kept as a hidden no-op for CLI compatibility. Registering already
-        // implies consent, so unattended registration must not prompt.
-        #[arg(long = "accept-tos", hide = true)]
-        accept_tos: bool,
     },
     /// Expose WARP as a native TUN device
     #[command(name = "nativetun")]
@@ -155,7 +153,6 @@ async fn main() -> Result<()> {
             model,
             name,
             jwt,
-            accept_tos: _,
         } => cmd_register(&cli.config, &locale, &model, name, jwt).await,
         Commands::NativeTun {
             connect_port,
@@ -210,11 +207,15 @@ async fn cmd_register(
     device_name: Option<String>,
     jwt: Option<String>,
 ) -> Result<()> {
-    if let Ok(existing) = config::Config::load(config_path) {
-        let _ = existing;
-        eprint!("Config already exists. Overwrite? (y/n): ");
-        let mut response = String::new();
-        std::io::stdin().read_line(&mut response)?;
+    if config::Config::load_async(config_path).await.is_ok() {
+        let response = tokio::task::spawn_blocking(|| {
+            eprint!("Config already exists. Overwrite? (y/n): ");
+            let mut response = String::new();
+            std::io::stdin().read_line(&mut response)?;
+            Ok::<_, std::io::Error>(response)
+        })
+        .await
+        .context("overwrite prompt task failed")??;
         if response.trim() != "y" {
             log::info!("Aborted.");
             return Ok(());
@@ -229,7 +230,7 @@ async fn cmd_register(
     let updated = register::enroll_key(&account_data, &pub_key_der, device_name.as_deref()).await?;
 
     let cfg = config::Config::from_account_data(&updated, &account_data.token, &priv_key_der)?;
-    cfg.save(config_path)?;
+    cfg.save_async(config_path).await?;
     log::info!("Config saved to {config_path}");
     Ok(())
 }
@@ -258,7 +259,7 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
         );
     }
 
-    let cfg = config::Config::load(config_path)?;
+    let cfg = config::Config::load_async(config_path).await?;
     eprintln!("Config loaded from {config_path}");
 
     let endpoint_ip: std::net::IpAddr = if use_ipv6_endpoint {
@@ -346,71 +347,20 @@ async fn create_proxy_net(
     config_path: &str,
     transport: &ProxyTransportArgs,
 ) -> Result<Arc<VirtualNet>> {
-    if transport.keepalive_period == 0 {
-        anyhow::bail!("keepalive period must be greater than zero");
-    }
-    if transport.no_tunnel_ipv4 && transport.no_tunnel_ipv6 {
-        anyhow::bail!("at least one tunnel address family must be enabled");
-    }
-    if transport.mtu != 1280 {
-        log::warn!(
-            "MTU {} differs from the supported/default 1280; packet loss or PMTU issues may occur",
-            transport.mtu
-        );
-    }
-
-    let config = config::Config::load(config_path)?;
-    let endpoint_ip: IpAddr = if transport.ipv6 {
-        config.endpoint_v6.parse()?
-    } else {
-        config.endpoint_v4.parse()?
-    };
-    let endpoint = SocketAddr::new(endpoint_ip, transport.connect_port);
-
-    let local_v4 = if transport.no_tunnel_ipv4 {
-        None
-    } else {
-        Some(parse_assigned_ipv4(&config.ipv4)?)
-    };
-    let local_v6 = if transport.no_tunnel_ipv6 {
-        None
-    } else {
-        Some(parse_assigned_ipv6(&config.ipv6)?)
-    };
-
-    let packet_stream = MasquePacketStream::connect(
-        Arc::new(config),
-        PacketSessionConfig {
-            endpoint,
-            bind: None,
+    proxy_session::connect(
+        config_path,
+        &TransportConfig {
+            connect_port: transport.connect_port,
+            use_ipv6_endpoint: transport.ipv6,
+            no_tunnel_ipv4: transport.no_tunnel_ipv4,
+            no_tunnel_ipv6: transport.no_tunnel_ipv6,
             sni: transport.sni_address.clone(),
             keepalive_period: Duration::from_secs(transport.keepalive_period),
             mtu: transport.mtu,
+            source_ip: transport.source_ip,
         },
     )
-    .await?;
-
-    let mtu = usize::try_from(transport.mtu)
-        .map_err(|_| anyhow::anyhow!("MTU does not fit usize: {}", transport.mtu))?;
-    VirtualNet::start(packet_stream, local_v4, local_v6, mtu).map_err(Into::into)
-}
-
-fn parse_assigned_ipv4(value: &str) -> Result<Ipv4Addr> {
-    value
-        .split('/')
-        .next()
-        .unwrap_or(value)
-        .parse()
-        .with_context(|| format!("invalid configured WARP IPv4 address {value:?}"))
-}
-
-fn parse_assigned_ipv6(value: &str) -> Result<Ipv6Addr> {
-    value
-        .split('/')
-        .next()
-        .unwrap_or(value)
-        .parse()
-        .with_context(|| format!("invalid configured WARP IPv6 address {value:?}"))
+    .await
 }
 
 fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<()> {
@@ -424,6 +374,7 @@ fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn proxy_commands_default_to_loopback() -> Result<()> {

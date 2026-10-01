@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use datagram_socket::DatagramSocketRecvExt;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
@@ -974,9 +974,11 @@ mod tests {
         assert_eq!(stats.rx_packets, 1);
         assert_eq!(stats.rx_bytes, 20);
         assert_eq!(&inbound_packets[0][VIRTIO_NET_HDR_LEN..], packet.as_slice());
-        assert!(inbound_packets[0][..VIRTIO_NET_HDR_LEN]
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(
+            inbound_packets[0][..VIRTIO_NET_HDR_LEN]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
     }
 
     #[test]

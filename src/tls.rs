@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
+use p256::SecretKey;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::DecodePrivateKey;
-use p256::SecretKey;
 use rcgen::{CertificateParams, KeyPair};
 use std::io::Write;
 use std::time::Duration;

@@ -56,6 +56,8 @@ The proxy transport accepts the same WARP-side family controls as the native tun
 
 After building the binary, `tests/proxy_smoke.sh` runs authenticated SOCKS5, SOCKS5h, HTTP-forwarding, and HTTPS-CONNECT checks against a real WARP config. Set `USQUE_BIN` if the binary is outside `target/debug/usque-rs`, and pass a config path readable by the account running the test.
 
+`--source-ip` pins the outer MASQUE UDP socket to a specific host address. It is a standalone transport option for deployments that need explicit source-address selection.
+
 ## Why the rewrite?
 
 I wrote the Go version as a PoC research client back when I was mostly focused on proxies. Since then, I’ve moved countries and my local ISP doesn't provide native IPv6. I wanted to use WARP to fill that gap, but there isn't an official client for my platform yet.
