@@ -401,10 +401,4 @@ mod tests {
         assert!(validate_auth_pair(Some("user"), None).is_err());
         assert!(validate_auth_pair(None, Some("pass")).is_err());
     }
-
-    #[test]
-    fn pool_commands_are_not_part_of_the_standalone_cli() {
-        assert!(Cli::try_parse_from(["usque-rs", "pool-offline"]).is_err());
-        assert!(Cli::try_parse_from(["usque-rs", "pool-remote"]).is_err());
-    }
 }

@@ -22,9 +22,8 @@ pub struct TransportConfig {
 
 /// Create the userspace WARP network used by the proxy frontends.
 ///
-/// `source_ip` controls the outer MASQUE UDP socket. It is intentionally
-/// independent from the WARP-assigned inner IPv4/IPv6 addresses; remote pool
-/// mode uses this to pin each identity to a distinct routed host /128.
+/// `source_ip` controls the outer MASQUE UDP socket independently from the
+/// WARP-assigned inner IPv4/IPv6 addresses.
 ///
 /// # Errors
 /// Returns an error for invalid address-family combinations, malformed WARP
