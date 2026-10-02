@@ -242,7 +242,6 @@ struct TunWriteBatchGate {
     active: bool,
     packet_target: usize,
     activation_span: Duration,
-    slow_batch_span: Duration,
     last_dense_event: Option<Instant>,
     dense_events: u8,
     slow_batches: u8,
@@ -263,7 +262,6 @@ impl TunWriteBatchGate {
             active: !adaptive && packet_target > 1,
             packet_target,
             activation_span: activation_span.min(max_delay),
-            slow_batch_span: max_delay / 2,
             last_dense_event: None,
             dense_events: 0,
             slow_batches: 0,
@@ -333,21 +331,16 @@ impl TunWriteBatchGate {
         }
     }
 
-    fn observe_flush(
-        &mut self,
-        packet_count: usize,
-        elapsed: Option<Duration>,
-        deadline_expired: bool,
-    ) {
+    fn observe_flush(&mut self, packet_count: usize, deadline_expired: bool) {
         if !self.adaptive || !self.active || self.packet_target <= 1 {
             return;
         }
 
-        let slow = deadline_expired
-            || (packet_count >= self.packet_target
-                && elapsed.is_some_and(|duration| duration > self.slow_batch_span));
-
-        if slow {
+        // Reaching the target before the deadline is a successful batch even
+        // when it took more than half the latency budget. Disabling after such
+        // batches causes mode churn at intermediate packet rates. Only repeated
+        // deadline expirations are evidence that retention is not paying off.
+        if deadline_expired {
             self.slow_batches = self.slow_batches.saturating_add(1);
             if self.slow_batches >= Self::SLOW_BATCHES_TO_DISABLE {
                 self.active = false;
@@ -365,7 +358,6 @@ impl TunWriteBatchGate {
 struct TunWriteState {
     gate: TunWriteBatchGate,
     inbound_count: usize,
-    started_at: Option<Instant>,
     deadline: Option<Instant>,
     max_delay: Duration,
 }
@@ -380,7 +372,6 @@ impl TunWriteState {
         Self {
             gate: TunWriteBatchGate::new(adaptive, packet_target, max_delay, activation_span),
             inbound_count: 0,
-            started_at: None,
             deadline: None,
             max_delay,
         }
@@ -392,24 +383,17 @@ impl TunWriteState {
 
     fn start_batch_if_needed(&mut self, now: Instant, target: usize) {
         if self.inbound_count == 0 && target > 1 {
-            self.started_at = Some(now);
             self.deadline = Some(now + self.max_delay);
         }
     }
 
     const fn clear_batch(&mut self) {
         self.inbound_count = 0;
-        self.started_at = None;
         self.deadline = None;
     }
 
     fn deadline_expired(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|deadline| now >= deadline)
-    }
-
-    fn elapsed(&self, now: Instant) -> Option<Duration> {
-        self.started_at
-            .map(|started| now.saturating_duration_since(started))
     }
 }
 
@@ -975,12 +959,9 @@ async fn flush_inbound_batch(
 
     let target = tun_write.effective_target();
     if target > 1 {
-        let now = Instant::now();
-        tun_write.gate.observe_flush(
-            tun_write.inbound_count,
-            tun_write.elapsed(now),
-            deadline_expired,
-        );
+        tun_write
+            .gate
+            .observe_flush(tun_write.inbound_count, deadline_expired);
     }
 
     send_tun_batch(
@@ -1230,7 +1211,6 @@ fn handle_udp_event(
 
             if batch_was_empty && tun_write_target > 1 {
                 let now = Instant::now();
-                tun_write.started_at = Some(now);
                 tun_write.deadline = Some(now + tun_write.max_delay);
             }
             accepted_inbound += 1;
@@ -1712,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_tun_write_gate_separates_activation_from_slow_batch_threshold() {
+    fn adaptive_tun_write_gate_separates_activation_from_deadline_disable() {
         let mut gate = TunWriteBatchGate::new(
             true,
             4,
@@ -1731,19 +1711,22 @@ mod tests {
         }
         assert_eq!(gate.effective_target(), 4);
 
+        // Successful target-filled batches reset the failure streak regardless
+        // of how much of the latency budget they consumed.
         for _ in 0..3 {
-            gate.observe_flush(4, Some(Duration::from_micros(300)), false);
+            gate.observe_flush(4, false);
         }
         assert_eq!(gate.effective_target(), 4);
 
+        // Only repeated actual deadline expirations disable retention.
         for _ in 0..3 {
-            gate.observe_flush(4, Some(Duration::from_micros(700)), false);
+            gate.observe_flush(3, true);
         }
         assert_eq!(gate.effective_target(), 1);
     }
 
     #[test]
-    fn adaptive_tun_write_gate_disables_after_repeated_slow_batches() {
+    fn adaptive_tun_write_gate_disables_after_repeated_deadlines() {
         let mut gate = TunWriteBatchGate::new(
             true,
             4,
@@ -1757,7 +1740,7 @@ mod tests {
         assert_eq!(gate.effective_target(), 4);
 
         for _ in 0..3 {
-            gate.observe_flush(4, Some(Duration::from_micros(700)), false);
+            gate.observe_flush(2, true);
         }
         assert_eq!(gate.effective_target(), 1);
     }
@@ -1771,7 +1754,7 @@ mod tests {
             Duration::from_micros(500),
         );
         assert_eq!(gate.effective_target(), 4);
-        gate.observe_flush(4, Some(Duration::from_micros(900)), true);
+        gate.observe_flush(1, true);
         assert_eq!(gate.effective_target(), 4);
     }
 
