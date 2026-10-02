@@ -331,7 +331,7 @@ impl TunWriteBatchGate {
         }
     }
 
-    fn observe_flush(&mut self, packet_count: usize, deadline_expired: bool) {
+    const fn observe_flush(&mut self, packet_count: usize, deadline_expired: bool) {
         if !self.adaptive || !self.active || self.packet_target <= 1 {
             return;
         }
