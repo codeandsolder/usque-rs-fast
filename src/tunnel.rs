@@ -242,6 +242,7 @@ struct TunWriteBatchGate {
     active: bool,
     packet_target: usize,
     activation_span: Duration,
+    slow_batch_span: Duration,
     last_dense_event: Option<Instant>,
     dense_events: u8,
     slow_batches: u8,
@@ -251,12 +252,18 @@ impl TunWriteBatchGate {
     const DENSE_EVENTS_TO_ENABLE: u8 = 3;
     const SLOW_BATCHES_TO_DISABLE: u8 = 3;
 
-    fn new(adaptive: bool, packet_target: usize, max_delay: Duration) -> Self {
+    fn new(
+        adaptive: bool,
+        packet_target: usize,
+        max_delay: Duration,
+        activation_span: Duration,
+    ) -> Self {
         Self {
             adaptive,
             active: !adaptive && packet_target > 1,
             packet_target,
-            activation_span: max_delay / 2,
+            activation_span: activation_span.min(max_delay),
+            slow_batch_span: max_delay / 2,
             last_dense_event: None,
             dense_events: 0,
             slow_batches: 0,
@@ -338,7 +345,7 @@ impl TunWriteBatchGate {
 
         let slow = deadline_expired
             || (packet_count >= self.packet_target
-                && elapsed.is_some_and(|duration| duration > self.activation_span));
+                && elapsed.is_some_and(|duration| duration > self.slow_batch_span));
 
         if slow {
             self.slow_batches = self.slow_batches.saturating_add(1);
@@ -364,9 +371,14 @@ struct TunWriteState {
 }
 
 impl TunWriteState {
-    fn new(adaptive: bool, packet_target: usize, max_delay: Duration) -> Self {
+    fn new(
+        adaptive: bool,
+        packet_target: usize,
+        max_delay: Duration,
+        activation_span: Duration,
+    ) -> Self {
         Self {
-            gate: TunWriteBatchGate::new(adaptive, packet_target, max_delay),
+            gate: TunWriteBatchGate::new(adaptive, packet_target, max_delay, activation_span),
             inbound_count: 0,
             started_at: None,
             deadline: None,
@@ -1090,7 +1102,7 @@ enum ForwardEvent {
     Stats,
 }
 
-fn tun_write_config() -> (usize, u64, bool) {
+fn tun_write_config() -> (usize, u64, Option<u64>, bool) {
     let packet_target = std::env::var("USQUE_TUN_WRITE_PACKETS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -1101,13 +1113,17 @@ fn tun_write_config() -> (usize, u64, bool) {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1_000)
         .clamp(1, 1_000);
+    let activation_span_us = std::env::var("USQUE_TUN_WRITE_ACTIVATION_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(1, max_delay_us));
     let adaptive = std::env::var("USQUE_TUN_WRITE_ADAPTIVE").is_ok_and(|value| {
         matches!(
             value.to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     });
-    (packet_target, max_delay_us, adaptive)
+    (packet_target, max_delay_us, activation_span_us, adaptive)
 }
 
 async fn enforce_tun_write_deadline(
@@ -1361,13 +1377,15 @@ async fn forward_native_session(
         &mut stats,
     )?;
 
-    let (packet_target, max_delay_us, adaptive) = tun_write_config();
+    let (packet_target, max_delay_us, activation_span_us, adaptive) = tun_write_config();
     let max_delay = Duration::from_micros(max_delay_us);
+    let activation_span = activation_span_us.map_or(max_delay / 2, Duration::from_micros);
     log::info!(
-        "TUN write batching: packet_target={packet_target} max_delay_us={max_delay_us} adaptive={adaptive}"
+        "TUN write batching: packet_target={packet_target} max_delay_us={max_delay_us} activation_span_us={} adaptive={adaptive}",
+        activation_span.as_micros()
     );
 
-    let tun_write = TunWriteState::new(adaptive, packet_target, max_delay);
+    let tun_write = TunWriteState::new(adaptive, packet_target, max_delay, activation_span);
     let mut runtime = ForwardRuntime::new(flow_prefix, stats, mtu + 128, tun_write);
     runtime.stats_interval.tick().await;
 
@@ -1636,7 +1654,12 @@ mod tests {
 
     #[test]
     fn adaptive_tun_write_gate_stays_off_for_sparse_receive_events() {
-        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let mut gate = TunWriteBatchGate::new(
+            true,
+            4,
+            Duration::from_micros(1_000),
+            Duration::from_micros(500),
+        );
         let start = Instant::now();
         for i in 0..6 {
             gate.observe_arrivals_at(start + Duration::from_micros(i * 750), 4);
@@ -1646,14 +1669,24 @@ mod tests {
 
     #[test]
     fn adaptive_tun_write_gate_single_large_receive_does_not_enable() {
-        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let mut gate = TunWriteBatchGate::new(
+            true,
+            4,
+            Duration::from_micros(1_000),
+            Duration::from_micros(500),
+        );
         gate.observe_arrivals_at(Instant::now(), 32);
         assert_eq!(gate.effective_target(), 1);
     }
 
     #[test]
     fn adaptive_tun_write_gate_partial_receive_resets_dense_streak() {
-        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let mut gate = TunWriteBatchGate::new(
+            true,
+            4,
+            Duration::from_micros(1_000),
+            Duration::from_micros(500),
+        );
         let start = Instant::now();
         gate.observe_arrivals_at(start, 4);
         gate.observe_arrivals_at(start + Duration::from_micros(100), 4);
@@ -1665,7 +1698,12 @@ mod tests {
 
     #[test]
     fn adaptive_tun_write_gate_enables_for_dense_receive_events() {
-        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let mut gate = TunWriteBatchGate::new(
+            true,
+            4,
+            Duration::from_micros(1_000),
+            Duration::from_micros(500),
+        );
         let start = Instant::now();
         for i in 0..3 {
             gate.observe_arrivals_at(start + Duration::from_micros(i * 100), 4);
@@ -1674,8 +1712,44 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_tun_write_gate_separates_activation_from_slow_batch_threshold() {
+        let mut gate = TunWriteBatchGate::new(
+            true,
+            4,
+            Duration::from_micros(1_000),
+            Duration::from_micros(125),
+        );
+        let start = Instant::now();
+
+        for offset_us in [0, 200, 400] {
+            gate.observe_arrivals_at(start + Duration::from_micros(offset_us), 4);
+        }
+        assert_eq!(gate.effective_target(), 1);
+
+        for offset_us in [500, 600, 700] {
+            gate.observe_arrivals_at(start + Duration::from_micros(offset_us), 4);
+        }
+        assert_eq!(gate.effective_target(), 4);
+
+        for _ in 0..3 {
+            gate.observe_flush(4, Some(Duration::from_micros(300)), false);
+        }
+        assert_eq!(gate.effective_target(), 4);
+
+        for _ in 0..3 {
+            gate.observe_flush(4, Some(Duration::from_micros(700)), false);
+        }
+        assert_eq!(gate.effective_target(), 1);
+    }
+
+    #[test]
     fn adaptive_tun_write_gate_disables_after_repeated_slow_batches() {
-        let mut gate = TunWriteBatchGate::new(true, 4, Duration::from_micros(1_000));
+        let mut gate = TunWriteBatchGate::new(
+            true,
+            4,
+            Duration::from_micros(1_000),
+            Duration::from_micros(500),
+        );
         let start = Instant::now();
         for i in 0..3 {
             gate.observe_arrivals_at(start + Duration::from_micros(i * 100), 4);
@@ -1690,7 +1764,12 @@ mod tests {
 
     #[test]
     fn fixed_tun_write_gate_remains_enabled() {
-        let mut gate = TunWriteBatchGate::new(false, 4, Duration::from_micros(1_000));
+        let mut gate = TunWriteBatchGate::new(
+            false,
+            4,
+            Duration::from_micros(1_000),
+            Duration::from_micros(500),
+        );
         assert_eq!(gate.effective_target(), 4);
         gate.observe_flush(4, Some(Duration::from_micros(900)), true);
         assert_eq!(gate.effective_target(), 4);
