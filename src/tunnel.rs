@@ -467,10 +467,10 @@ async fn flush_quic_packets_profiled(
     udp_gso: bool,
     mut profile: Option<&mut FlowProfileCounters>,
 ) -> Result<()> {
-    if let Some(profile) = profile.as_deref_mut() {
-        if profile.enabled {
-            profile.flush_calls += 1;
-        }
+    if let Some(profile) = profile.as_deref_mut()
+        && profile.enabled
+    {
+        profile.flush_calls += 1;
     }
     loop {
         let first_cap = MAX_DATAGRAM_SIZE.min(out.len());
@@ -480,10 +480,10 @@ async fn flush_quic_packets_profiled(
             Err(e) => bail!("quic send error: {e}"),
         };
 
-        if let Some(profile) = profile.as_deref_mut() {
-            if profile.enabled {
-                profile.quic_send_packets += 1;
-            }
+        if let Some(profile) = profile.as_deref_mut()
+            && profile.enabled
+        {
+            profile.quic_send_packets += 1;
         }
         let segment_size = first_len;
         let mut total = first_len;
@@ -511,10 +511,10 @@ async fn flush_quic_packets_profiled(
 
                         total += write;
                         segments += 1;
-                        if let Some(profile) = profile.as_deref_mut() {
-                            if profile.enabled {
-                                profile.quic_send_packets += 1;
-                            }
+                        if let Some(profile) = profile.as_deref_mut()
+                            && profile.enabled
+                        {
+                            profile.quic_send_packets += 1;
                         }
                         if write < segment_size {
                             // UDP GSO permits the final segment to be shorter.
@@ -540,22 +540,22 @@ async fn flush_quic_packets_profiled(
             send_udp_gso(socket, &out[..total], segment_size, first_info.to)
                 .await
                 .map_err(|e| anyhow::anyhow!("UDP GSO send failed: {e}"))?;
-            if let Some(profile) = profile.as_deref_mut() {
-                if profile.enabled {
-                    profile.udp_send_syscalls += 1;
-                    profile.gso_super_buffers += 1;
-                    profile.gso_segments += segments;
-                }
+            if let Some(profile) = profile.as_deref_mut()
+                && profile.enabled
+            {
+                profile.udp_send_syscalls += 1;
+                profile.gso_super_buffers += 1;
+                profile.gso_segments += segments;
             }
         } else {
             socket
                 .send_to(&out[..first_len], first_info.to)
                 .await
                 .map_err(|e| anyhow::anyhow!("UDP send failed: {e}"))?;
-            if let Some(profile) = profile.as_deref_mut() {
-                if profile.enabled {
-                    profile.udp_send_syscalls += 1;
-                }
+            if let Some(profile) = profile.as_deref_mut()
+                && profile.enabled
+            {
+                profile.udp_send_syscalls += 1;
             }
         }
 
@@ -693,6 +693,7 @@ struct FlowProfileCounters {
     udp_send_syscalls: u64,
     gso_super_buffers: u64,
     gso_segments: u64,
+    deferred_quic_flushes: u64,
 }
 
 impl FlowProfileCounters {
@@ -725,7 +726,7 @@ impl FlowProfileCounters {
             return;
         }
         eprintln!(
-            "USQUE_DIAG flow udp_events={} udp_packets={} udp_batch_max={} udp_batch_1={} udp_batch_2_4={} udp_batch_5_8={} udp_batch_9_16={} udp_batch_17_32={} tun_events={} wake_events={} stats_events={} flush_calls={} quic_send_packets={} udp_send_syscalls={} gso_super_buffers={} gso_segments={}",
+            "USQUE_DIAG flow udp_events={} udp_packets={} udp_batch_max={} udp_batch_1={} udp_batch_2_4={} udp_batch_5_8={} udp_batch_9_16={} udp_batch_17_32={} tun_events={} wake_events={} stats_events={} flush_calls={} quic_send_packets={} udp_send_syscalls={} gso_super_buffers={} gso_segments={} deferred_quic_flushes={}",
             self.udp_events,
             self.udp_packets,
             self.udp_batch_max,
@@ -742,6 +743,7 @@ impl FlowProfileCounters {
             self.udp_send_syscalls,
             self.gso_super_buffers,
             self.gso_segments,
+            self.deferred_quic_flushes,
         );
     }
 }
@@ -1161,6 +1163,7 @@ struct ForwardRuntime {
     tune_tx_packets: u64,
     tune_process_cpu_ns: Option<u64>,
     tun_write: TunWriteState,
+    quic_flush_deferred: bool,
     flow_profile: FlowProfileCounters,
 }
 
@@ -1184,6 +1187,7 @@ impl ForwardRuntime {
             tune_tx_packets,
             tune_process_cpu_ns: process_cpu_time_ns(),
             tun_write,
+            quic_flush_deferred: false,
             flow_profile: FlowProfileCounters::new(),
         }
     }
@@ -1402,11 +1406,22 @@ fn handle_stats_event(session: &NativeSession, runtime: &mut ForwardRuntime) {
     runtime.stats.print(&session.quic.conn);
 }
 
+const fn should_defer_rx_quic_flush(
+    enabled: bool,
+    pure_rx_iteration: bool,
+    inbound_count: usize,
+    deadline_expired: bool,
+    connection_closed: bool,
+) -> bool {
+    enabled && pure_rx_iteration && inbound_count > 0 && !deadline_expired && !connection_closed
+}
+
 async fn finish_forward_iteration(
     session: &mut NativeSession,
     tun_dev: &tun_rs::AsyncDevice,
     runtime: &mut ForwardRuntime,
     pure_rx_iteration: bool,
+    defer_rx_quic_flush: bool,
 ) -> Result<bool> {
     drain_h3_events(&mut session.h3_conn, &mut session.quic.conn);
     let fallback_inbound = drain_inbound_datagrams(
@@ -1440,14 +1455,29 @@ async fn finish_forward_iteration(
         .await?;
     }
 
-    flush_quic_packets_profiled(
-        &mut session.quic.conn,
-        &session.quic.socket,
-        &mut session.quic.out,
-        session.quic.udp_gso,
-        Some(&mut runtime.flow_profile),
-    )
-    .await?;
+    let defer_flush = should_defer_rx_quic_flush(
+        defer_rx_quic_flush,
+        pure_rx_iteration,
+        runtime.tun_write.inbound_count,
+        runtime.tun_write.deadline_expired(Instant::now()),
+        session.quic.conn.is_closed(),
+    );
+    if defer_flush {
+        runtime.quic_flush_deferred = true;
+        if runtime.flow_profile.enabled {
+            runtime.flow_profile.deferred_quic_flushes += 1;
+        }
+    } else {
+        flush_quic_packets_profiled(
+            &mut session.quic.conn,
+            &session.quic.socket,
+            &mut session.quic.out,
+            session.quic.udp_gso,
+            Some(&mut runtime.flow_profile),
+        )
+        .await?;
+        runtime.quic_flush_deferred = false;
+    }
 
     if session.quic.conn.is_closed() {
         flush_inbound_batch(tun_dev, &mut runtime.buffers, &mut runtime.tun_write, false).await?;
@@ -1482,6 +1512,9 @@ async fn forward_native_session(
     );
 
     let tun_write = TunWriteState::new(adaptive, packet_target, max_delay, activation_span);
+    let defer_rx_quic_flush = std::env::var("USQUE_DEFER_RX_QUIC_FLUSH")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    log::info!("defer pure-RX QUIC flush while TUN batch is retained: {defer_rx_quic_flush}");
     let mut runtime = ForwardRuntime::new(flow_prefix, stats, mtu + 128, tun_write);
     runtime.stats_interval.tick().await;
 
@@ -1493,6 +1526,17 @@ async fn forward_native_session(
 
     loop {
         enforce_tun_write_deadline(tun_dev, &mut runtime).await?;
+        if runtime.quic_flush_deferred && runtime.tun_write.inbound_count == 0 {
+            flush_quic_packets_profiled(
+                &mut session.quic.conn,
+                &session.quic.socket,
+                &mut session.quic.out,
+                session.quic.udp_gso,
+                Some(&mut runtime.flow_profile),
+            )
+            .await?;
+            runtime.quic_flush_deferred = false;
+        }
         let tun_write_target = runtime.tun_write.effective_target();
         let event = next_forward_event(
             session,
@@ -1536,7 +1580,15 @@ async fn forward_native_session(
             }
         };
 
-        if finish_forward_iteration(session, tun_dev, &mut runtime, pure_rx_iteration).await? {
+        if finish_forward_iteration(
+            session,
+            tun_dev,
+            &mut runtime,
+            pure_rx_iteration,
+            defer_rx_quic_flush,
+        )
+        .await?
+        {
             return Ok(());
         }
     }
@@ -1739,6 +1791,16 @@ mod tests {
         assert!(inbound_packets.iter().all(Vec::is_empty));
         assert_eq!(stats.rx_packets, 0);
         assert_eq!(stats.rx_bytes, 0);
+    }
+
+    #[test]
+    fn rx_quic_flush_deferral_is_bounded_by_retained_tun_batch() {
+        assert!(should_defer_rx_quic_flush(true, true, 1, false, false));
+        assert!(!should_defer_rx_quic_flush(false, true, 1, false, false));
+        assert!(!should_defer_rx_quic_flush(true, false, 1, false, false));
+        assert!(!should_defer_rx_quic_flush(true, true, 0, false, false));
+        assert!(!should_defer_rx_quic_flush(true, true, 1, true, false));
+        assert!(!should_defer_rx_quic_flush(true, true, 1, false, true));
     }
 
     #[test]
