@@ -54,6 +54,8 @@ For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only on
 
 The proxy transport accepts the same WARP-side family controls as the native tunnel (`--ipv6`, `--no-tunnel-ipv4`, `--no-tunnel-ipv6`, `--connect-port`, `--sni-address`, `--keepalive-period`, and `--mtu`). Hostname targets use tunneled DNS and dual-stack connections use staggered IPv6/IPv4 connection attempts rather than waiting through a dead address family serially.
 
+DNS answers are kept in a small bounded positive cache with a conservative 30-second local lifetime. Concurrent misses for the same hostname are single-flight. The default resolver race uses unfiltered Cloudflare, Quad9, and Control D endpoints; repeat `--dns-server IP` to replace that set with explicitly selected resolvers. A lightweight WARP-side DNS `whoami.cloudflare` probe watches the public egress and invalidates the cache when the exit changes.
+
 After building the binary, `tests/proxy_smoke.sh` runs authenticated SOCKS5, SOCKS5h, HTTP-forwarding, and HTTPS-CONNECT checks against a real WARP config. Set `USQUE_BIN` if the binary is outside `target/debug/usque-rs`, and pass a config path readable by the account running the test.
 
 `--source-ip` pins the outer MASQUE UDP socket to a specific host address. It is a standalone transport option for deployments that need explicit source-address selection.
