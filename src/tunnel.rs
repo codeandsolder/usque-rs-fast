@@ -694,6 +694,9 @@ struct FlowProfileCounters {
     gso_super_buffers: u64,
     gso_segments: u64,
     deferred_quic_flushes: u64,
+    tun_drain_on_intervals: u64,
+    tun_drain_off_intervals: u64,
+    tun_drain_switches: u64,
 }
 
 impl FlowProfileCounters {
@@ -721,12 +724,26 @@ impl FlowProfileCounters {
         }
     }
 
+    const fn observe_tun_drain_interval(&mut self, enabled: bool, switched: bool) {
+        if !self.enabled {
+            return;
+        }
+        if enabled {
+            self.tun_drain_on_intervals += 1;
+        } else {
+            self.tun_drain_off_intervals += 1;
+        }
+        if switched {
+            self.tun_drain_switches += 1;
+        }
+    }
+
     fn print(&self) {
         if !self.enabled {
             return;
         }
         eprintln!(
-            "USQUE_DIAG flow udp_events={} udp_packets={} udp_batch_max={} udp_batch_1={} udp_batch_2_4={} udp_batch_5_8={} udp_batch_9_16={} udp_batch_17_32={} tun_events={} wake_events={} stats_events={} flush_calls={} quic_send_packets={} udp_send_syscalls={} gso_super_buffers={} gso_segments={} deferred_quic_flushes={}",
+            "USQUE_DIAG flow udp_events={} udp_packets={} udp_batch_max={} udp_batch_1={} udp_batch_2_4={} udp_batch_5_8={} udp_batch_9_16={} udp_batch_17_32={} tun_events={} wake_events={} stats_events={} flush_calls={} quic_send_packets={} udp_send_syscalls={} gso_super_buffers={} gso_segments={} deferred_quic_flushes={} tun_drain_on_intervals={} tun_drain_off_intervals={} tun_drain_switches={}",
             self.udp_events,
             self.udp_packets,
             self.udp_batch_max,
@@ -744,6 +761,9 @@ impl FlowProfileCounters {
             self.gso_super_buffers,
             self.gso_segments,
             self.deferred_quic_flushes,
+            self.tun_drain_on_intervals,
+            self.tun_drain_off_intervals,
+            self.tun_drain_switches,
         );
     }
 }
@@ -1159,6 +1179,7 @@ struct ForwardRuntime {
     buffers: ForwardBuffers,
     stats_interval: tokio::time::Interval,
     tun_ready_drain: bool,
+    tun_ready_drain_override: Option<bool>,
     tun_drain_tuner: TunDrainTuner,
     tune_tx_packets: u64,
     tune_process_cpu_ns: Option<u64>,
@@ -1173,6 +1194,7 @@ impl ForwardRuntime {
         stats: TunnelStats,
         buffer_size: usize,
         tun_write: TunWriteState,
+        tun_ready_drain_override: Option<bool>,
     ) -> Self {
         let tune_tx_packets = stats.tx_packets;
         let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
@@ -1182,7 +1204,8 @@ impl ForwardRuntime {
             stats,
             buffers: ForwardBuffers::new(buffer_size),
             stats_interval,
-            tun_ready_drain: false,
+            tun_ready_drain: tun_ready_drain_override.unwrap_or(false),
+            tun_ready_drain_override,
             tun_drain_tuner: TunDrainTuner::new(),
             tune_tx_packets,
             tune_process_cpu_ns: process_cpu_time_ns(),
@@ -1198,6 +1221,19 @@ enum ForwardEvent {
     Tun(usize),
     Wake,
     Stats,
+}
+
+fn tun_ready_drain_override() -> Option<bool> {
+    let value = std::env::var("USQUE_TUN_READY_DRAIN").ok()?;
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        "auto" | "" => None,
+        _ => {
+            log::warn!("ignoring invalid USQUE_TUN_READY_DRAIN={value:?}; expected auto/on/off");
+            None
+        }
+    }
 }
 
 fn tun_write_config() -> (usize, u64, Option<u64>, bool) {
@@ -1386,8 +1422,11 @@ async fn handle_tun_event(
 }
 
 fn handle_stats_event(session: &NativeSession, runtime: &mut ForwardRuntime) {
+    let previous_drain_mode = runtime.tun_ready_drain;
     let current_cpu_ns = process_cpu_time_ns();
-    if let (Some(previous_cpu_ns), Some(current_cpu_ns)) =
+    if let Some(fixed_mode) = runtime.tun_ready_drain_override {
+        runtime.tun_ready_drain = fixed_mode;
+    } else if let (Some(previous_cpu_ns), Some(current_cpu_ns)) =
         (runtime.tune_process_cpu_ns, current_cpu_ns)
     {
         let cpu_delta = current_cpu_ns.saturating_sub(previous_cpu_ns);
@@ -1400,6 +1439,10 @@ fn handle_stats_event(session: &NativeSession, runtime: &mut ForwardRuntime) {
                 .tun_drain_tuner
                 .observe(runtime.tun_ready_drain, cpu_delta, packet_delta);
     }
+    runtime.flow_profile.observe_tun_drain_interval(
+        previous_drain_mode,
+        runtime.tun_ready_drain != previous_drain_mode,
+    );
     runtime.tune_process_cpu_ns = current_cpu_ns;
     runtime.tune_tx_packets = runtime.stats.tx_packets;
     runtime.flow_profile.print();
@@ -1512,10 +1555,25 @@ async fn forward_native_session(
     );
 
     let tun_write = TunWriteState::new(adaptive, packet_target, max_delay, activation_span);
+    let tun_ready_drain_override = tun_ready_drain_override();
+    log::info!(
+        "TUN ready-drain mode: {}",
+        match tun_ready_drain_override {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "auto",
+        }
+    );
     let defer_rx_quic_flush = std::env::var("USQUE_DEFER_RX_QUIC_FLUSH")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     log::info!("defer pure-RX QUIC flush while TUN batch is retained: {defer_rx_quic_flush}");
-    let mut runtime = ForwardRuntime::new(flow_prefix, stats, mtu + 128, tun_write);
+    let mut runtime = ForwardRuntime::new(
+        flow_prefix,
+        stats,
+        mtu + 128,
+        tun_write,
+        tun_ready_drain_override,
+    );
     runtime.stats_interval.tick().await;
 
     let mut udp_recv_storage = vec![vec![0u8; MAX_DATAGRAM_SIZE]; UDP_RECV_BATCH_SIZE];
