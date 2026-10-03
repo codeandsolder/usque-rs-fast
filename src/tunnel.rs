@@ -460,12 +460,18 @@ fn try_stage_inbound_datagram(
     true
 }
 
-async fn flush_quic_packets(
+async fn flush_quic_packets_profiled(
     conn: &mut quiche::Connection,
     socket: &tokio::net::UdpSocket,
     out: &mut [u8],
     udp_gso: bool,
+    mut profile: Option<&mut FlowProfileCounters>,
 ) -> Result<()> {
+    if let Some(profile) = profile.as_deref_mut() {
+        if profile.enabled {
+            profile.flush_calls += 1;
+        }
+    }
     loop {
         let first_cap = MAX_DATAGRAM_SIZE.min(out.len());
         let (first_len, first_info) = match conn.send(&mut out[..first_cap]) {
@@ -474,8 +480,14 @@ async fn flush_quic_packets(
             Err(e) => bail!("quic send error: {e}"),
         };
 
+        if let Some(profile) = profile.as_deref_mut() {
+            if profile.enabled {
+                profile.quic_send_packets += 1;
+            }
+        }
         let segment_size = first_len;
         let mut total = first_len;
+        let mut segments = 1u64;
         let mut done = false;
 
         if udp_gso && segment_size > 0 {
@@ -498,6 +510,12 @@ async fn flush_quic_packets(
                         }
 
                         total += write;
+                        segments += 1;
+                        if let Some(profile) = profile.as_deref_mut() {
+                            if profile.enabled {
+                                profile.quic_send_packets += 1;
+                            }
+                        }
                         if write < segment_size {
                             // UDP GSO permits the final segment to be shorter.
                             break;
@@ -522,17 +540,38 @@ async fn flush_quic_packets(
             send_udp_gso(socket, &out[..total], segment_size, first_info.to)
                 .await
                 .map_err(|e| anyhow::anyhow!("UDP GSO send failed: {e}"))?;
+            if let Some(profile) = profile.as_deref_mut() {
+                if profile.enabled {
+                    profile.udp_send_syscalls += 1;
+                    profile.gso_super_buffers += 1;
+                    profile.gso_segments += segments;
+                }
+            }
         } else {
             socket
                 .send_to(&out[..first_len], first_info.to)
                 .await
                 .map_err(|e| anyhow::anyhow!("UDP send failed: {e}"))?;
+            if let Some(profile) = profile.as_deref_mut() {
+                if profile.enabled {
+                    profile.udp_send_syscalls += 1;
+                }
+            }
         }
 
         if done {
             return Ok(());
         }
     }
+}
+
+async fn flush_quic_packets(
+    conn: &mut quiche::Connection,
+    socket: &tokio::net::UdpSocket,
+    out: &mut [u8],
+    udp_gso: bool,
+) -> Result<()> {
+    flush_quic_packets_profiled(conn, socket, out, udp_gso, None).await
 }
 
 /// Run the MASQUE tunnel, reconnecting on-demand when traffic arrives.
@@ -632,6 +671,78 @@ impl ForwardBuffers {
                 .collect(),
             icmp_packet: vec![Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet_capacity)],
         }
+    }
+}
+
+#[derive(Default)]
+struct FlowProfileCounters {
+    enabled: bool,
+    udp_events: u64,
+    udp_packets: u64,
+    udp_batch_max: u64,
+    udp_batch_1: u64,
+    udp_batch_2_4: u64,
+    udp_batch_5_8: u64,
+    udp_batch_9_16: u64,
+    udp_batch_17_32: u64,
+    tun_events: u64,
+    wake_events: u64,
+    stats_events: u64,
+    flush_calls: u64,
+    quic_send_packets: u64,
+    udp_send_syscalls: u64,
+    gso_super_buffers: u64,
+    gso_segments: u64,
+}
+
+impl FlowProfileCounters {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("USQUE_PROFILE_FLOW").is_some(),
+            ..Self::default()
+        }
+    }
+
+    fn observe_udp_batch(&mut self, count: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.udp_events += 1;
+        self.udp_packets += count as u64;
+        self.udp_batch_max = self.udp_batch_max.max(count as u64);
+        match count {
+            0 => {}
+            1 => self.udp_batch_1 += 1,
+            2..=4 => self.udp_batch_2_4 += 1,
+            5..=8 => self.udp_batch_5_8 += 1,
+            9..=16 => self.udp_batch_9_16 += 1,
+            _ => self.udp_batch_17_32 += 1,
+        }
+    }
+
+    fn print(&self) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "USQUE_DIAG flow udp_events={} udp_packets={} udp_batch_max={} udp_batch_1={} udp_batch_2_4={} udp_batch_5_8={} udp_batch_9_16={} udp_batch_17_32={} tun_events={} wake_events={} stats_events={} flush_calls={} quic_send_packets={} udp_send_syscalls={} gso_super_buffers={} gso_segments={}",
+            self.udp_events,
+            self.udp_packets,
+            self.udp_batch_max,
+            self.udp_batch_1,
+            self.udp_batch_2_4,
+            self.udp_batch_5_8,
+            self.udp_batch_9_16,
+            self.udp_batch_17_32,
+            self.tun_events,
+            self.wake_events,
+            self.stats_events,
+            self.flush_calls,
+            self.quic_send_packets,
+            self.udp_send_syscalls,
+            self.gso_super_buffers,
+            self.gso_segments,
+        );
     }
 }
 
@@ -1050,6 +1161,7 @@ struct ForwardRuntime {
     tune_tx_packets: u64,
     tune_process_cpu_ns: Option<u64>,
     tun_write: TunWriteState,
+    flow_profile: FlowProfileCounters,
 }
 
 impl ForwardRuntime {
@@ -1072,6 +1184,7 @@ impl ForwardRuntime {
             tune_tx_packets,
             tune_process_cpu_ns: process_cpu_time_ns(),
             tun_write,
+            flow_profile: FlowProfileCounters::new(),
         }
     }
 }
@@ -1184,6 +1297,7 @@ fn handle_udp_event(
     runtime: &mut ForwardRuntime,
     tun_write_target: usize,
 ) {
+    runtime.flow_profile.observe_udp_batch(count);
     let ForwardRuntime {
         buffers,
         stats,
@@ -1284,6 +1398,7 @@ fn handle_stats_event(session: &NativeSession, runtime: &mut ForwardRuntime) {
     }
     runtime.tune_process_cpu_ns = current_cpu_ns;
     runtime.tune_tx_packets = runtime.stats.tx_packets;
+    runtime.flow_profile.print();
     runtime.stats.print(&session.quic.conn);
 }
 
@@ -1325,11 +1440,12 @@ async fn finish_forward_iteration(
         .await?;
     }
 
-    flush_quic_packets(
+    flush_quic_packets_profiled(
         &mut session.quic.conn,
         &session.quic.socket,
         &mut session.quic.out,
         session.quic.udp_gso,
+        Some(&mut runtime.flow_profile),
     )
     .await?;
 
@@ -1399,11 +1515,22 @@ async fn forward_native_session(
                 true
             }
             ForwardEvent::Tun(count) => {
+                if runtime.flow_profile.enabled {
+                    runtime.flow_profile.tun_events += 1;
+                }
                 handle_tun_event(session, tun_dev, &mut runtime, count).await?;
                 false
             }
-            ForwardEvent::Wake => false,
+            ForwardEvent::Wake => {
+                if runtime.flow_profile.enabled {
+                    runtime.flow_profile.wake_events += 1;
+                }
+                false
+            }
             ForwardEvent::Stats => {
+                if runtime.flow_profile.enabled {
+                    runtime.flow_profile.stats_events += 1;
+                }
                 handle_stats_event(session, &mut runtime);
                 false
             }
