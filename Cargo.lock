@@ -1703,7 +1703,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=f539155b38778b8e058710bc7f6f0e2e7dfb1df2#f539155b38778b8e058710bc7f6f0e2e7dfb1df2"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=78b6a8627e7b4b3f9667b10d1235757058f6d209#78b6a8627e7b4b3f9667b10d1235757058f6d209"
 
 [[package]]
 name = "oid-registry"
@@ -1912,7 +1912,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.30.0"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=f539155b38778b8e058710bc7f6f0e2e7dfb1df2#f539155b38778b8e058710bc7f6f0e2e7dfb1df2"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=78b6a8627e7b4b3f9667b10d1235757058f6d209#78b6a8627e7b4b3f9667b10d1235757058f6d209"
 dependencies = [
  "boring",
  "boring-sys",
