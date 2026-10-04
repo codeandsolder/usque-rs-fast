@@ -499,12 +499,12 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "datagram-socket"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e352260f0c4539a6380c32001b3ca4912aa7a038030478d70d74bcffe3b0fc95"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=f7917ac125db84df515dd64d48633f39139184c1#f7917ac125db84df515dd64d48633f39139184c1"
 dependencies = [
  "bytes",
  "futures-util",
  "libc",
+ "portable-atomic",
  "smallvec",
  "tokio",
 ]
