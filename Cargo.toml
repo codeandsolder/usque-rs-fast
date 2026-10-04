@@ -74,6 +74,9 @@ await_holding_lock = "deny"
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = "1.15"
+
 [patch.crates-io]
 quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f539155b38778b8e058710bc7f6f0e2e7dfb1df2" }
 octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f539155b38778b8e058710bc7f6f0e2e7dfb1df2" }

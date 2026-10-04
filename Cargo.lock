@@ -2829,6 +2829,7 @@ dependencies = [
  "nix 0.31.3",
  "octets",
  "p256",
+ "portable-atomic",
  "quiche",
  "quick_cache",
  "rcgen",
