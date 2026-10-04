@@ -499,12 +499,12 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "datagram-socket"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e352260f0c4539a6380c32001b3ca4912aa7a038030478d70d74bcffe3b0fc95"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=75520b4f9da689d5e7a6d03660c759c4a61ed4e0#75520b4f9da689d5e7a6d03660c759c4a61ed4e0"
 dependencies = [
  "bytes",
  "futures-util",
  "libc",
+ "portable-atomic",
  "smallvec",
  "tokio",
 ]
@@ -1703,7 +1703,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=f539155b38778b8e058710bc7f6f0e2e7dfb1df2#f539155b38778b8e058710bc7f6f0e2e7dfb1df2"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=78b6a8627e7b4b3f9667b10d1235757058f6d209#78b6a8627e7b4b3f9667b10d1235757058f6d209"
 
 [[package]]
 name = "oid-registry"
@@ -1912,7 +1912,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.30.0"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=f539155b38778b8e058710bc7f6f0e2e7dfb1df2#f539155b38778b8e058710bc7f6f0e2e7dfb1df2"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=78b6a8627e7b4b3f9667b10d1235757058f6d209#78b6a8627e7b4b3f9667b10d1235757058f6d209"
 dependencies = [
  "boring",
  "boring-sys",
@@ -2829,6 +2829,7 @@ dependencies = [
  "nix 0.31.3",
  "octets",
  "p256",
+ "portable-atomic",
  "quiche",
  "quick_cache",
  "rcgen",

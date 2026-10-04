@@ -1,6 +1,8 @@
 use crate::MasquePacketStream;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, future::poll_fn, stream::FuturesUnordered};
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use quick_cache::sync::Cache;
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
@@ -9,6 +11,8 @@ use smoltcp::{
     time::Instant as SmolInstant,
     wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address},
 };
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::VecDeque,
     io,
@@ -16,7 +20,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
