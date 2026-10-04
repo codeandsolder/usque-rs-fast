@@ -81,7 +81,7 @@ portable-atomic = "1.15"
 quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f539155b38778b8e058710bc7f6f0e2e7dfb1df2" }
 octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f539155b38778b8e058710bc7f6f0e2e7dfb1df2" }
 tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "2fbed52d52028f1851e558d05f66ba7c6560c401" }
-datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "f7917ac125db84df515dd64d48633f39139184c1" }
+datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "75520b4f9da689d5e7a6d03660c759c4a61ed4e0" }
 
 [profile.release]
 opt-level = 3
