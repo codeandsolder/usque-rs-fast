@@ -22,7 +22,7 @@ const fn ip_version(buf: &[u8]) -> u8 {
     buf[0] >> 4
 }
 
-/// Validate an IP packet and decrement TTL/Hop Limit in-place.
+/// Validate a packet being forwarded between links and decrement TTL/Hop Limit in-place.
 /// Returns the IP version (4 or 6) on success.
 ///
 /// # Errors
@@ -76,6 +76,20 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
         }
         v => Err(PacketError::UnknownVersion(v)),
     }
+}
+
+/// Validate a packet that is about to enter the CONNECT-IP tunnel.
+///
+/// This intentionally does not decrement TTL/Hop Limit. Locally generated
+/// packets are exempt from the CONNECT-IP forwarding decrement, and packets
+/// forwarded by the host kernel have already had their hop count adjusted.
+///
+/// # Errors
+///
+/// Returns `PacketError` when the packet is empty, malformed, or has an
+/// unknown IP version.
+pub fn validate_outgoing(buf: &[u8]) -> Result<u8, PacketError> {
+    validate_incoming(buf)
 }
 
 /// Validate an incoming IP packet (basic checks only).
@@ -183,6 +197,20 @@ mod tests {
             v = (v & 0xFFFF) + (v >> 16);
         }
         assert_eq!(low_u16(v), 0xFFFF);
+    }
+
+    #[test]
+    fn validate_outgoing_preserves_endpoint_generated_hop_counts() -> Result<(), PacketError> {
+        let mut ipv4 = make_ipv4(20);
+        ipv4[8] = 1;
+        assert_eq!(validate_outgoing(&ipv4)?, 4);
+        assert_eq!(ipv4[8], 1);
+
+        let mut ipv6 = make_ipv6(40);
+        ipv6[7] = 1;
+        assert_eq!(validate_outgoing(&ipv6)?, 6);
+        assert_eq!(ipv6[7], 1);
+        Ok(())
     }
 
     #[test]

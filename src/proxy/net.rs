@@ -4,6 +4,7 @@ use futures::{SinkExt, StreamExt, future::poll_fn, stream::FuturesUnordered};
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::AtomicU64;
 use quick_cache::sync::Cache;
+use ring::rand::SecureRandom;
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -390,7 +391,7 @@ impl VirtualNet {
 
         let mut device = PacketDevice::new(mtu);
         let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
-        iface_config.random_seed = seed();
+        iface_config.random_seed = secure_seed()?;
         let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
 
         let mut address_table_full = false;
@@ -909,7 +910,7 @@ async fn probe_warp_egress(shared: Arc<Shared>) -> io::Result<IpAddr> {
     };
 
     let socket = bind_udp_shared(shared)?;
-    let seed_bytes = seed().to_le_bytes();
+    let seed_bytes = secure_seed()?.to_le_bytes();
     let transaction_id = u16::from_le_bytes([seed_bytes[0], seed_bytes[1]]);
     let query = build_whoami_query(transaction_id);
     socket.send_to(&query, server).await?;
@@ -1418,12 +1419,12 @@ fn dns_cache_key(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
-fn seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    now.as_secs() ^ u64::from(now.subsec_nanos()) ^ u64::from(std::process::id())
+fn secure_seed() -> io::Result<u64> {
+    let mut seed = [0_u8; 8];
+    ring::rand::SystemRandom::new()
+        .fill(&mut seed)
+        .map_err(|_| io::Error::other("system RNG failed"))?;
+    Ok(u64::from_le_bytes(seed))
 }
 
 #[cfg(test)]

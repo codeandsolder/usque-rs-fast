@@ -163,36 +163,8 @@ mod pipeline {
         tmp[..len].to_vec()
     }
 
-    fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, String> {
-        if buf.is_empty() {
-            return Err("empty".into());
-        }
-        match buf[0] >> 4 {
-            4 => {
-                if buf.len() < IPV4_HEADER_LEN {
-                    return Err("too short".into());
-                }
-                let ttl = buf[8];
-                if ttl <= 1 {
-                    return Err("ttl expired".into());
-                }
-                buf[8] -= 1;
-                let cksum = ipv4_checksum(&buf[..IPV4_HEADER_LEN]);
-                buf[10..12].copy_from_slice(&cksum.to_be_bytes());
-                Ok(4)
-            }
-            6 => {
-                if buf.len() < IPV6_HEADER_LEN {
-                    return Err("too short".into());
-                }
-                if buf[7] <= 1 {
-                    return Err("hop limit expired".into());
-                }
-                buf[7] -= 1;
-                Ok(6)
-            }
-            v => Err(format!("unknown version: {v}")),
-        }
+    fn validate_outgoing(buf: &[u8]) -> Result<u8, String> {
+        validate_incoming(buf)
     }
 
     fn validate_incoming(buf: &[u8]) -> Result<u8, String> {
@@ -231,8 +203,8 @@ mod pipeline {
     }
 
     fn pipeline_ipv4(packet_size: u16, flow_id: u64) -> TestResult {
-        let mut pkt = make_ipv4_packet(packet_size, 64, [10, 0, 0, 1], [10, 0, 0, 2]);
-        let version = prepare_outgoing(&mut pkt).unwrap_or_default();
+        let pkt = make_ipv4_packet(packet_size, 64, [10, 0, 0, 1], [10, 0, 0, 2]);
+        let version = validate_outgoing(&pkt).unwrap_or_default();
 
         let flow_prefix = encode_varint(flow_id);
         let ctx_prefix = encode_varint(0);
@@ -251,8 +223,8 @@ mod pipeline {
     fn pipeline_ipv6(packet_size: u16, flow_id: u64) -> TestResult {
         let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
-        let mut pkt = make_ipv6_packet(packet_size, 64, src, dst);
-        let version = prepare_outgoing(&mut pkt).unwrap_or_default();
+        let pkt = make_ipv6_packet(packet_size, 64, src, dst);
+        let version = validate_outgoing(&pkt).unwrap_or_default();
 
         let flow_prefix = encode_varint(flow_id);
         let ctx_prefix = encode_varint(0);
@@ -272,7 +244,7 @@ mod pipeline {
     fn ipv4_576_outgoing_pipeline() {
         let r = pipeline_ipv4(576, 0);
         assert_eq!(r.version, 4);
-        assert_eq!(r.ttl_after, 63);
+        assert_eq!(r.ttl_after, 64);
         let payload = parse_datagram(&r.datagram, 0).unwrap_or_default();
         assert_eq!(payload.len(), 576);
         assert_eq!(validate_incoming(&payload).unwrap_or_default(), 4);
@@ -283,7 +255,7 @@ mod pipeline {
     fn ipv4_68_minimum_outgoing_pipeline() {
         let r = pipeline_ipv4(68, 0);
         assert_eq!(r.version, 4);
-        assert_eq!(r.ttl_after, 63);
+        assert_eq!(r.ttl_after, 64);
         let payload = parse_datagram(&r.datagram, 0).unwrap_or_default();
         assert_eq!(payload.len(), 68);
     }
@@ -291,7 +263,7 @@ mod pipeline {
     #[test]
     fn ipv4_1280_outgoing_pipeline() {
         let r = pipeline_ipv4(1280, 0);
-        assert_eq!(r.ttl_after, 63);
+        assert_eq!(r.ttl_after, 64);
         let payload = parse_datagram(&r.datagram, 0).unwrap_or_default();
         assert_eq!(payload.len(), 1280);
         assert!(verify_ipv4_checksum(&payload[..IPV4_HEADER_LEN]));
@@ -300,7 +272,7 @@ mod pipeline {
     #[test]
     fn ipv4_1500_outgoing_pipeline() {
         let r = pipeline_ipv4(1500, 0);
-        assert_eq!(r.ttl_after, 63);
+        assert_eq!(r.ttl_after, 64);
         let payload = parse_datagram(&r.datagram, 0).unwrap_or_default();
         assert_eq!(payload.len(), 1500);
     }
@@ -309,7 +281,7 @@ mod pipeline {
     fn ipv4_9000_jumbo_outgoing_pipeline() {
         let r = pipeline_ipv4(9000, 0);
         assert_eq!(r.version, 4);
-        assert_eq!(r.ttl_after, 63);
+        assert_eq!(r.ttl_after, 64);
         let payload = parse_datagram(&r.datagram, 0).unwrap_or_default();
         assert_eq!(payload.len(), 9000);
         assert!(verify_ipv4_checksum(&payload[..IPV4_HEADER_LEN]));
@@ -319,7 +291,7 @@ mod pipeline {
     fn ipv6_1280_minimum_outgoing_pipeline() {
         let r = pipeline_ipv6(1280, 0);
         assert_eq!(r.version, 6);
-        assert_eq!(r.ttl_after, 63);
+        assert_eq!(r.ttl_after, 64);
         let payload = parse_datagram(&r.datagram, 0).unwrap_or_default();
         assert_eq!(payload.len(), 1280);
     }
@@ -327,7 +299,7 @@ mod pipeline {
     #[test]
     fn ipv6_1500_outgoing_pipeline() {
         let r = pipeline_ipv6(1500, 0);
-        assert_eq!(r.ttl_after, 63);
+        assert_eq!(r.ttl_after, 64);
         let payload = parse_datagram(&r.datagram, 0).unwrap_or_default();
         assert_eq!(payload.len(), 1500);
     }
@@ -336,7 +308,7 @@ mod pipeline {
     fn ipv6_9000_jumbo_outgoing_pipeline() {
         let r = pipeline_ipv6(9000, 0);
         assert_eq!(r.version, 6);
-        assert_eq!(r.ttl_after, 63);
+        assert_eq!(r.ttl_after, 64);
         let payload = parse_datagram(&r.datagram, 0).unwrap_or_default();
         assert_eq!(payload.len(), 9000);
     }
@@ -346,7 +318,7 @@ mod pipeline {
         let r = pipeline_ipv4(100, 42);
         let payload = parse_datagram(&r.datagram, 42).unwrap_or_default();
         assert_eq!(validate_incoming(&payload).unwrap_or_default(), 4);
-        assert_eq!(payload[8], 63);
+        assert_eq!(payload[8], 64);
     }
 
     #[test]
@@ -361,7 +333,7 @@ mod pipeline {
         let r = pipeline_ipv6(100, 7);
         let payload = parse_datagram(&r.datagram, 7).unwrap_or_default();
         assert_eq!(validate_incoming(&payload).unwrap_or_default(), 6);
-        assert_eq!(payload[7], 63);
+        assert_eq!(payload[7], 64);
     }
 
     #[test]
@@ -378,17 +350,19 @@ mod pipeline {
     }
 
     #[test]
-    fn ttl_1_rejected() {
-        let mut pkt = make_ipv4_packet(100, 1, [10, 0, 0, 1], [10, 0, 0, 2]);
-        assert!(prepare_outgoing(&mut pkt).is_err());
+    fn ttl_1_is_preserved_for_endpoint_generated_packet() {
+        let pkt = make_ipv4_packet(100, 1, [10, 0, 0, 1], [10, 0, 0, 2]);
+        assert_eq!(validate_outgoing(&pkt).unwrap_or_default(), 4);
+        assert_eq!(pkt[8], 1);
     }
 
     #[test]
-    fn hop_limit_1_rejected() {
+    fn hop_limit_1_is_preserved_for_endpoint_generated_packet() {
         let src = [0; 16];
         let dst = [1; 16];
-        let mut pkt = make_ipv6_packet(100, 1, src, dst);
-        assert!(prepare_outgoing(&mut pkt).is_err());
+        let pkt = make_ipv6_packet(100, 1, src, dst);
+        assert_eq!(validate_outgoing(&pkt).unwrap_or_default(), 6);
+        assert_eq!(pkt[7], 1);
     }
 
     #[test]
