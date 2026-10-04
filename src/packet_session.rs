@@ -151,22 +151,17 @@ impl MasquePacketStream {
 
         flush_conn_send(&socket, &mut conn, &mut out).await?;
 
-        match tokio::time::timeout(
-            CONNECTION_SETUP_TIMEOUT,
-            complete_handshake(
-                &socket,
-                &mut conn,
-                &mut out,
-                &mut buf,
-                local_addr,
-                session_cfg.endpoint,
-            ),
+        if let Some(outcome) = complete_handshake(
+            &socket,
+            &mut conn,
+            &mut out,
+            &mut buf,
+            local_addr,
+            session_cfg.endpoint,
         )
         .await
         {
-            Ok(Some(outcome)) => return Err(anyhow::anyhow!(outcome.into_message())),
-            Ok(None) => {}
-            Err(_) => bail!("timed out during QUIC handshake"),
+            return Err(anyhow::anyhow!(outcome.into_message()));
         }
 
         let peer_cert = conn
@@ -187,26 +182,21 @@ impl MasquePacketStream {
 
         flush_conn_send(&socket, &mut conn, &mut out).await?;
 
-        match tokio::time::timeout(
-            CONNECTION_SETUP_TIMEOUT,
-            wait_for_connect_response(
-                &socket,
-                &mut conn,
-                &mut h3_conn,
-                &mut out,
-                &mut buf,
-                DatagramPath {
-                    local_addr,
-                    endpoint: session_cfg.endpoint,
-                },
-                stream_id,
-            ),
+        if let Some(outcome) = wait_for_connect_response(
+            &socket,
+            &mut conn,
+            &mut h3_conn,
+            &mut out,
+            &mut buf,
+            DatagramPath {
+                local_addr,
+                endpoint: session_cfg.endpoint,
+            },
+            stream_id,
         )
         .await
         {
-            Ok(Some(outcome)) => return Err(anyhow::anyhow!(outcome.into_message())),
-            Ok(None) => {}
-            Err(_) => bail!("timed out waiting for CONNECT response"),
+            return Err(anyhow::anyhow!(outcome.into_message()));
         }
 
         let mut stream = Self {
@@ -652,10 +642,18 @@ async fn complete_handshake(
     local_addr: SocketAddr,
     endpoint: SocketAddr,
 ) -> Option<SessionLoopOutcome> {
+    let deadline = Instant::now() + CONNECTION_SETUP_TIMEOUT;
+
     loop {
         let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
 
         tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                return Some(SessionLoopOutcome::Reconnect(
+                    "timed out during QUIC handshake".to_string(),
+                ));
+            }
             result = socket.recv(buf) => {
                 match result {
                     Ok(len) => {
@@ -701,12 +699,19 @@ async fn wait_for_connect_response(
     path: DatagramPath,
     stream_id: u64,
 ) -> Option<SessionLoopOutcome> {
+    let deadline = Instant::now() + CONNECTION_SETUP_TIMEOUT;
     let mut connect_established = false;
 
     loop {
         let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
 
         tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                return Some(SessionLoopOutcome::Reconnect(
+                    "timed out waiting for CONNECT response".to_string(),
+                ));
+            }
             result = socket.recv(buf) => {
                 match result {
                     Ok(len) => {

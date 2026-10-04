@@ -709,12 +709,7 @@ async fn open_native_quic(config: &Config, tunnel_cfg: &TunnelConfig) -> Result<
         udp_gso,
     };
     flush_quic_packets(&mut quic.conn, &quic.socket, &mut quic.out, false).await?;
-    tokio::time::timeout(
-        CONNECTION_SETUP_TIMEOUT,
-        complete_native_handshake(&mut quic),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out during QUIC handshake"))??;
+    complete_native_handshake(&mut quic).await?;
 
     let peer_cert = quic
         .conn
@@ -728,10 +723,16 @@ async fn open_native_quic(config: &Config, tunnel_cfg: &TunnelConfig) -> Result<
 }
 
 async fn complete_native_handshake(quic: &mut NativeQuic) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + CONNECTION_SETUP_TIMEOUT;
+
     loop {
         let timeout = quic.conn.timeout().unwrap_or(Duration::from_millis(100));
 
         tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                bail!("timed out during QUIC handshake");
+            }
             result = quic.socket.recv(&mut quic.buf) => {
                 let len = result?;
                 let recv_info = quiche::RecvInfo {
@@ -783,12 +784,7 @@ async fn establish_connect_ip(mut quic: NativeQuic) -> Result<NativeSession> {
     log::debug!("CONNECT request sent on stream {stream_id}, flow_id={flow_id}");
 
     flush_quic_packets(&mut quic.conn, &quic.socket, &mut quic.out, false).await?;
-    tokio::time::timeout(
-        CONNECTION_SETUP_TIMEOUT,
-        wait_for_connect_response(&mut quic, &mut h3_conn, stream_id),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out waiting for CONNECT response"))??;
+    wait_for_connect_response(&mut quic, &mut h3_conn, stream_id).await?;
 
     Ok(NativeSession {
         quic,
@@ -802,10 +798,16 @@ async fn wait_for_connect_response(
     h3_conn: &mut quiche::h3::Connection,
     stream_id: u64,
 ) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + CONNECTION_SETUP_TIMEOUT;
+
     loop {
         let timeout = quic.conn.timeout().unwrap_or(Duration::from_millis(100));
 
         tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                bail!("timed out waiting for CONNECT response");
+            }
             result = quic.socket.recv(&mut quic.buf) => {
                 let len = result?;
                 let recv_info = quiche::RecvInfo {
