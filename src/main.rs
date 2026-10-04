@@ -213,7 +213,10 @@ async fn cmd_register(
     device_name: Option<String>,
     jwt: Option<String>,
 ) -> Result<()> {
-    if config::Config::load_async(config_path).await.is_ok() {
+    if std::path::Path::new(config_path)
+        .try_exists()
+        .with_context(|| format!("failed to inspect config path {config_path}"))?
+    {
         let response = tokio::task::spawn_blocking(|| {
             eprint!("Config already exists. Overwrite? (y/n): ");
             let mut response = String::new();

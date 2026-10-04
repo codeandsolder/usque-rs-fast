@@ -19,6 +19,7 @@ use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone)]
@@ -150,17 +151,22 @@ impl MasquePacketStream {
 
         flush_conn_send(&socket, &mut conn, &mut out).await?;
 
-        if let Some(outcome) = complete_handshake(
-            &socket,
-            &mut conn,
-            &mut out,
-            &mut buf,
-            local_addr,
-            session_cfg.endpoint,
+        match tokio::time::timeout(
+            CONNECTION_SETUP_TIMEOUT,
+            complete_handshake(
+                &socket,
+                &mut conn,
+                &mut out,
+                &mut buf,
+                local_addr,
+                session_cfg.endpoint,
+            ),
         )
         .await
         {
-            return Err(anyhow::anyhow!(outcome.into_message()));
+            Ok(Some(outcome)) => return Err(anyhow::anyhow!(outcome.into_message())),
+            Ok(None) => {}
+            Err(_) => bail!("timed out during QUIC handshake"),
         }
 
         let peer_cert = conn
@@ -181,21 +187,26 @@ impl MasquePacketStream {
 
         flush_conn_send(&socket, &mut conn, &mut out).await?;
 
-        if let Some(outcome) = wait_for_connect_response(
-            &socket,
-            &mut conn,
-            &mut h3_conn,
-            &mut out,
-            &mut buf,
-            DatagramPath {
-                local_addr,
-                endpoint: session_cfg.endpoint,
-            },
-            stream_id,
+        match tokio::time::timeout(
+            CONNECTION_SETUP_TIMEOUT,
+            wait_for_connect_response(
+                &socket,
+                &mut conn,
+                &mut h3_conn,
+                &mut out,
+                &mut buf,
+                DatagramPath {
+                    local_addr,
+                    endpoint: session_cfg.endpoint,
+                },
+                stream_id,
+            ),
         )
         .await
         {
-            return Err(anyhow::anyhow!(outcome.into_message()));
+            Ok(Some(outcome)) => return Err(anyhow::anyhow!(outcome.into_message())),
+            Ok(None) => {}
+            Err(_) => bail!("timed out waiting for CONNECT response"),
         }
 
         let mut stream = Self {
@@ -692,7 +703,7 @@ async fn wait_for_connect_response(
 ) -> Option<SessionLoopOutcome> {
     let mut connect_established = false;
 
-    for _ in 0..100 {
+    loop {
         let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
 
         tokio::select! {
@@ -756,10 +767,6 @@ async fn wait_for_connect_response(
             ));
         }
     }
-
-    Some(SessionLoopOutcome::Reconnect(
-        "timed out waiting for CONNECT response".to_string(),
-    ))
 }
 
 async fn flush_conn_send(

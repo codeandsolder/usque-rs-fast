@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 
@@ -75,40 +75,34 @@ impl Config {
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
 
-        let mut tmp_name = path
-            .file_name()
-            .map_or_else(|| "config.json".into(), std::ffi::OsStr::to_os_string);
-        tmp_name.push(".tmp");
-        let tmp = path.with_file_name(tmp_name);
-
-        let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-
-        let mut file = options
-            .open(&tmp)
-            .with_context(|| format!("failed to open temporary config {}", tmp.display()))?;
+        let mut file = tempfile::Builder::new()
+            .prefix(".usque-config-")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!("failed to create temporary config in {}", parent.display())
+            })?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
+            file.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))
                 .with_context(|| {
-                    format!("failed to secure config permissions for {}", tmp.display())
+                    format!(
+                        "failed to secure temporary config permissions in {}",
+                        parent.display()
+                    )
                 })?;
         }
 
         file.write_all(json.as_bytes())
-            .with_context(|| format!("failed to write config to {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to sync config {}", tmp.display()))?;
-        drop(file);
+            .with_context(|| format!("failed to write config for {}", path.display()))?;
+        file.as_file()
+            .sync_all()
+            .with_context(|| format!("failed to sync config for {}", path.display()))?;
 
-        fs::rename(&tmp, path)
+        file.persist(path)
+            .map_err(|error| error.error)
             .with_context(|| format!("failed to atomically replace config {}", path.display()))?;
 
         #[cfg(unix)]
@@ -147,18 +141,23 @@ impl Config {
             .peers
             .first()
             .context("registration response contained no WARP peers")?;
-        let ep_v4 = peer.endpoint.v4.trim_end_matches(":0").to_string();
-        let ep_v6 = peer.endpoint.v6.clone();
-        let ep_v6 = ep_v6
-            .trim_start_matches('[')
-            .trim_end_matches("]:0")
-            .trim_end_matches(":0")
-            .to_string();
+        let ep_v4 = parse_endpoint_ip(&peer.endpoint.v4)
+            .with_context(|| format!("invalid IPv4 WARP endpoint {:?}", peer.endpoint.v4))?;
+        anyhow::ensure!(
+            ep_v4.is_ipv4(),
+            "IPv4 WARP endpoint resolved to an IPv6 address: {ep_v4}"
+        );
+        let ep_v6 = parse_endpoint_ip(&peer.endpoint.v6)
+            .with_context(|| format!("invalid IPv6 WARP endpoint {:?}", peer.endpoint.v6))?;
+        anyhow::ensure!(
+            ep_v6.is_ipv6(),
+            "IPv6 WARP endpoint resolved to an IPv4 address: {ep_v6}"
+        );
 
         Ok(Self {
             private_key: base64::engine::general_purpose::STANDARD.encode(priv_key_der),
-            endpoint_v4: ep_v4,
-            endpoint_v6: ep_v6,
+            endpoint_v4: ep_v4.to_string(),
+            endpoint_v6: ep_v6.to_string(),
             endpoint_pub_key: peer.public_key.clone(),
             license: account.account.license.clone().unwrap_or_default(),
             id: account.id.clone(),
@@ -193,6 +192,18 @@ impl Config {
         spki.to_der()
             .context("failed to encode endpoint public key as SPKI DER")
     }
+}
+
+fn parse_endpoint_ip(endpoint: &str) -> Result<std::net::IpAddr> {
+    if let Ok(ip) = endpoint.parse::<std::net::IpAddr>() {
+        return Ok(ip);
+    }
+    endpoint
+        .parse::<std::net::SocketAddr>()
+        .map(|address| address.ip())
+        .with_context(|| {
+            format!("endpoint is not an IP address or IP socket address: {endpoint:?}")
+        })
 }
 
 #[cfg(test)]
@@ -308,6 +319,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn save_ignores_preexisting_fixed_temp_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.json");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"leave-me-alone")?;
+        symlink(&victim, dir.path().join("config.json.tmp"))?;
+
+        let cfg = Config {
+            private_key: "secret-key".to_string(),
+            endpoint_v4: "192.0.2.1".to_string(),
+            endpoint_v6: "2001:db8::1".to_string(),
+            endpoint_pub_key: "public-key".to_string(),
+            license: String::new(),
+            id: "id".to_string(),
+            access_token: "secret-token".to_string(),
+            ipv4: "172.16.0.2".to_string(),
+            ipv6: "2606:4700:110::2".to_string(),
+        };
+
+        cfg.save(&path)?;
+        assert_eq!(fs::read(&victim)?, b"leave-me-alone");
+        assert_eq!(Config::load(&path)?.access_token, "secret-token");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn load_repairs_permissive_permissions() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -346,5 +386,27 @@ mod tests {
         assert_eq!(cfg.endpoint_v4, "192.0.2.1");
         assert_eq!(cfg.endpoint_v6, "2001:db8::1");
         Ok(())
+    }
+
+    #[test]
+    fn endpoint_parser_does_not_strip_ipv6_hextets_that_end_in_zero() -> Result<()> {
+        assert_eq!(parse_endpoint_ip("2001:db8::0")?.to_string(), "2001:db8::");
+        assert_eq!(
+            parse_endpoint_ip("[2001:db8::10]:0")?.to_string(),
+            "2001:db8::10"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_endpoint_is_rejected_during_registration_conversion() {
+        let peer = Peer {
+            public_key: "public-key".to_string(),
+            endpoint: Endpoint {
+                v4: "not-an-ip:0".to_string(),
+                v6: "[2001:db8::1]:0".to_string(),
+            },
+        };
+        assert!(Config::from_account_data(&account_data(vec![peer]), "token", b"key").is_err());
     }
 }

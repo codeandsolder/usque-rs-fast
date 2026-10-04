@@ -15,6 +15,7 @@ use crate::tls;
 use crate::udp_socket::{bind_udp_socket, detect_udp_gso, send_udp_gso};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const TUN_READY_DRAIN_MAX_READS: usize = 8;
 const TUN_DRAIN_INITIAL_SAMPLES_PER_MODE: u8 = 3;
@@ -708,7 +709,12 @@ async fn open_native_quic(config: &Config, tunnel_cfg: &TunnelConfig) -> Result<
         udp_gso,
     };
     flush_quic_packets(&mut quic.conn, &quic.socket, &mut quic.out, false).await?;
-    complete_native_handshake(&mut quic).await?;
+    tokio::time::timeout(
+        CONNECTION_SETUP_TIMEOUT,
+        complete_native_handshake(&mut quic),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out during QUIC handshake"))??;
 
     let peer_cert = quic
         .conn
@@ -777,7 +783,12 @@ async fn establish_connect_ip(mut quic: NativeQuic) -> Result<NativeSession> {
     log::debug!("CONNECT request sent on stream {stream_id}, flow_id={flow_id}");
 
     flush_quic_packets(&mut quic.conn, &quic.socket, &mut quic.out, false).await?;
-    wait_for_connect_response(&mut quic, &mut h3_conn, stream_id).await?;
+    tokio::time::timeout(
+        CONNECTION_SETUP_TIMEOUT,
+        wait_for_connect_response(&mut quic, &mut h3_conn, stream_id),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for CONNECT response"))??;
 
     Ok(NativeSession {
         quic,
@@ -791,7 +802,7 @@ async fn wait_for_connect_response(
     h3_conn: &mut quiche::h3::Connection,
     stream_id: u64,
 ) -> Result<()> {
-    for _ in 0..100 {
+    loop {
         let timeout = quic.conn.timeout().unwrap_or(Duration::from_millis(100));
 
         tokio::select! {
@@ -819,8 +830,6 @@ async fn wait_for_connect_response(
             bail!("connection closed before CONNECT response");
         }
     }
-
-    bail!("timed out waiting for CONNECT response")
 }
 
 fn connect_response_ready(
