@@ -16,6 +16,7 @@ use crate::udp_socket::{bind_udp_socket, detect_udp_gso, send_udp_gso};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const H3_BODY_DRAIN_SIZE: usize = 4096;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const TUN_READY_DRAIN_MAX_READS: usize = 8;
 const TUN_DRAIN_INITIAL_SAMPLES_PER_MODE: u8 = 3;
@@ -609,6 +610,7 @@ struct NativeQuic {
 struct NativeSession {
     quic: NativeQuic,
     h3_conn: quiche::h3::Connection,
+    connect_stream_id: u64,
     flow_id: u64,
 }
 
@@ -789,6 +791,7 @@ async fn establish_connect_ip(mut quic: NativeQuic) -> Result<NativeSession> {
     Ok(NativeSession {
         quic,
         h3_conn,
+        connect_stream_id: stream_id,
         flow_id,
     })
 }
@@ -841,7 +844,7 @@ fn connect_response_ready(
 ) -> Result<bool> {
     loop {
         match h3_conn.poll(conn) {
-            Ok((response_stream_id, quiche::h3::Event::Headers { list, .. }))
+            Ok((response_stream_id, quiche::h3::Event::Headers { list, more_frames }))
                 if response_stream_id == stream_id =>
             {
                 for header in &list {
@@ -849,11 +852,25 @@ fn connect_response_ready(
                         let status = std::str::from_utf8(header.value()).unwrap_or("?");
                         log::debug!("CONNECT response status: {status}");
                         if status.starts_with('2') {
+                            if !more_frames {
+                                bail!("CONNECT response closed the request stream");
+                            }
                             return Ok(true);
                         }
                         bail!("CONNECT rejected with status {status}");
                     }
                 }
+            }
+            Ok((event_stream_id, quiche::h3::Event::Data)) => {
+                drain_h3_body(h3_conn, conn, event_stream_id)?;
+            }
+            Ok((event_stream_id, quiche::h3::Event::Finished)) if event_stream_id == stream_id => {
+                bail!("CONNECT request stream closed before tunnel use");
+            }
+            Ok((event_stream_id, quiche::h3::Event::Reset(error_code)))
+                if event_stream_id == stream_id =>
+            {
+                bail!("CONNECT request stream reset by peer: {error_code}");
             }
             Ok(_) => {}
             Err(quiche::h3::Error::Done) => return Ok(false),
@@ -880,8 +897,8 @@ fn queue_pending_packets(
     pending_packets: &mut VecDeque<Vec<u8>>,
     stats: &mut TunnelStats,
 ) -> Result<()> {
-    while let Some(mut packet) = pending_packets.pop_front() {
-        if packet::prepare_outgoing(&mut packet).is_err() {
+    while let Some(packet) = pending_packets.pop_front() {
+        if packet::validate_outgoing(&packet).is_err() {
             continue;
         }
 
@@ -909,7 +926,7 @@ async fn forward_tun_batch(
     for index in 0..count {
         let packet_len = buffers.tun_sizes[index];
         let packet = &mut buffers.tun_packets[index][..packet_len];
-        if let Err(error) = packet::prepare_outgoing(packet) {
+        if let Err(error) = packet::validate_outgoing(packet) {
             stats.dropped += 1;
             log::trace!("dropping outgoing packet: {error}");
             continue;
@@ -945,15 +962,43 @@ async fn forward_tun_batch(
     Ok(())
 }
 
-fn drain_h3_events(h3_conn: &mut quiche::h3::Connection, conn: &mut quiche::Connection) {
+fn drain_h3_events(
+    h3_conn: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    connect_stream_id: u64,
+) -> Result<()> {
     loop {
         match h3_conn.poll(conn) {
-            Ok(_) => {}
-            Err(quiche::h3::Error::Done) => break,
-            Err(error) => {
-                log::warn!("h3 poll error: {error}");
-                break;
+            Ok((stream_id, quiche::h3::Event::Data)) => {
+                drain_h3_body(h3_conn, conn, stream_id)?;
             }
+            Ok((stream_id, quiche::h3::Event::Finished)) if stream_id == connect_stream_id => {
+                bail!("CONNECT request stream closed by peer");
+            }
+            Ok((stream_id, quiche::h3::Event::Reset(error_code)))
+                if stream_id == connect_stream_id =>
+            {
+                bail!("CONNECT request stream reset by peer: {error_code}");
+            }
+            Ok(_) => {}
+            Err(quiche::h3::Error::Done) => return Ok(()),
+            Err(error) => bail!("h3 poll error: {error}"),
+        }
+    }
+}
+
+fn drain_h3_body(
+    h3_conn: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+) -> Result<()> {
+    let mut body = [0_u8; H3_BODY_DRAIN_SIZE];
+
+    loop {
+        match h3_conn.recv_body(conn, stream_id, &mut body) {
+            Ok(0) | Err(quiche::h3::Error::Done) => return Ok(()),
+            Ok(read) => log::trace!("discarded {read} HTTP/3 capsule bytes on stream {stream_id}"),
+            Err(error) => bail!("HTTP/3 body receive failed on stream {stream_id}: {error}"),
         }
     }
 }
@@ -1304,7 +1349,11 @@ async fn finish_forward_iteration(
     runtime: &mut ForwardRuntime,
     pure_rx_iteration: bool,
 ) -> Result<bool> {
-    drain_h3_events(&mut session.h3_conn, &mut session.quic.conn);
+    drain_h3_events(
+        &mut session.h3_conn,
+        &mut session.quic.conn,
+        session.connect_stream_id,
+    )?;
     let fallback_inbound = drain_inbound_datagrams(
         &mut session.quic.conn,
         tun_dev,

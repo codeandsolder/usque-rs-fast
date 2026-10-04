@@ -21,6 +21,7 @@ use crate::udp_socket::bind_udp_socket;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+const H3_BODY_DRAIN_SIZE: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct PacketSessionConfig {
@@ -65,6 +66,8 @@ pub struct MasquePacketStream {
     socket: tokio::net::UdpSocket,
     conn: quiche::Connection,
     h3_conn: quiche::h3::Connection,
+    connect_stream_id: u64,
+    flow_id: u64,
     flow_prefix: Vec<u8>,
     outbound_queue: VecDeque<Bytes>,
     inbound_queue: VecDeque<Bytes>,
@@ -203,6 +206,8 @@ impl MasquePacketStream {
             socket,
             conn,
             h3_conn,
+            connect_stream_id: stream_id,
+            flow_id,
             flow_prefix: build_flow_prefix(flow_id)?,
             outbound_queue: VecDeque::new(),
             inbound_queue: VecDeque::new(),
@@ -438,6 +443,26 @@ impl MasquePacketStream {
 
         loop {
             match self.h3_conn.poll(&mut self.conn) {
+                Ok((stream_id, quiche::h3::Event::Data)) => {
+                    progressed = true;
+                    drain_h3_body(&mut self.h3_conn, &mut self.conn, stream_id)?;
+                }
+                Ok((stream_id, quiche::h3::Event::Finished))
+                    if stream_id == self.connect_stream_id =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "CONNECT request stream closed by peer",
+                    ));
+                }
+                Ok((stream_id, quiche::h3::Event::Reset(error_code)))
+                    if stream_id == self.connect_stream_id =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("CONNECT request stream reset by peer: {error_code}"),
+                    ));
+                }
                 Ok(_) => progressed = true,
                 Err(quiche::h3::Error::Done) => return Ok(progressed),
                 Err(error) => return Err(io::Error::other(format!("h3 poll error: {error}"))),
@@ -456,7 +481,7 @@ impl MasquePacketStream {
             match self.conn.dgram_recv_buf() {
                 Ok(dgram) => {
                     progressed = true;
-                    if let Some(offset) = parse_datagram_offset(&dgram, 0) {
+                    if let Some(offset) = parse_datagram_offset(&dgram, self.flow_id) {
                         let dgram = Bytes::from(dgram);
                         let packet = dgram.slice(offset..);
                         if packet::validate_incoming(packet.as_ref()).is_ok() {
@@ -733,12 +758,17 @@ async fn wait_for_connect_response(
 
         loop {
             match h3_conn.poll(conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
+                Ok((sid, quiche::h3::Event::Headers { list, more_frames })) if sid == stream_id => {
                     for header in &list {
                         if header.name() == b":status" {
                             let status = std::str::from_utf8(header.value()).unwrap_or("?");
                             if status.starts_with('2') {
                                 connect_established = true;
+                                if !more_frames {
+                                    return Some(SessionLoopOutcome::Reconnect(
+                                        "CONNECT response closed the request stream".to_string(),
+                                    ));
+                                }
                             } else {
                                 return Some(SessionLoopOutcome::Reconnect(format!(
                                     "CONNECT rejected with status {status}"
@@ -746,6 +776,23 @@ async fn wait_for_connect_response(
                             }
                         }
                     }
+                }
+                Ok((sid, quiche::h3::Event::Data)) => {
+                    if let Err(error) = drain_h3_body(h3_conn, conn, sid) {
+                        return Some(SessionLoopOutcome::Reconnect(format!(
+                            "failed to drain HTTP/3 body: {error}"
+                        )));
+                    }
+                }
+                Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
+                    return Some(SessionLoopOutcome::Reconnect(
+                        "CONNECT request stream closed before tunnel use".to_string(),
+                    ));
+                }
+                Ok((sid, quiche::h3::Event::Reset(error_code))) if sid == stream_id => {
+                    return Some(SessionLoopOutcome::Reconnect(format!(
+                        "CONNECT request stream reset by peer: {error_code}"
+                    )));
                 }
                 Ok(_) => {}
                 Err(quiche::h3::Error::Done) => break,
@@ -770,6 +817,26 @@ async fn wait_for_connect_response(
             return Some(SessionLoopOutcome::Reconnect(
                 "connection closed before CONNECT response".to_string(),
             ));
+        }
+    }
+}
+
+fn drain_h3_body(
+    h3_conn: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+) -> io::Result<()> {
+    let mut body = [0_u8; H3_BODY_DRAIN_SIZE];
+
+    loop {
+        match h3_conn.recv_body(conn, stream_id, &mut body) {
+            Ok(0) | Err(quiche::h3::Error::Done) => return Ok(()),
+            Ok(read) => log::trace!("discarded {read} HTTP/3 body bytes on stream {stream_id}"),
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "HTTP/3 body receive failed on stream {stream_id}: {error}"
+                )));
+            }
         }
     }
 }
@@ -822,14 +889,11 @@ fn flush_pending_queue(
 }
 
 fn build_flow_datagram(flow_prefix: &[u8], packet: &[u8]) -> Option<Vec<u8>> {
+    packet::validate_outgoing(packet).ok()?;
     let mut dgram = Vec::with_capacity(flow_prefix.len() + packet.len());
     dgram.extend_from_slice(flow_prefix);
     dgram.extend_from_slice(packet);
-    if packet::prepare_outgoing(&mut dgram[flow_prefix.len()..]).is_ok() {
-        Some(dgram)
-    } else {
-        None
-    }
+    Some(dgram)
 }
 
 fn build_flow_prefix(flow_id: u64) -> Result<Vec<u8>> {
@@ -893,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn build_flow_datagram_prepares_ttl() -> Result<()> {
+    fn build_flow_datagram_preserves_endpoint_generated_ttl() -> Result<()> {
         let flow_prefix = build_flow_prefix(0)?;
         let packet = Bytes::from_static(&[
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 64, 0x11, 0x00, 0x00, 10, 0, 0, 1, 10,
@@ -901,7 +965,7 @@ mod tests {
         ]);
         let datagram = build_flow_datagram(&flow_prefix, &packet)
             .ok_or_else(|| anyhow::anyhow!("test packet should produce a flow datagram"))?;
-        assert_eq!(datagram[flow_prefix.len() + 8], 63);
+        assert_eq!(datagram[flow_prefix.len() + 8], 64);
         Ok(())
     }
 }
