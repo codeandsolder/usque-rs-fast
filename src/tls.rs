@@ -9,6 +9,7 @@ use tempfile::NamedTempFile;
 
 use crate::config::Config;
 
+#[cfg(feature = "tun")]
 pub(crate) const DGRAM_QUEUE_LEN: usize = 1000;
 
 /// Holds temporary PEM files for quiche TLS config and the pinned endpoint key.
