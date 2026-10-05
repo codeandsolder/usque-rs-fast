@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use crate::register::AccountData;
+use crate::account::AccountData;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -209,7 +209,7 @@ fn parse_endpoint_ip(endpoint: &str) -> Result<std::net::IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::register::{Account, Addresses, Endpoint, Interface, Peer, WarpConfig};
+    use crate::account::{Account, Addresses, Endpoint, Interface, Peer, WarpConfig};
 
     fn account_data(peers: Vec<Peer>) -> AccountData {
         AccountData {

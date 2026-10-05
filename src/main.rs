@@ -32,6 +32,7 @@ use std::net::IpAddr;
     feature = "socks5-proxy"
 ))]
 use std::time::Duration;
+use usque_rs::config;
 #[cfg(any(
     feature = "http-proxy",
     feature = "https-proxy",
@@ -42,7 +43,8 @@ use usque_rs::l4::{L4Client, L4Config};
 use usque_rs::proxy::http::{self as http_proxy, HttpConfig};
 #[cfg(feature = "socks5-proxy")]
 use usque_rs::proxy::socks::{self, SocksConfig};
-use usque_rs::{config, register};
+#[cfg(feature = "register")]
+use usque_rs::register;
 #[cfg(feature = "tun")]
 use usque_rs::{tun_device, tunnel};
 
@@ -100,6 +102,7 @@ struct NativeTunOptions {
 #[derive(Subcommand)]
 enum Commands {
     /// Register a new client and enroll a device key.
+    #[cfg(feature = "register")]
     Register {
         #[arg(short, long, default_value = "en_US")]
         locale: String,
@@ -189,6 +192,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        #[cfg(feature = "register")]
         Commands::Register {
             locale,
             model,
@@ -256,6 +260,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[cfg(feature = "register")]
 async fn cmd_register(
     config_path: &str,
     locale: &str,

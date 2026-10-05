@@ -9,6 +9,7 @@
     )
 )]
 
+pub mod account;
 pub mod config;
 #[cfg(feature = "tun")]
 pub mod icmp;
@@ -26,6 +27,7 @@ pub mod packet;
     feature = "socks5-proxy"
 ))]
 pub mod proxy;
+#[cfg(feature = "register")]
 pub mod register;
 pub mod tls;
 #[cfg(feature = "tun")]
