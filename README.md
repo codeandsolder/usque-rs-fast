@@ -10,7 +10,7 @@ Read [SETUP_NOTES.md](SETUP_NOTES.md) for my use-case.
 
 ## Cargo features
 
-The default build enables all four application capabilities. They can also be compiled independently:
+The default build enables all four runtime capabilities plus the registration command. The runtime capabilities can also be compiled independently, without registration-only HTTP/TLS dependencies:
 
 ```sh
 # Native TUN only
@@ -24,9 +24,12 @@ cargo build --release --no-default-features --features https-proxy
 
 # TCP-only SOCKS5/SOCKS5h proxy only
 cargo build --release --no-default-features --features socks5-proxy
+
+# Registration/enrollment utility only
+cargo build --release --no-default-features --features register
 ```
 
-Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile Hyper or the SOCKS frontend. Registration/configuration support remains available in every build.
+Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends, Hyper, or reqwest; a SOCKS5-only build likewise avoids Hyper and reqwest. Saved-config parsing remains available to every runtime build. The `register` feature is separate and is included in the default feature set for backwards compatibility.
 
 ## Proxy modes
 

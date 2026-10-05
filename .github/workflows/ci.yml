@@ -92,6 +92,7 @@ jobs:
         run: |
           cargo check --all-targets --no-default-features
           for features in \
+            register \
             tun \
             http-proxy \
             https-proxy \
@@ -115,7 +116,7 @@ jobs:
         sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go perl pkg-config clang libclang-dev nasm
         cargo +1.99.0 test --all-features
         cargo +1.99.0 check --all-targets --no-default-features
-        for features in tun http-proxy https-proxy socks5-proxy http-proxy,https-proxy,socks5-proxy; do
+        for features in register tun http-proxy https-proxy socks5-proxy http-proxy,https-proxy,socks5-proxy; do
           cargo +1.99.0 check --all-targets --no-default-features --features "$features"
         done
       rust-toolchain: "1.99.0"
