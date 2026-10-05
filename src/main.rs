@@ -104,6 +104,17 @@ struct NativeTunOptions {
     interface_name: Option<String>,
 }
 
+#[cfg(feature = "https-proxy")]
+struct HttpsProxyOptions {
+    bind: IpAddr,
+    port: u16,
+    tls_cert: String,
+    tls_key: String,
+    username: Option<String>,
+    password: Option<String>,
+    transport: L4TransportArgs,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Register a new client and enroll a device key.
@@ -287,13 +298,15 @@ async fn main() -> Result<()> {
             } => {
                 cmd_https_proxy(
                     &cli.config,
-                    bind,
-                    port,
-                    tls_cert,
-                    tls_key,
-                    username,
-                    password,
-                    &transport,
+                    HttpsProxyOptions {
+                        bind,
+                        port,
+                        tls_cert,
+                        tls_key,
+                        username,
+                        password,
+                        transport,
+                    },
                 )
                 .await
             }
@@ -473,18 +486,18 @@ async fn cmd_http_proxy(
 }
 
 #[cfg(feature = "https-proxy")]
-async fn cmd_https_proxy(
-    config_path: &str,
-    bind: IpAddr,
-    port: u16,
-    tls_cert: String,
-    tls_key: String,
-    username: Option<String>,
-    password: Option<String>,
-    transport: &L4TransportArgs,
-) -> Result<()> {
+async fn cmd_https_proxy(config_path: &str, options: HttpsProxyOptions) -> Result<()> {
+    let HttpsProxyOptions {
+        bind,
+        port,
+        tls_cert,
+        tls_key,
+        username,
+        password,
+        transport,
+    } = options;
     validate_auth_pair(username.as_deref(), password.as_deref())?;
-    let l4 = create_l4(config_path, transport).await?;
+    let l4 = create_l4(config_path, &transport).await?;
     http_proxy::serve_tls(
         HttpConfig {
             bind: std::net::SocketAddr::new(bind, port),
