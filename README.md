@@ -82,7 +82,11 @@ Since my router is a literal **hot potato**, I wanted to get this working with z
 
 ## Performance
 
-Still needs to be measured properly, but it is able to max out my 150 Mbit/s residential downstream and 30 Mbit/s upstream network on a `Cudy WR3000P v1` with some Mediatek 1.3 GHz Dual-Core Cortex-A53 CPU with a load avg of 0.4 during the speedtest. That is good enough for my goals. And memory usage was optimized for as less copies as possible.
+Performance is measured with a two-tier end-to-end CONNECT-IP harness rather than process CPU alone. The primary metric is raw host-wide CPU seconds per steady inner-L3 Gbit, with separate low-end MT7621 and high-end EPYC targets, calibrated 8-second steady windows, quality/saturation gates, and pinned-stack A/B comparisons across usque, quiche, and tun-rs.
+
+See [Performance benchmarking](docs/BENCHMARKING.md) for the complete methodology, calibration, profiler workflow, representative results, negative results, and the mistakes future benchmark work should avoid.
+
+As a separate field datapoint, the project has also saturated a 150 Mbit/s downstream / 30 Mbit/s upstream residential link on a `Cudy WR3000P v1` (MediaTek dual-core Cortex-A53). That observation is not used as controlled benchmark evidence.
 
 ## Release binaries
 
