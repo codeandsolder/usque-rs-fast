@@ -222,7 +222,7 @@ impl L4Client {
             driver_config,
             initial_session,
             command_rx,
-            command_tx.clone(),
+            command_tx.downgrade(),
         ));
 
         let dns_servers = if l4.dns_servers.is_empty() {
@@ -479,7 +479,7 @@ impl Session {
     async fn run(
         &mut self,
         command_rx: &mut mpsc::Receiver<Command>,
-        command_tx: &mpsc::Sender<Command>,
+        command_tx: &mpsc::WeakSender<Command>,
     ) -> Result<()> {
         loop {
             let now = Instant::now();
@@ -623,7 +623,7 @@ impl Session {
         }
     }
 
-    fn process_h3_events(&mut self, command_tx: &mpsc::Sender<Command>) -> Result<()> {
+    fn process_h3_events(&mut self, command_tx: &mpsc::WeakSender<Command>) -> Result<()> {
         loop {
             match self.h3.poll(&mut self.conn) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, more_frames })) => {
@@ -637,8 +637,20 @@ impl Session {
                     match status {
                         Some(code) if code < 200 => {}
                         Some(code) if (200..300).contains(&code) && more_frames => {
+                            let Some(bridge_tx) = command_tx.upgrade() else {
+                                fail_opening(
+                                    state,
+                                    io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "L4 client stopped before CONNECT completed",
+                                    ),
+                                );
+                                state.receive_state = ReceiveState::Finished;
+                                state.send_state = SendState::Finished;
+                                continue;
+                            };
                             let (application, bridge) = tokio::io::duplex(STREAM_BRIDGE_BYTES);
-                            spawn_stream_bridge(stream_id, bridge, command_tx.clone());
+                            spawn_stream_bridge(stream_id, bridge, bridge_tx);
                             if let Some(reply) = state.mark_open() {
                                 let _ = reply.send(Ok(application));
                             }
@@ -883,7 +895,7 @@ async fn run_driver(
     config: Arc<DriverConfig>,
     mut session: Session,
     mut command_rx: mpsc::Receiver<Command>,
-    command_tx: mpsc::Sender<Command>,
+    command_tx: mpsc::WeakSender<Command>,
 ) {
     loop {
         match session.run(&mut command_rx, &command_tx).await {
