@@ -25,10 +25,10 @@ jobs:
       - name: Verify maintenance detector syntax
         run: python3 -m py_compile .github/scripts/*.py
 
-      - name: Install Rust 1.98.1
+      - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           components: rustfmt
 
       - name: Check formatting
@@ -49,10 +49,10 @@ jobs:
             cmake ninja-build golang-go perl \
             pkg-config clang libclang-dev nasm
 
-      - name: Install Rust 1.98.1
+      - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           components: clippy
 
       - name: Cache Rust artifacts
@@ -77,10 +77,10 @@ jobs:
             cmake ninja-build golang-go perl \
             pkg-config clang libclang-dev nasm
 
-      - name: Install Rust 1.98.1
+      - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -100,8 +100,8 @@ jobs:
       command: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go perl pkg-config clang libclang-dev nasm
-        cargo +1.98.1 test --all
-      rust-toolchain: "1.98.1"
+        cargo +1.99.0 test --all
+      rust-toolchain: "1.99.0"
       rustflags: "-C target-cpu=x86-64-v2"
 
   msrv:
@@ -148,10 +148,10 @@ jobs:
             cmake ninja-build golang-go perl \
             pkg-config clang libclang-dev nasm
 
-      - name: Install Rust 1.98.1
+      - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

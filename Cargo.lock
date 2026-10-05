@@ -2758,7 +2758,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tun-rs"
 version = "2.8.11"
-source = "git+https://github.com/codeandsolder/tun-rs-fast.git?rev=dc18992d56360e16f6769b6baeb5cca6fd1c3e41#dc18992d56360e16f6769b6baeb5cca6fd1c3e41"
+source = "git+https://github.com/codeandsolder/tun-rs-fast.git?rev=302d6bc98f491e9ca3a6113919cbc6f9c23c7b3f#302d6bc98f491e9ca3a6113919cbc6f9c23c7b3f"
 dependencies = [
  "ahash",
  "blocking",
