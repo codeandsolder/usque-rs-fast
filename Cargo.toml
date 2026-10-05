@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["tun", "http-proxy", "https-proxy", "socks5-proxy"]
-tun = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:datagram-socket", "dep:futures", "dep:octets", "dep:rtnetlink", "dep:tun-rs"]
+tun = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:thiserror", "dep:datagram-socket", "dep:futures", "dep:octets", "dep:rtnetlink", "dep:tun-rs"]
 http-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util"]
 https-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/http1", "hyper/server", "dep:hyper-util"]
 socks5-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:fast-socks5"]
@@ -34,7 +34,7 @@ base64 = "0.23"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
-thiserror = "2"
+thiserror = { version = "2", optional = true }
 rcgen = "0.14"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pem", "std"] }
 x509-cert = { version = "0.3", default-features = false, features = ["pem"] }

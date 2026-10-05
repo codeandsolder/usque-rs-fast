@@ -3,15 +3,15 @@ use anyhow::Result;
 use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
-#[cfg(feature = "http-proxy")]
-use hyper::client::conn::http1 as client_http1;
 use hyper::{
-    Method, Request, Response, StatusCode, Uri,
+    Method, Request, Response, StatusCode,
     body::Incoming,
-    header::{CONNECTION, HOST, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
+    header::{HOST, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
     server::conn::http1 as server_http1,
     service::service_fn,
 };
+#[cfg(feature = "http-proxy")]
+use hyper::{Uri, client::conn::http1 as client_http1, header::CONNECTION};
 use hyper_util::rt::TokioIo;
 use std::{convert::Infallible, error::Error, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;

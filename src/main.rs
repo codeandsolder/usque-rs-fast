@@ -464,7 +464,14 @@ fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    )
+))]
 mod tests {
     use super::*;
     use clap::Parser;

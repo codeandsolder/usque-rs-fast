@@ -96,17 +96,75 @@ struct PendingWrite {
     reply: oneshot::Sender<io::Result<()>>,
 }
 
+enum OpenState {
+    Opening {
+        reply: oneshot::Sender<io::Result<DuplexStream>>,
+        deadline: Instant,
+    },
+    Open,
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiveState {
+    Idle,
+    Readable,
+    Finished,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendState {
+    Open,
+    FinishRequested,
+    Finished,
+}
+
 struct StreamState {
     authority: String,
-    open_reply: Option<oneshot::Sender<io::Result<DuplexStream>>>,
+    open_state: OpenState,
     pending_read: Option<oneshot::Sender<io::Result<Option<Vec<u8>>>>>,
     pending_write: Option<PendingWrite>,
-    readable: bool,
-    remote_finished: bool,
-    local_finish_requested: bool,
-    local_finished: bool,
-    opened: bool,
-    open_deadline: Instant,
+    receive_state: ReceiveState,
+    send_state: SendState,
+}
+
+impl StreamState {
+    const fn is_opening(&self) -> bool {
+        matches!(self.open_state, OpenState::Opening { .. })
+    }
+
+    const fn is_open(&self) -> bool {
+        matches!(self.open_state, OpenState::Open)
+    }
+
+    const fn open_deadline(&self) -> Option<Instant> {
+        match self.open_state {
+            OpenState::Opening { deadline, .. } => Some(deadline),
+            OpenState::Open | OpenState::Failed => None,
+        }
+    }
+
+    fn mark_open(&mut self) -> Option<oneshot::Sender<io::Result<DuplexStream>>> {
+        match std::mem::replace(&mut self.open_state, OpenState::Failed) {
+            OpenState::Opening { reply, .. } => {
+                self.open_state = OpenState::Open;
+                Some(reply)
+            }
+            OpenState::Open => {
+                self.open_state = OpenState::Open;
+                None
+            }
+            OpenState::Failed => None,
+        }
+    }
+
+    fn is_receive_finished(&self) -> bool {
+        self.receive_state == ReceiveState::Finished
+    }
+
+    fn is_send_finished(&self) -> bool {
+        self.send_state == SendState::Finished
+    }
 }
 
 struct Session {
@@ -140,7 +198,7 @@ impl L4Client {
             config.endpoint_v4.parse()?
         };
         let endpoint = SocketAddr::new(endpoint_ip, l4.connect_port);
-        let bind_ip = l4.source_ip.unwrap_or_else(|| match endpoint_ip {
+        let bind_ip = l4.source_ip.unwrap_or(match endpoint_ip {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         });
@@ -184,11 +242,19 @@ impl L4Client {
     }
 
     /// Dial an IP endpoint directly over an HTTP/3 CONNECT stream.
+    ///
+    /// # Errors
+    /// Returns an error if the shared L4 session is unavailable or the CONNECT
+    /// stream cannot be established.
     pub async fn dial_addr(&self, address: SocketAddr) -> io::Result<DuplexStream> {
         self.open(authority_for(address)).await
     }
 
     /// Resolve a hostname through DNS-over-TCP over WARP, then dial it over L4.
+    ///
+    /// # Errors
+    /// Returns an error if tunneled DNS fails, no address is returned, or the
+    /// resulting L4 CONNECT stream cannot be established.
     pub async fn dial_host(&self, host: &str, port: u16) -> io::Result<DuplexStream> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return self.dial_addr(SocketAddr::new(ip, port)).await;
@@ -240,7 +306,7 @@ impl L4Client {
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => last_error = Some(error),
                 Err(error) => {
-                    last_error = Some(io::Error::other(format!("DNS query task failed: {error}")))
+                    last_error = Some(io::Error::other(format!("DNS query task failed: {error}")));
                 }
             }
         }
@@ -258,14 +324,16 @@ impl L4Client {
             .dns_cache
             .lock()
             .map_err(|_| io::Error::other("DNS cache lock poisoned"))?;
-        let Some(entry) = cache.get(host).copied() else {
-            return Ok(None);
+        let cached = match cache.get(host).copied() {
+            Some(entry) if entry.expires_at > StdInstant::now() => Some(entry.address),
+            Some(_) => {
+                cache.remove(host);
+                None
+            }
+            None => None,
         };
-        if entry.expires_at > StdInstant::now() {
-            return Ok(Some(entry.address));
-        }
-        cache.remove(host);
-        Ok(None)
+        drop(cache);
+        Ok(cached)
     }
 
     fn cache(&self, host: &str, address: IpAddr, ttl: Duration) -> io::Result<()> {
@@ -286,6 +354,7 @@ impl L4Client {
                 expires_at: StdInstant::now() + ttl.max(Duration::from_secs(1)),
             },
         );
+        drop(cache);
         Ok(())
     }
 
@@ -411,7 +480,7 @@ impl Session {
         &mut self,
         command_rx: &mut mpsc::Receiver<Command>,
         command_tx: &mpsc::Sender<Command>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         loop {
             let now = Instant::now();
             let quic_deadline = self.conn.timeout().map(|timeout| now + timeout);
@@ -421,8 +490,7 @@ impl Session {
             if let Some(open_deadline) = self
                 .streams
                 .values()
-                .filter(|state| !state.opened)
-                .map(|state| state.open_deadline)
+                .filter_map(StreamState::open_deadline)
                 .min()
             {
                 wake_at = wake_at.min(open_deadline);
@@ -431,8 +499,8 @@ impl Session {
             tokio::select! {
                 biased;
                 command = command_rx.recv() => {
-                    let Some(command) = command else { return Ok(false); };
-                    self.handle_command(command)?;
+                    let Some(command) = command else { return Ok(()); };
+                    self.handle_command(command);
                 }
                 received = self.socket.recv(&mut self.recv) => {
                     let len = received.context("L4 UDP receive failed")?;
@@ -456,7 +524,7 @@ impl Session {
 
             self.process_h3_events(command_tx)?;
             self.expire_connects();
-            self.progress_streams()?;
+            self.progress_streams();
             flush_conn_send(&self.socket, &mut self.conn, &mut self.out).await?;
             self.prune_finished();
 
@@ -466,7 +534,7 @@ impl Session {
         }
     }
 
-    fn handle_command(&mut self, command: Command) -> Result<()> {
+    fn handle_command(&mut self, command: Command) {
         match command {
             Command::Open { authority, reply } => {
                 // RFC 9114 basic CONNECT carries only :method and :authority.
@@ -483,15 +551,14 @@ impl Session {
                             stream_id,
                             StreamState {
                                 authority,
-                                open_reply: Some(reply),
+                                open_state: OpenState::Opening {
+                                    reply,
+                                    deadline: Instant::now() + STREAM_CONNECT_TIMEOUT,
+                                },
                                 pending_read: None,
                                 pending_write: None,
-                                readable: false,
-                                remote_finished: false,
-                                local_finish_requested: false,
-                                local_finished: false,
-                                opened: false,
-                                open_deadline: Instant::now() + STREAM_CONNECT_TIMEOUT,
+                                receive_state: ReceiveState::Idle,
+                                send_state: SendState::Open,
                             },
                         );
                     }
@@ -512,9 +579,9 @@ impl Session {
                         io::ErrorKind::BrokenPipe,
                         "L4 stream is closed",
                     )));
-                    return Ok(());
+                    return;
                 };
-                if state.pending_write.is_some() || state.local_finish_requested {
+                if state.pending_write.is_some() || state.send_state != SendState::Open {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         "L4 stream already has a pending write",
@@ -528,8 +595,10 @@ impl Session {
                 }
             }
             Command::Finish { stream_id } => {
-                if let Some(state) = self.streams.get_mut(&stream_id) {
-                    state.local_finish_requested = true;
+                if let Some(state) = self.streams.get_mut(&stream_id)
+                    && state.send_state != SendState::Finished
+                {
+                    state.send_state = SendState::FinishRequested;
                 }
             }
             Command::Read { stream_id, reply } => {
@@ -538,9 +607,9 @@ impl Session {
                         io::ErrorKind::BrokenPipe,
                         "L4 stream is closed",
                     )));
-                    return Ok(());
+                    return;
                 };
-                if state.remote_finished {
+                if state.is_receive_finished() {
                     let _ = reply.send(Ok(None));
                 } else if state.pending_read.is_some() {
                     let _ = reply.send(Err(io::Error::new(
@@ -552,7 +621,6 @@ impl Session {
                 }
             }
         }
-        Ok(())
     }
 
     fn process_h3_events(&mut self, command_tx: &mpsc::Sender<Command>) -> Result<()> {
@@ -563,15 +631,15 @@ impl Session {
                     let Some(state) = self.streams.get_mut(&stream_id) else {
                         continue;
                     };
-                    if state.opened {
+                    if !state.is_opening() {
                         continue;
                     }
                     match status {
+                        Some(code) if code < 200 => {}
                         Some(code) if (200..300).contains(&code) && more_frames => {
-                            state.opened = true;
                             let (application, bridge) = tokio::io::duplex(STREAM_BRIDGE_BYTES);
                             spawn_stream_bridge(stream_id, bridge, command_tx.clone());
-                            if let Some(reply) = state.open_reply.take() {
+                            if let Some(reply) = state.mark_open() {
                                 let _ = reply.send(Ok(application));
                             }
                             log::debug!(
@@ -579,26 +647,37 @@ impl Session {
                                 state.authority
                             );
                         }
+                        Some(code) if (200..300).contains(&code) => {
+                            fail_opening(
+                                state,
+                                io::Error::new(
+                                    io::ErrorKind::ConnectionReset,
+                                    "CONNECT response closed the request stream",
+                                ),
+                            );
+                            state.receive_state = ReceiveState::Finished;
+                            state.send_state = SendState::Finished;
+                        }
                         Some(code) => {
-                            fail_open(
+                            fail_opening(
                                 state,
                                 io::Error::other(format!("CONNECT rejected with status {code}")),
                             );
-                            state.remote_finished = true;
-                            state.local_finished = true;
+                            state.receive_state = ReceiveState::Finished;
+                            state.send_state = SendState::Finished;
                         }
                         None => {}
                     }
                 }
                 Ok((stream_id, quiche::h3::Event::Data)) => {
                     if let Some(state) = self.streams.get_mut(&stream_id) {
-                        state.readable = true;
+                        state.receive_state = ReceiveState::Readable;
                     }
                 }
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     if let Some(state) = self.streams.get_mut(&stream_id) {
-                        if !state.opened {
-                            fail_open(
+                        if !state.is_open() {
+                            fail_opening(
                                 state,
                                 io::Error::new(
                                     io::ErrorKind::ConnectionReset,
@@ -606,7 +685,7 @@ impl Session {
                                 ),
                             );
                         }
-                        state.remote_finished = true;
+                        state.receive_state = ReceiveState::Finished;
                         if let Some(reply) = state.pending_read.take() {
                             let _ = reply.send(Ok(None));
                         }
@@ -616,13 +695,13 @@ impl Session {
                     if let Some(state) = self.streams.get_mut(&stream_id) {
                         fail_stream(
                             state,
-                            io::Error::new(
+                            &io::Error::new(
                                 io::ErrorKind::ConnectionReset,
                                 format!("L4 stream reset by peer: {code}"),
                             ),
                         );
-                        state.remote_finished = true;
-                        state.local_finished = true;
+                        state.receive_state = ReceiveState::Finished;
+                        state.send_state = SendState::Finished;
                     }
                 }
                 Ok((_stream_id, quiche::h3::Event::PriorityUpdate | quiche::h3::Event::GoAway)) => {
@@ -640,18 +719,21 @@ impl Session {
             .streams
             .iter()
             .filter_map(|(&stream_id, state)| {
-                (!state.opened && now >= state.open_deadline).then_some(stream_id)
+                state
+                    .open_deadline()
+                    .is_some_and(|deadline| now >= deadline)
+                    .then_some(stream_id)
             })
             .collect::<Vec<_>>();
         let error_code = quiche::h3::WireErrorCode::RequestCancelled as u64;
         for stream_id in expired {
             if let Some(state) = self.streams.get_mut(&stream_id) {
-                fail_open(
+                fail_opening(
                     state,
                     io::Error::new(io::ErrorKind::TimedOut, "L4 CONNECT timed out"),
                 );
-                state.local_finished = true;
-                state.remote_finished = true;
+                state.send_state = SendState::Finished;
+                state.receive_state = ReceiveState::Finished;
             }
             let _ = self
                 .conn
@@ -662,29 +744,30 @@ impl Session {
         }
     }
 
-    fn progress_streams(&mut self) -> Result<()> {
+    fn progress_streams(&mut self) {
         let ids = self.streams.keys().copied().collect::<Vec<_>>();
         for stream_id in ids {
-            self.progress_read(stream_id)?;
-            self.progress_write(stream_id)?;
-            self.progress_finish(stream_id)?;
+            self.progress_read(stream_id);
+            self.progress_write(stream_id);
+            self.progress_finish(stream_id);
         }
-        Ok(())
     }
 
-    fn progress_read(&mut self, stream_id: u64) -> Result<()> {
+    fn progress_read(&mut self, stream_id: u64) {
         let should_read = self.streams.get(&stream_id).is_some_and(|state| {
-            state.opened && state.readable && state.pending_read.is_some() && !state.remote_finished
+            state.is_open()
+                && state.receive_state == ReceiveState::Readable
+                && state.pending_read.is_some()
         });
         if !should_read {
-            return Ok(());
+            return;
         }
 
         let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
         match self.h3.recv_body(&mut self.conn, stream_id, &mut buffer) {
             Ok(0) | Err(quiche::h3::Error::Done) => {
                 if let Some(state) = self.streams.get_mut(&stream_id) {
-                    state.readable = false;
+                    state.receive_state = ReceiveState::Idle;
                 }
             }
             Ok(read) => {
@@ -699,23 +782,22 @@ impl Session {
                 if let Some(state) = self.streams.get_mut(&stream_id) {
                     fail_stream(
                         state,
-                        io::Error::other(format!("L4 stream read failed: {error}")),
+                        &io::Error::other(format!("L4 stream read failed: {error}")),
                     );
-                    state.remote_finished = true;
-                    state.local_finished = true;
+                    state.receive_state = ReceiveState::Finished;
+                    state.send_state = SendState::Finished;
                 }
             }
         }
-        Ok(())
     }
 
-    fn progress_write(&mut self, stream_id: u64) -> Result<()> {
+    fn progress_write(&mut self, stream_id: u64) {
         let pending = self
             .streams
             .get_mut(&stream_id)
             .and_then(|state| state.pending_write.take());
         let Some(mut pending) = pending else {
-            return Ok(());
+            return;
         };
         match self.h3.send_body(
             &mut self.conn,
@@ -741,28 +823,26 @@ impl Session {
                     "L4 stream write failed: {error}"
                 ))));
                 if let Some(state) = self.streams.get_mut(&stream_id) {
-                    state.remote_finished = true;
-                    state.local_finished = true;
+                    state.receive_state = ReceiveState::Finished;
+                    state.send_state = SendState::Finished;
                 }
             }
         }
-        Ok(())
     }
 
-    fn progress_finish(&mut self, stream_id: u64) -> Result<()> {
+    fn progress_finish(&mut self, stream_id: u64) {
         let should_finish = self.streams.get(&stream_id).is_some_and(|state| {
-            state.opened
-                && state.local_finish_requested
-                && !state.local_finished
+            state.is_open()
+                && state.send_state == SendState::FinishRequested
                 && state.pending_write.is_none()
         });
         if !should_finish {
-            return Ok(());
+            return;
         }
         match self.h3.send_body(&mut self.conn, stream_id, &[], true) {
             Ok(_) => {
                 if let Some(state) = self.streams.get_mut(&stream_id) {
-                    state.local_finished = true;
+                    state.send_state = SendState::Finished;
                 }
             }
             Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {}
@@ -770,29 +850,28 @@ impl Session {
                 if let Some(state) = self.streams.get_mut(&stream_id) {
                     fail_stream(
                         state,
-                        io::Error::other(format!("L4 stream finish failed: {error}")),
+                        &io::Error::other(format!("L4 stream finish failed: {error}")),
                     );
-                    state.local_finished = true;
-                    state.remote_finished = true;
+                    state.send_state = SendState::Finished;
+                    state.receive_state = ReceiveState::Finished;
                 }
             }
         }
-        Ok(())
     }
 
     fn prune_finished(&mut self) {
         self.streams
-            .retain(|_, state| !(state.local_finished && state.remote_finished));
+            .retain(|_, state| !(state.is_send_finished() && state.is_receive_finished()));
     }
 
     fn fail_all(&mut self, message: &str) {
         for state in self.streams.values_mut() {
             fail_stream(
                 state,
-                io::Error::new(io::ErrorKind::ConnectionReset, message.to_owned()),
+                &io::Error::new(io::ErrorKind::ConnectionReset, message.to_owned()),
             );
-            state.remote_finished = true;
-            state.local_finished = true;
+            state.receive_state = ReceiveState::Finished;
+            state.send_state = SendState::Finished;
         }
         self.streams.clear();
     }
@@ -806,8 +885,7 @@ async fn run_driver(
 ) {
     loop {
         match session.run(&mut command_rx, &command_tx).await {
-            Ok(false) => return,
-            Ok(true) => {}
+            Ok(()) => return,
             Err(error) => log::warn!("L4 session disconnected: {error:#}"),
         }
         session.fail_all("L4 outer connection disconnected");
@@ -832,33 +910,27 @@ fn spawn_stream_bridge(stream_id: u64, bridge: DuplexStream, command_tx: mpsc::S
         let write_side = async move {
             let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
             loop {
-                match from_application.read(&mut buffer).await {
-                    Ok(0) => {
+                let read = match from_application.read(&mut buffer).await {
+                    Ok(0) | Err(_) => {
                         let _ = write_tx.send(Command::Finish { stream_id }).await;
                         return;
                     }
-                    Ok(read) => {
-                        let (reply_tx, reply_rx) = oneshot::channel();
-                        if write_tx
-                            .send(Command::Write {
-                                stream_id,
-                                data: buffer[..read].to_vec(),
-                                reply: reply_tx,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        match reply_rx.await {
-                            Ok(Ok(())) => {}
-                            _ => return,
-                        }
-                    }
-                    Err(_) => {
-                        let _ = write_tx.send(Command::Finish { stream_id }).await;
-                        return;
-                    }
+                    Ok(read) => read,
+                };
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if write_tx
+                    .send(Command::Write {
+                        stream_id,
+                        data: buffer[..read].to_vec(),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if !matches!(reply_rx.await, Ok(Ok(()))) {
+                    return;
                 }
             }
         };
@@ -877,16 +949,13 @@ fn spawn_stream_bridge(stream_id: u64, bridge: DuplexStream, command_tx: mpsc::S
                     let _ = to_application.shutdown().await;
                     return;
                 }
-                match reply_rx.await {
-                    Ok(Ok(Some(data))) => {
-                        if to_application.write_all(&data).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
-                        let _ = to_application.shutdown().await;
+                if let Ok(Ok(Some(data))) = reply_rx.await {
+                    if to_application.write_all(&data).await.is_err() {
                         return;
                     }
+                } else {
+                    let _ = to_application.shutdown().await;
+                    return;
                 }
             }
         };
@@ -895,22 +964,29 @@ fn spawn_stream_bridge(stream_id: u64, bridge: DuplexStream, command_tx: mpsc::S
     });
 }
 
-fn fail_open(state: &mut StreamState, error: io::Error) {
-    if let Some(reply) = state.open_reply.take() {
-        let _ = reply.send(Err(error));
+fn fail_opening(state: &mut StreamState, error: io::Error) {
+    match std::mem::replace(&mut state.open_state, OpenState::Failed) {
+        OpenState::Opening { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        OpenState::Open => state.open_state = OpenState::Open,
+        OpenState::Failed => {}
     }
 }
 
-fn fail_stream(state: &mut StreamState, error: io::Error) {
+fn fail_stream(state: &mut StreamState, error: &io::Error) {
+    let kind = error.kind();
     let message = error.to_string();
-    fail_open(state, io::Error::new(error.kind(), message.clone()));
+    if state.is_opening() {
+        fail_opening(state, io::Error::new(kind, message.clone()));
+    } else {
+        state.open_state = OpenState::Failed;
+    }
     if let Some(reply) = state.pending_read.take() {
-        let _ = reply.send(Err(io::Error::new(error.kind(), message.clone())));
+        let _ = reply.send(Err(io::Error::new(kind, message.clone())));
     }
     if let Some(pending) = state.pending_write.take() {
-        let _ = pending
-            .reply
-            .send(Err(io::Error::new(error.kind(), message)));
+        let _ = pending.reply.send(Err(io::Error::new(kind, message)));
     }
 }
 
