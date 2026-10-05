@@ -86,7 +86,21 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Run tests
-        run: cargo test --all
+        run: cargo test --all-features
+
+      - name: Check independently selectable features
+        run: |
+          cargo check --all-targets --no-default-features
+          for features in \
+            register \
+            tun \
+            http-proxy \
+            https-proxy \
+            socks5-proxy \
+            http-proxy,https-proxy,socks5-proxy
+          do
+            cargo check --all-targets --no-default-features --features "$features"
+          done
 
 
   test-shared-cache:
@@ -100,7 +114,11 @@ jobs:
       command: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go perl pkg-config clang libclang-dev nasm
-        cargo +1.99.0 test --all
+        cargo +1.99.0 test --all-features
+        cargo +1.99.0 check --all-targets --no-default-features
+        for features in register tun http-proxy https-proxy socks5-proxy http-proxy,https-proxy,socks5-proxy; do
+          cargo +1.99.0 check --all-targets --no-default-features --features "$features"
+        done
       rust-toolchain: "1.99.0"
       rustflags: "-C target-cpu=x86-64-v2"
 

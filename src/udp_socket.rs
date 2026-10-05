@@ -35,7 +35,7 @@ pub fn bind_udp_socket(bind_addr: SocketAddr, label: &'static str) -> io::Result
     UdpSocket::from_std(socket)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "tun", target_os = "linux"))]
 pub fn detect_udp_gso(socket: &UdpSocket, segment_size: usize) -> bool {
     use nix::sys::socket::{setsockopt, sockopt::UdpGsoSegment};
 
@@ -46,12 +46,12 @@ pub fn detect_udp_gso(socket: &UdpSocket, segment_size: usize) -> bool {
     setsockopt(socket, UdpGsoSegment, &segment_size).is_ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(feature = "tun", not(target_os = "linux")))]
 pub fn detect_udp_gso(_socket: &UdpSocket, _segment_size: usize) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "tun", target_os = "linux"))]
 pub async fn send_udp_gso(
     socket: &UdpSocket,
     buf: &[u8],
@@ -91,7 +91,7 @@ pub async fn send_udp_gso(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(feature = "tun", not(target_os = "linux")))]
 pub async fn send_udp_gso(
     _socket: &UdpSocket,
     _buf: &[u8],

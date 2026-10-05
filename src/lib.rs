@@ -9,15 +9,35 @@
     )
 )]
 
+pub mod account;
 pub mod config;
+#[cfg(feature = "tun")]
 pub mod icmp;
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+pub mod l4;
+#[cfg(feature = "tun")]
 pub mod packet;
-pub mod packet_session;
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 pub mod proxy;
+#[cfg(feature = "register")]
 pub mod register;
 pub mod tls;
+#[cfg(feature = "tun")]
 pub mod tun_device;
+#[cfg(feature = "tun")]
 pub mod tunnel;
+#[cfg(any(
+    feature = "tun",
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 mod udp_socket;
-
-pub use packet_session::MasquePacketStream;

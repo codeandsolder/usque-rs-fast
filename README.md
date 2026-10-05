@@ -2,15 +2,38 @@
 
 A tiny Rust rewrite of my previous [usque](https://github.com/Diniboy1123/usque) project. The goal is simple: a decently fast, native tunnel using Cloudflare WARP and its MASQUE-based protocol.
 
-The Rust client supports both the Linux `nativetun` mode and userspace TCP proxy modes. The proxy path runs a dual-stack smoltcp network stack directly over the existing MASQUE CONNECT-IP session, so it does not require a host TUN device.
+The Rust client has four independently selectable application features: native Linux TUN, plaintext HTTP proxy, TLS-wrapped HTTPS proxy, and SOCKS5/SOCKS5h proxy. Proxy modes use the direct L4 WARP endpoint: one shared QUIC/HTTP/3 connection is reused and each proxied TCP connection is an HTTP/3 CONNECT stream, so proxy builds do not carry a userspace IP/TCP stack.
 
 Just like the Go based usque project, `nativetun` won't try to choose or replace your routes; you still control routing policy. The TUN IP addresses and MTU are configured for you.
 
 Read [SETUP_NOTES.md](SETUP_NOTES.md) for my use-case.
 
+## Cargo features
+
+The default build enables all four runtime capabilities plus the registration command. The runtime capabilities can also be compiled independently, without registration-only HTTP/TLS dependencies:
+
+```sh
+# Native TUN only
+cargo build --release --no-default-features --features tun
+
+# Plaintext HTTP proxy only
+cargo build --release --no-default-features --features http-proxy
+
+# TLS-wrapped HTTPS proxy only
+cargo build --release --no-default-features --features https-proxy
+
+# TCP-only SOCKS5/SOCKS5h proxy only
+cargo build --release --no-default-features --features socks5-proxy
+
+# Registration/enrollment utility only
+cargo build --release --no-default-features --features register
+```
+
+Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends, Hyper, or reqwest; a SOCKS5-only build likewise avoids Hyper and reqwest. Saved-config parsing remains available to every runtime build. The `register` feature is separate and is included in the default feature set for backwards compatibility.
+
 ## Proxy modes
 
-Both proxy listeners bind to loopback by default. Binding to a non-loopback address is explicit; if you do that, configure `--username` and `--password` together unless you deliberately want an unauthenticated proxy.
+All proxy listeners bind to loopback by default. Binding to a non-loopback address is explicit; if you do that, configure `--username` and `--password` together unless you deliberately want an unauthenticated proxy.
 
 Start a SOCKS5 proxy:
 
@@ -18,47 +41,49 @@ Start a SOCKS5 proxy:
 usque-rs -c config.json socks
 ```
 
-The distinction between SOCKS5 and SOCKS5h is made by the client, not by a separate server mode:
+The distinction between SOCKS5 and SOCKS5h is made by the client. SOCKS5h hostnames are resolved with DNS-over-TCP through the same WARP L4 transport, so hostname resolution does not fall back to the host resolver. Repeat `--dns-server IP` to select resolvers; the default pair is `1.1.1.1` and `8.8.8.8`. Positive answers are cached with their DNS TTL in a bounded cache.
 
 ```sh
-# curl resolves the hostname locally and sends an IP address to the proxy.
+# Client-side DNS; the proxy receives an IP address.
 curl --socks5 127.0.0.1:1080 https://example.com/
 
-# curl sends the hostname to usque-rs; DNS resolution happens inside the WARP-side userspace stack.
+# Proxy-side tunneled DNS.
 curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 ```
 
-SOCKS5 UDP ASSOCIATE is also supported. UDP destinations may be literal IPv4/IPv6 addresses or domain names; domain targets are resolved through the tunneled WARP-side resolver. SOCKS UDP fragmentation (`FRAG != 0`) is not supported, but ordinary large UDP datagrams are carried using IP fragmentation/reassembly inside the userspace stack when needed.
+Direct L4 is TCP-only. SOCKS5 UDP ASSOCIATE is deliberately reported as unsupported rather than pulling CONNECT-IP and a userspace packet stack back into a SOCKS-only build.
 
-Start the streaming HTTP/1.1 proxy:
+Start the plaintext HTTP proxy. It supports both ordinary forward-proxy requests and CONNECT:
 
 ```sh
 usque-rs -c config.json http-proxy
+curl --proxy http://127.0.0.1:8000 http://example.com/
 ```
 
-It supports ordinary HTTP forwarding and HTTPS tunnelling with `CONNECT`:
+Start the HTTPS proxy (HTTP proxy protocol over a TLS-protected client-to-proxy connection). A certificate chain and private key are required:
 
 ```sh
-curl --proxy http://127.0.0.1:8000 http://example.com/
-curl --proxy http://127.0.0.1:8000 https://example.com/
+usque-rs -c config.json https-proxy \
+  --tls-cert proxy-chain.pem \
+  --tls-key proxy-key.pem
+
+# Trust proxy-chain.pem (or use --proxy-insecure for a local smoke test).
+curl --proxy https://127.0.0.1:8443 \
+  --proxy-cacert proxy-chain.pem \
+  https://example.com/
 ```
 
-Optional proxy authentication uses the same flags in both modes:
+Both HTTP and HTTPS proxy listeners support ordinary HTTP forwarding and CONNECT. The feature distinction is the client-to-proxy transport: `http-proxy` is plaintext HTTP, while `https-proxy` wraps the same proxy semantics in TLS.
+
+Optional proxy authentication uses the same flags in all proxy modes:
 
 ```sh
 usque-rs -c config.json socks --username alice --password secret
 usque-rs -c config.json http-proxy --username alice --password secret
+usque-rs -c config.json https-proxy --tls-cert proxy-chain.pem --tls-key proxy-key.pem --username alice --password secret
 ```
 
-For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected.
-
-The proxy transport accepts the same WARP-side family controls as the native tunnel (`--ipv6`, `--no-tunnel-ipv4`, `--no-tunnel-ipv6`, `--connect-port`, `--sni-address`, `--keepalive-period`, and `--mtu`). Hostname targets use tunneled DNS and dual-stack connections use staggered IPv6/IPv4 connection attempts rather than waiting through a dead address family serially.
-
-DNS answers are kept in a small bounded positive cache with a conservative 30-second local lifetime. Concurrent misses for the same hostname are single-flight. The default resolver race uses unfiltered Cloudflare, Quad9, and Control D endpoints; repeat `--dns-server IP` to replace that set with explicitly selected resolvers. A lightweight WARP-side DNS `whoami.cloudflare` probe watches the public egress and invalidates the cache when the exit changes.
-
-After building the binary, `tests/proxy_smoke.sh` runs authenticated SOCKS5, SOCKS5h, HTTP-forwarding, and HTTPS-CONNECT checks against a real WARP config. Set `USQUE_BIN` if the binary is outside `target/debug/usque-rs`, and pass a config path readable by the account running the test.
-
-`--source-ip` pins the outer MASQUE UDP socket to a specific host address. It is a standalone transport option for deployments that need explicit source-address selection.
+For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected. `--source-ip` pins the shared outer MASQUE UDP socket to a specific host address.
 
 ## Why the rewrite?
 

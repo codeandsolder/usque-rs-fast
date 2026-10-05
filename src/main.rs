@@ -9,25 +9,49 @@
     )
 )]
 
-//! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
+//! usque-rs - MASQUE client for Cloudflare WARP.
 
-use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
-use usque_rs::{
-    config,
-    proxy::{
-        http::{self as http_proxy, HttpConfig},
-        net::VirtualNet,
-        session::{self as proxy_session, TransportConfig},
-        socks::{self, SocksConfig},
-    },
-    register, tun_device, tunnel,
-};
+#[cfg(feature = "register")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+use clap::Args;
+use clap::{Parser, Subcommand};
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+use std::net::IpAddr;
+#[cfg(any(
+    feature = "tun",
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+use std::time::Duration;
+#[cfg(any(feature = "register", feature = "tun"))]
+use usque_rs::config;
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+use usque_rs::l4::{L4Client, L4Config};
+#[cfg(feature = "https-proxy")]
+use usque_rs::proxy::http::HttpsConfig;
+#[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
+use usque_rs::proxy::http::{self as http_proxy, HttpConfig};
+#[cfg(feature = "socks5-proxy")]
+use usque_rs::proxy::socks::{self, SocksConfig};
+#[cfg(feature = "register")]
+use usque_rs::register;
+#[cfg(feature = "tun")]
+use usque_rs::{tun_device, tunnel};
 
 #[derive(Parser)]
 #[command(
@@ -42,38 +66,34 @@ struct Cli {
     command: Commands,
 }
 
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 #[derive(Args, Clone)]
-struct ProxyTransportArgs {
+struct L4TransportArgs {
     #[arg(short = 'P', long, default_value_t = 443)]
     connect_port: u16,
     #[arg(short = '6', long, default_value_t = false)]
     ipv6: bool,
-    #[arg(short = 'F', long, default_value_t = false)]
-    no_tunnel_ipv4: bool,
-    #[arg(short = 'S', long, default_value_t = false)]
-    no_tunnel_ipv6: bool,
-    #[arg(short, long, default_value = "consumer-masque.cloudflareclient.com")]
-    sni_address: String,
     #[arg(short, long, default_value_t = 30)]
     keepalive_period: u64,
-    #[arg(short, long, default_value_t = 1280)]
-    mtu: u32,
     #[arg(long)]
     source_ip: Option<IpAddr>,
-    /// DNS resolver IPs to race inside the WARP userspace stack.
-    ///
-    /// Repeat this option to supply multiple resolvers. When omitted, the
-    /// proxy races a provider-diverse unfiltered default set.
+    /// DNS resolver IPs reached over direct L4 TCP streams through WARP.
     #[arg(long = "dns-server", value_name = "IP")]
     dns_servers: Vec<IpAddr>,
 }
 
+#[cfg(feature = "tun")]
 struct AddressSelection {
     use_ipv6_endpoint: bool,
     no_tunnel_ipv4: bool,
     no_tunnel_ipv6: bool,
 }
 
+#[cfg(feature = "tun")]
 struct NativeTunOptions {
     connect_port: u16,
     addresses: AddressSelection,
@@ -84,9 +104,21 @@ struct NativeTunOptions {
     interface_name: Option<String>,
 }
 
+#[cfg(feature = "https-proxy")]
+struct HttpsProxyOptions {
+    bind: IpAddr,
+    port: u16,
+    tls_cert: String,
+    tls_key: String,
+    username: Option<String>,
+    password: Option<String>,
+    transport: L4TransportArgs,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Register a new client and enroll a device key
+    /// Register a new client and enroll a device key.
+    #[cfg(feature = "register")]
     Register {
         #[arg(short, long, default_value = "en_US")]
         locale: String,
@@ -97,7 +129,9 @@ enum Commands {
         #[arg(long)]
         jwt: Option<String>,
     },
-    /// Expose WARP as a native TUN device
+
+    /// Expose WARP as a native TUN device.
+    #[cfg(feature = "tun")]
     #[command(name = "nativetun")]
     NativeTun {
         #[arg(short = 'P', long, default_value_t = 443)]
@@ -119,7 +153,9 @@ enum Commands {
         #[arg(short = 'n', long)]
         interface_name: Option<String>,
     },
-    /// Expose WARP as a dual-stack SOCKS5/SOCKS5h proxy.
+
+    /// Expose WARP as a direct-L4 TCP-only SOCKS5/SOCKS5h proxy.
+    #[cfg(feature = "socks5-proxy")]
     Socks {
         #[arg(short, long, default_value = "127.0.0.1")]
         bind: IpAddr,
@@ -130,9 +166,11 @@ enum Commands {
         #[arg(short = 'w', long)]
         password: Option<String>,
         #[command(flatten)]
-        transport: ProxyTransportArgs,
+        transport: L4TransportArgs,
     },
-    /// Expose WARP as a streaming HTTP/1.1 proxy with CONNECT support.
+
+    /// Expose WARP as a plaintext HTTP proxy (forward requests and CONNECT).
+    #[cfg(feature = "http-proxy")]
     #[command(name = "http-proxy")]
     HttpProxy {
         #[arg(short, long, default_value = "127.0.0.1")]
@@ -144,68 +182,139 @@ enum Commands {
         #[arg(short = 'w', long)]
         password: Option<String>,
         #[command(flatten)]
-        transport: ProxyTransportArgs,
+        transport: L4TransportArgs,
+    },
+
+    /// Expose WARP as a TLS-wrapped HTTP proxy (HTTPS proxy protocol).
+    #[cfg(feature = "https-proxy")]
+    #[command(name = "https-proxy")]
+    HttpsProxy {
+        #[arg(short, long, default_value = "127.0.0.1")]
+        bind: IpAddr,
+        #[arg(short, long, default_value_t = 8443)]
+        port: u16,
+        #[arg(long, value_name = "PATH")]
+        tls_cert: String,
+        #[arg(long, value_name = "PATH")]
+        tls_key: String,
+        #[arg(short, long)]
+        username: Option<String>,
+        #[arg(short = 'w', long)]
+        password: Option<String>,
+        #[command(flatten)]
+        transport: L4TransportArgs,
     },
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    env_logger::init();
-    let cli = Cli::parse();
+    #[cfg(not(any(
+        feature = "register",
+        feature = "tun",
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    )))]
+    anyhow::bail!("usque-rs was built without any capability feature");
 
-    match cli.command {
-        Commands::Register {
-            locale,
-            model,
-            name,
-            jwt,
-        } => cmd_register(&cli.config, &locale, &model, name, jwt).await,
-        Commands::NativeTun {
-            connect_port,
-            ipv6,
-            no_tunnel_ipv4,
-            no_tunnel_ipv6,
-            sni_address,
-            keepalive_period,
-            mtu,
-            no_iproute2,
-            interface_name,
-        } => {
-            cmd_nativetun(
-                &cli.config,
-                NativeTunOptions {
-                    connect_port,
-                    addresses: AddressSelection {
-                        use_ipv6_endpoint: ipv6,
-                        no_tunnel_ipv4,
-                        no_tunnel_ipv6,
+    #[cfg(any(
+        feature = "register",
+        feature = "tun",
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    ))]
+    {
+        env_logger::init();
+        let cli = Cli::parse();
+
+        match cli.command {
+            #[cfg(feature = "register")]
+            Commands::Register {
+                locale,
+                model,
+                name,
+                jwt,
+            } => cmd_register(&cli.config, &locale, &model, name, jwt).await,
+
+            #[cfg(feature = "tun")]
+            Commands::NativeTun {
+                connect_port,
+                ipv6,
+                no_tunnel_ipv4,
+                no_tunnel_ipv6,
+                sni_address,
+                keepalive_period,
+                mtu,
+                no_iproute2,
+                interface_name,
+            } => {
+                cmd_nativetun(
+                    &cli.config,
+                    NativeTunOptions {
+                        connect_port,
+                        addresses: AddressSelection {
+                            use_ipv6_endpoint: ipv6,
+                            no_tunnel_ipv4,
+                            no_tunnel_ipv6,
+                        },
+                        sni: sni_address,
+                        keepalive_period: Duration::from_secs(keepalive_period),
+                        mtu,
+                        no_iproute2,
+                        interface_name,
                     },
-                    sni: sni_address,
-                    keepalive_period: Duration::from_secs(keepalive_period),
-                    mtu,
-                    no_iproute2,
-                    interface_name,
-                },
-            )
-            .await
+                )
+                .await
+            }
+
+            #[cfg(feature = "socks5-proxy")]
+            Commands::Socks {
+                bind,
+                port,
+                username,
+                password,
+                transport,
+            } => cmd_socks(&cli.config, bind, port, username, password, &transport).await,
+
+            #[cfg(feature = "http-proxy")]
+            Commands::HttpProxy {
+                bind,
+                port,
+                username,
+                password,
+                transport,
+            } => cmd_http_proxy(&cli.config, bind, port, username, password, &transport).await,
+
+            #[cfg(feature = "https-proxy")]
+            Commands::HttpsProxy {
+                bind,
+                port,
+                tls_cert,
+                tls_key,
+                username,
+                password,
+                transport,
+            } => {
+                cmd_https_proxy(
+                    &cli.config,
+                    HttpsProxyOptions {
+                        bind,
+                        port,
+                        tls_cert,
+                        tls_key,
+                        username,
+                        password,
+                        transport,
+                    },
+                )
+                .await
+            }
         }
-        Commands::Socks {
-            bind,
-            port,
-            username,
-            password,
-            transport,
-        } => cmd_socks(&cli.config, bind, port, username, password, &transport).await,
-        Commands::HttpProxy {
-            bind,
-            port,
-            username,
-            password,
-            transport,
-        } => cmd_http_proxy(&cli.config, bind, port, username, password, &transport).await,
     }
 }
 
+#[cfg(feature = "register")]
 async fn cmd_register(
     config_path: &str,
     locale: &str,
@@ -244,6 +353,7 @@ async fn cmd_register(
     Ok(())
 }
 
+#[cfg(feature = "tun")]
 async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<()> {
     let NativeTunOptions {
         connect_port,
@@ -306,73 +416,108 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
         keepalive_period,
         mtu,
     };
-
     tunnel::maintain_tunnel(&cfg, &tunnel_cfg, tun_dev).await
 }
 
-async fn cmd_socks(
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+async fn create_l4(
     config_path: &str,
-    bind: IpAddr,
-    port: u16,
-    username: Option<String>,
-    password: Option<String>,
-    transport: &ProxyTransportArgs,
-) -> Result<()> {
-    validate_auth_pair(username.as_deref(), password.as_deref())?;
-    let net = create_proxy_net(config_path, transport).await?;
-    socks::serve(
-        SocksConfig {
-            bind: SocketAddr::new(bind, port),
-            username,
-            password,
-        },
-        net,
-    )
-    .await
-}
-
-async fn cmd_http_proxy(
-    config_path: &str,
-    bind: IpAddr,
-    port: u16,
-    username: Option<String>,
-    password: Option<String>,
-    transport: &ProxyTransportArgs,
-) -> Result<()> {
-    validate_auth_pair(username.as_deref(), password.as_deref())?;
-    let net = create_proxy_net(config_path, transport).await?;
-    http_proxy::serve(
-        HttpConfig {
-            bind: SocketAddr::new(bind, port),
-            username,
-            password,
-        },
-        net,
-    )
-    .await
-}
-
-async fn create_proxy_net(
-    config_path: &str,
-    transport: &ProxyTransportArgs,
-) -> Result<Arc<VirtualNet>> {
-    proxy_session::connect(
+    transport: &L4TransportArgs,
+) -> Result<std::sync::Arc<L4Client>> {
+    L4Client::connect(
         config_path,
-        &TransportConfig {
+        &L4Config {
             connect_port: transport.connect_port,
             use_ipv6_endpoint: transport.ipv6,
-            no_tunnel_ipv4: transport.no_tunnel_ipv4,
-            no_tunnel_ipv6: transport.no_tunnel_ipv6,
-            sni: transport.sni_address.clone(),
-            keepalive_period: Duration::from_secs(transport.keepalive_period),
-            mtu: transport.mtu,
             source_ip: transport.source_ip,
+            keepalive_period: Duration::from_secs(transport.keepalive_period),
             dns_servers: transport.dns_servers.clone(),
         },
     )
     .await
 }
 
+#[cfg(feature = "socks5-proxy")]
+async fn cmd_socks(
+    config_path: &str,
+    bind: IpAddr,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    transport: &L4TransportArgs,
+) -> Result<()> {
+    validate_auth_pair(username.as_deref(), password.as_deref())?;
+    let l4 = create_l4(config_path, transport).await?;
+    socks::serve(
+        SocksConfig {
+            bind: std::net::SocketAddr::new(bind, port),
+            username,
+            password,
+        },
+        l4,
+    )
+    .await
+}
+
+#[cfg(feature = "http-proxy")]
+async fn cmd_http_proxy(
+    config_path: &str,
+    bind: IpAddr,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    transport: &L4TransportArgs,
+) -> Result<()> {
+    validate_auth_pair(username.as_deref(), password.as_deref())?;
+    let l4 = create_l4(config_path, transport).await?;
+    http_proxy::serve_plain(
+        HttpConfig {
+            bind: std::net::SocketAddr::new(bind, port),
+            username,
+            password,
+        },
+        l4,
+    )
+    .await
+}
+
+#[cfg(feature = "https-proxy")]
+async fn cmd_https_proxy(config_path: &str, options: HttpsProxyOptions) -> Result<()> {
+    let HttpsProxyOptions {
+        bind,
+        port,
+        tls_cert,
+        tls_key,
+        username,
+        password,
+        transport,
+    } = options;
+    validate_auth_pair(username.as_deref(), password.as_deref())?;
+    let l4 = create_l4(config_path, &transport).await?;
+    http_proxy::serve_tls(
+        HttpConfig {
+            bind: std::net::SocketAddr::new(bind, port),
+            username,
+            password,
+        },
+        HttpsConfig {
+            certificate: tls_cert.into(),
+            private_key: tls_key.into(),
+        },
+        l4,
+    )
+    .await
+}
+
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<()> {
     match (username, password) {
         (Some(_), Some(_)) | (None, None) => Ok(()),
@@ -380,27 +525,67 @@ fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    )
+))]
 mod tests {
     use super::*;
-    use clap::Parser;
-    use std::net::Ipv4Addr;
+    use clap::CommandFactory;
+    use std::net::{IpAddr, Ipv4Addr};
 
+    fn proxy_defaults(command: &str, args: &[&str]) -> Result<(IpAddr, u16)> {
+        let matches = Cli::command().try_get_matches_from(args.iter().copied())?;
+        let subcommand = matches
+            .subcommand_matches(command)
+            .ok_or_else(|| anyhow::anyhow!("expected {command} subcommand"))?;
+        let bind = *subcommand
+            .get_one::<IpAddr>("bind")
+            .ok_or_else(|| anyhow::anyhow!("missing bind default"))?;
+        let port = *subcommand
+            .get_one::<u16>("port")
+            .ok_or_else(|| anyhow::anyhow!("missing port default"))?;
+        Ok((bind, port))
+    }
+
+    #[cfg(feature = "socks5-proxy")]
     #[test]
-    fn proxy_commands_default_to_loopback() -> Result<()> {
-        let socks = Cli::try_parse_from(["usque-rs", "socks"])?;
-        let Commands::Socks { bind, port, .. } = socks.command else {
-            anyhow::bail!("expected SOCKS command");
-        };
+    fn socks_defaults_to_loopback() -> Result<()> {
+        let (bind, port) = proxy_defaults("socks", &["usque-rs", "socks"])?;
         assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(port, 1080);
+        Ok(())
+    }
 
-        let http = Cli::try_parse_from(["usque-rs", "http-proxy"])?;
-        let Commands::HttpProxy { bind, port, .. } = http.command else {
-            anyhow::bail!("expected HTTP proxy command");
-        };
+    #[cfg(feature = "http-proxy")]
+    #[test]
+    fn http_proxy_defaults_to_loopback() -> Result<()> {
+        let (bind, port) = proxy_defaults("http-proxy", &["usque-rs", "http-proxy"])?;
         assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(port, 8000);
+        Ok(())
+    }
+
+    #[cfg(feature = "https-proxy")]
+    #[test]
+    fn https_proxy_defaults_to_loopback() -> Result<()> {
+        let (bind, port) = proxy_defaults(
+            "https-proxy",
+            &[
+                "usque-rs",
+                "https-proxy",
+                "--tls-cert",
+                "proxy.crt",
+                "--tls-key",
+                "proxy.key",
+            ],
+        )?;
+        assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(port, 8443);
         Ok(())
     }
 
