@@ -676,7 +676,8 @@ impl Session {
                 }
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     if let Some(state) = self.streams.get_mut(&stream_id) {
-                        if !state.is_open() {
+                        let finished_while_opening = state.is_opening();
+                        if finished_while_opening {
                             fail_opening(
                                 state,
                                 io::Error::new(
@@ -684,6 +685,7 @@ impl Session {
                                     "CONNECT stream finished before response",
                                 ),
                             );
+                            state.send_state = SendState::Finished;
                         }
                         state.receive_state = ReceiveState::Finished;
                         if let Some(reply) = state.pending_read.take() {
