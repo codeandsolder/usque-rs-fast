@@ -10,11 +10,15 @@ use hyper::{
     server::conn::http1 as server_http1,
     service::service_fn,
 };
-#[cfg(feature = "http-proxy")]
 use hyper::{Uri, client::conn::http1 as client_http1, header::CONNECTION};
 use hyper_util::rt::TokioIo;
+#[cfg(feature = "https-proxy")]
+use std::path::PathBuf;
 use std::{convert::Infallible, error::Error, net::SocketAddr, sync::Arc};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+#[cfg(feature = "https-proxy")]
+use tokio_rustls::TlsAcceptor;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -26,26 +30,21 @@ pub struct HttpConfig {
     pub password: Option<String>,
 }
 
-/// Serve whichever HTTP proxy modes were compiled and enabled by the caller.
+#[cfg(feature = "https-proxy")]
+#[derive(Clone, Debug)]
+pub struct HttpsConfig {
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[cfg(feature = "http-proxy")]
+/// Serve a plaintext HTTP proxy listener.
 ///
 /// # Errors
 /// Returns an error when authentication configuration is incomplete or the listener
 /// cannot be bound or accepted.
-pub async fn serve(
-    config: HttpConfig,
-    l4: Arc<L4Client>,
-    allow_forward_http: bool,
-    allow_connect: bool,
-) -> Result<()> {
-    let expected_auth = match (&config.username, &config.password) {
-        (Some(username), Some(password)) => Some(format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
-        )),
-        (None, None) => None,
-        _ => anyhow::bail!("HTTP proxy username and password must be configured together"),
-    };
-
+pub async fn serve_plain(config: HttpConfig, l4: Arc<L4Client>) -> Result<()> {
+    let expected_auth = expected_proxy_auth(&config)?;
     let listener = TcpListener::bind(config.bind).await?;
     log::info!("HTTP proxy listening on {}", config.bind);
 
@@ -54,33 +53,86 @@ pub async fn serve(
         let l4 = l4.clone();
         let expected_auth = expected_auth.clone();
         tokio::spawn(async move {
-            let service = service_fn(move |request| {
-                let l4 = l4.clone();
-                let expected_auth = expected_auth.clone();
-                async move {
-                    Ok::<_, Infallible>(
-                        handle(
-                            request,
-                            l4,
-                            expected_auth.as_deref(),
-                            allow_forward_http,
-                            allow_connect,
-                        )
-                        .await,
-                    )
-                }
-            });
+            serve_connection(stream, peer, l4, expected_auth).await;
+        });
+    }
+}
 
-            if let Err(error) = server_http1::Builder::new()
-                .preserve_header_case(true)
-                .title_case_headers(false)
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades()
-                .await
-            {
-                log::debug!("HTTP proxy connection from {peer} failed: {error}");
+#[cfg(feature = "https-proxy")]
+/// Serve an HTTPS proxy: HTTP proxy semantics inside a TLS listener.
+///
+/// # Errors
+/// Returns an error when TLS material cannot be loaded, authentication configuration
+/// is incomplete, or the listener cannot be bound or accepted.
+pub async fn serve_tls(config: HttpConfig, tls: HttpsConfig, l4: Arc<L4Client>) -> Result<()> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    let certificates = CertificateDer::pem_file_iter(&tls.certificate)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    anyhow::ensure!(
+        !certificates.is_empty(),
+        "HTTPS proxy certificate file is empty"
+    );
+    let private_key = PrivateKeyDer::from_pem_file(&tls.private_key)?;
+    let mut server_config = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(certificates, private_key)?;
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let expected_auth = expected_proxy_auth(&config)?;
+    let listener = TcpListener::bind(config.bind).await?;
+    log::info!("HTTPS proxy listening on {}", config.bind);
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let l4 = l4.clone();
+        let expected_auth = expected_auth.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(stream) => serve_connection(stream, peer, l4, expected_auth).await,
+                Err(error) => log::debug!("HTTPS proxy TLS handshake from {peer} failed: {error}"),
             }
         });
+    }
+}
+
+fn expected_proxy_auth(config: &HttpConfig) -> Result<Option<String>> {
+    match (&config.username, &config.password) {
+        (Some(username), Some(password)) => Ok(Some(format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        ))),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("HTTP proxy username and password must be configured together"),
+    }
+}
+
+async fn serve_connection<I>(
+    stream: I,
+    peer: SocketAddr,
+    l4: Arc<L4Client>,
+    expected_auth: Option<String>,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |request| {
+        let l4 = l4.clone();
+        let expected_auth = expected_auth.clone();
+        async move { Ok::<_, Infallible>(handle(request, l4, expected_auth.as_deref()).await) }
+    });
+
+    if let Err(error) = server_http1::Builder::new()
+        .preserve_header_case(true)
+        .title_case_headers(false)
+        .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades()
+        .await
+    {
+        log::debug!("HTTP proxy connection from {peer} failed: {error}");
     }
 }
 
@@ -88,8 +140,6 @@ async fn handle(
     request: Request<Incoming>,
     l4: Arc<L4Client>,
     expected_auth: Option<&str>,
-    allow_forward_http: bool,
-    allow_connect: bool,
 ) -> Response<ProxyBody> {
     if let Some(expected) = expected_auth {
         let provided = request
@@ -108,31 +158,12 @@ async fn handle(
     }
 
     if request.method() == Method::CONNECT {
-        #[cfg(feature = "https-proxy")]
-        if allow_connect {
-            return handle_connect(request, l4).await;
-        }
-        let _ = allow_connect;
-        return text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "CONNECT proxy support is not compiled/enabled",
-        );
+        return handle_connect(request, l4).await;
     }
 
-    #[cfg(feature = "http-proxy")]
-    {
-        if allow_forward_http {
-            return handle_forward(request, l4).await;
-        }
-    }
-    let _ = (request, l4, allow_forward_http);
-    text_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "plain HTTP proxy support is not compiled/enabled",
-    )
+    handle_forward(request, l4).await
 }
 
-#[cfg(feature = "http-proxy")]
 async fn handle_forward(mut request: Request<Incoming>, l4: Arc<L4Client>) -> Response<ProxyBody> {
     let (host, port) = match request_target(&request, 80) {
         Ok(target) => target,
@@ -194,7 +225,6 @@ async fn handle_forward(mut request: Request<Incoming>, l4: Arc<L4Client>) -> Re
     )
 }
 
-#[cfg(feature = "https-proxy")]
 async fn handle_connect(request: Request<Incoming>, l4: Arc<L4Client>) -> Response<ProxyBody> {
     let (host, port) = match request_target(&request, 443) {
         Ok(target) => target,
@@ -225,7 +255,6 @@ async fn handle_connect(request: Request<Incoming>, l4: Arc<L4Client>) -> Respon
     response_with_status(StatusCode::OK, empty_body())
 }
 
-#[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
 fn request_target(
     request: &Request<Incoming>,
     default_port: u16,
@@ -277,7 +306,6 @@ fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), 
     }
 }
 
-#[cfg(feature = "http-proxy")]
 fn rewrite_for_origin<B>(request: &mut Request<B>) -> Result<(), &'static str> {
     let authority = request.uri().authority().cloned();
     let path_and_query = request
@@ -297,7 +325,6 @@ fn rewrite_for_origin<B>(request: &mut Request<B>) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[cfg(feature = "http-proxy")]
 fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
     let connection_tokens = headers
         .get_all(CONNECTION)
@@ -353,7 +380,6 @@ fn text_response(status: StatusCode, message: &'static str) -> Response<ProxyBod
 mod tests {
     use super::*;
 
-    #[cfg(feature = "http-proxy")]
     #[test]
     fn absolute_form_request_rewrites_host_for_origin() -> Result<()> {
         let mut request = Request::builder()
@@ -371,7 +397,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "http-proxy")]
     #[test]
     fn origin_form_request_keeps_existing_host() -> Result<()> {
         let mut request = Request::builder()

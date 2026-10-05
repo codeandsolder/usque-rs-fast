@@ -42,6 +42,8 @@ use usque_rs::config;
     feature = "socks5-proxy"
 ))]
 use usque_rs::l4::{L4Client, L4Config};
+#[cfg(feature = "https-proxy")]
+use usque_rs::proxy::http::HttpsConfig;
 #[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
 use usque_rs::proxy::http::{self as http_proxy, HttpConfig};
 #[cfg(feature = "socks5-proxy")]
@@ -156,7 +158,7 @@ enum Commands {
         transport: L4TransportArgs,
     },
 
-    /// Expose WARP as a direct-L4 HTTP/1.1 forward proxy.
+    /// Expose WARP as a plaintext HTTP proxy (forward requests and CONNECT).
     #[cfg(feature = "http-proxy")]
     #[command(name = "http-proxy")]
     HttpProxy {
@@ -172,14 +174,18 @@ enum Commands {
         transport: L4TransportArgs,
     },
 
-    /// Expose WARP as a direct-L4 HTTPS CONNECT proxy.
+    /// Expose WARP as a TLS-wrapped HTTP proxy (HTTPS proxy protocol).
     #[cfg(feature = "https-proxy")]
     #[command(name = "https-proxy")]
     HttpsProxy {
         #[arg(short, long, default_value = "127.0.0.1")]
         bind: IpAddr,
-        #[arg(short, long, default_value_t = 8000)]
+        #[arg(short, long, default_value_t = 8443)]
         port: u16,
+        #[arg(long, value_name = "PATH")]
+        tls_cert: String,
+        #[arg(long, value_name = "PATH")]
+        tls_key: String,
         #[arg(short, long)]
         username: Option<String>,
         #[arg(short = 'w', long)]
@@ -273,10 +279,24 @@ async fn main() -> Result<()> {
             Commands::HttpsProxy {
                 bind,
                 port,
+                tls_cert,
+                tls_key,
                 username,
                 password,
                 transport,
-            } => cmd_https_proxy(&cli.config, bind, port, username, password, &transport).await,
+            } => {
+                cmd_https_proxy(
+                    &cli.config,
+                    bind,
+                    port,
+                    tls_cert,
+                    tls_key,
+                    username,
+                    password,
+                    &transport,
+                )
+                .await
+            }
         }
     }
 }
@@ -441,15 +461,13 @@ async fn cmd_http_proxy(
 ) -> Result<()> {
     validate_auth_pair(username.as_deref(), password.as_deref())?;
     let l4 = create_l4(config_path, transport).await?;
-    http_proxy::serve(
+    http_proxy::serve_plain(
         HttpConfig {
             bind: std::net::SocketAddr::new(bind, port),
             username,
             password,
         },
         l4,
-        true,
-        cfg!(feature = "https-proxy"),
     )
     .await
 }
@@ -459,21 +477,25 @@ async fn cmd_https_proxy(
     config_path: &str,
     bind: IpAddr,
     port: u16,
+    tls_cert: String,
+    tls_key: String,
     username: Option<String>,
     password: Option<String>,
     transport: &L4TransportArgs,
 ) -> Result<()> {
     validate_auth_pair(username.as_deref(), password.as_deref())?;
     let l4 = create_l4(config_path, transport).await?;
-    http_proxy::serve(
+    http_proxy::serve_tls(
         HttpConfig {
             bind: std::net::SocketAddr::new(bind, port),
             username,
             password,
         },
+        HttpsConfig {
+            certificate: tls_cert.into(),
+            private_key: tls_key.into(),
+        },
         l4,
-        false,
-        true,
     )
     .await
 }
@@ -503,8 +525,8 @@ mod tests {
     use clap::CommandFactory;
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn proxy_defaults(command: &str) -> Result<(IpAddr, u16)> {
-        let matches = Cli::command().try_get_matches_from(["usque-rs", command])?;
+    fn proxy_defaults(command: &str, args: &[&str]) -> Result<(IpAddr, u16)> {
+        let matches = Cli::command().try_get_matches_from(args.iter().copied())?;
         let subcommand = matches
             .subcommand_matches(command)
             .ok_or_else(|| anyhow::anyhow!("expected {command} subcommand"))?;
@@ -520,7 +542,7 @@ mod tests {
     #[cfg(feature = "socks5-proxy")]
     #[test]
     fn socks_defaults_to_loopback() -> Result<()> {
-        let (bind, port) = proxy_defaults("socks")?;
+        let (bind, port) = proxy_defaults("socks", &["usque-rs", "socks"])?;
         assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(port, 1080);
         Ok(())
@@ -529,7 +551,7 @@ mod tests {
     #[cfg(feature = "http-proxy")]
     #[test]
     fn http_proxy_defaults_to_loopback() -> Result<()> {
-        let (bind, port) = proxy_defaults("http-proxy")?;
+        let (bind, port) = proxy_defaults("http-proxy", &["usque-rs", "http-proxy"])?;
         assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(port, 8000);
         Ok(())
@@ -538,9 +560,19 @@ mod tests {
     #[cfg(feature = "https-proxy")]
     #[test]
     fn https_proxy_defaults_to_loopback() -> Result<()> {
-        let (bind, port) = proxy_defaults("https-proxy")?;
+        let (bind, port) = proxy_defaults(
+            "https-proxy",
+            &[
+                "usque-rs",
+                "https-proxy",
+                "--tls-cert",
+                "proxy.crt",
+                "--tls-key",
+                "proxy.key",
+            ],
+        )?;
         assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(port, 8000);
+        assert_eq!(port, 8443);
         Ok(())
     }
 

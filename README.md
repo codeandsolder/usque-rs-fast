@@ -2,7 +2,7 @@
 
 A tiny Rust rewrite of my previous [usque](https://github.com/Diniboy1123/usque) project. The goal is simple: a decently fast, native tunnel using Cloudflare WARP and its MASQUE-based protocol.
 
-The Rust client has four independently selectable application features: native Linux TUN, HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5/SOCKS5h proxy. Proxy modes use the direct L4 WARP endpoint: one shared QUIC/HTTP/3 connection is reused and each proxied TCP connection is an HTTP/3 CONNECT stream, so proxy builds do not carry a userspace IP/TCP stack.
+The Rust client has four independently selectable application features: native Linux TUN, plaintext HTTP proxy, TLS-wrapped HTTPS proxy, and SOCKS5/SOCKS5h proxy. Proxy modes use the direct L4 WARP endpoint: one shared QUIC/HTTP/3 connection is reused and each proxied TCP connection is an HTTP/3 CONNECT stream, so proxy builds do not carry a userspace IP/TCP stack.
 
 Just like the Go based usque project, `nativetun` won't try to choose or replace your routes; you still control routing policy. The TUN IP addresses and MTU are configured for you.
 
@@ -16,10 +16,10 @@ The default build enables all four runtime capabilities plus the registration co
 # Native TUN only
 cargo build --release --no-default-features --features tun
 
-# Plain HTTP forward proxy only
+# Plaintext HTTP proxy only
 cargo build --release --no-default-features --features http-proxy
 
-# HTTPS CONNECT proxy only
+# TLS-wrapped HTTPS proxy only
 cargo build --release --no-default-features --features https-proxy
 
 # TCP-only SOCKS5/SOCKS5h proxy only
@@ -53,28 +53,34 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 
 Direct L4 is TCP-only. SOCKS5 UDP ASSOCIATE is deliberately reported as unsupported rather than pulling CONNECT-IP and a userspace packet stack back into a SOCKS-only build.
 
-Start the plaintext HTTP forward proxy:
+Start the plaintext HTTP proxy. It supports both ordinary forward-proxy requests and CONNECT:
 
 ```sh
 usque-rs -c config.json http-proxy
 curl --proxy http://127.0.0.1:8000 http://example.com/
 ```
 
-Start the HTTPS CONNECT proxy:
+Start the HTTPS proxy (HTTP proxy protocol over a TLS-protected client-to-proxy connection). A certificate chain and private key are required:
 
 ```sh
-usque-rs -c config.json https-proxy
-curl --proxy http://127.0.0.1:8000 https://example.com/
+usque-rs -c config.json https-proxy \
+  --tls-cert proxy-chain.pem \
+  --tls-key proxy-key.pem
+
+# Trust proxy-chain.pem (or use --proxy-insecure for a local smoke test).
+curl --proxy https://127.0.0.1:8443 \
+  --proxy-cacert proxy-chain.pem \
+  https://example.com/
 ```
 
-When both `http-proxy` and `https-proxy` are compiled (including the default build), the `http-proxy` command also accepts CONNECT for backwards compatibility. `https-proxy` remains CONNECT-only.
+Both HTTP and HTTPS proxy listeners support ordinary HTTP forwarding and CONNECT. The feature distinction is the client-to-proxy transport: `http-proxy` is plaintext HTTP, while `https-proxy` wraps the same proxy semantics in TLS.
 
 Optional proxy authentication uses the same flags in all proxy modes:
 
 ```sh
 usque-rs -c config.json socks --username alice --password secret
 usque-rs -c config.json http-proxy --username alice --password secret
-usque-rs -c config.json https-proxy --username alice --password secret
+usque-rs -c config.json https-proxy --tls-cert proxy-chain.pem --tls-key proxy-key.pem --username alice --password secret
 ```
 
 For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected. `--source-ip` pins the shared outer MASQUE UDP socket to a specific host address.

@@ -2800,6 +2800,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-rustls",
  "tun-rs",
  "webpki-roots",
  "x509-cert",
