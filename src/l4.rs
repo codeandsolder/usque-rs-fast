@@ -627,59 +627,7 @@ impl Session {
         loop {
             match self.h3.poll(&mut self.conn) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, more_frames })) => {
-                    let status = status_code(&list);
-                    let Some(state) = self.streams.get_mut(&stream_id) else {
-                        continue;
-                    };
-                    if !state.is_opening() {
-                        continue;
-                    }
-                    match status {
-                        Some(code) if code < 200 => {}
-                        Some(code) if (200..300).contains(&code) && more_frames => {
-                            let Some(bridge_tx) = command_tx.upgrade() else {
-                                fail_opening(
-                                    state,
-                                    io::Error::new(
-                                        io::ErrorKind::BrokenPipe,
-                                        "L4 client stopped before CONNECT completed",
-                                    ),
-                                );
-                                state.receive_state = ReceiveState::Finished;
-                                state.send_state = SendState::Finished;
-                                continue;
-                            };
-                            let (application, bridge) = tokio::io::duplex(STREAM_BRIDGE_BYTES);
-                            spawn_stream_bridge(stream_id, bridge, bridge_tx);
-                            if let Some(reply) = state.mark_open() {
-                                let _ = reply.send(Ok(application));
-                            }
-                            log::debug!(
-                                "L4 CONNECT {} opened on H3 stream {stream_id}",
-                                state.authority
-                            );
-                        }
-                        Some(code) if (200..300).contains(&code) => {
-                            fail_opening(
-                                state,
-                                io::Error::new(
-                                    io::ErrorKind::ConnectionReset,
-                                    "CONNECT response closed the request stream",
-                                ),
-                            );
-                            state.receive_state = ReceiveState::Finished;
-                            state.send_state = SendState::Finished;
-                        }
-                        Some(code) => {
-                            fail_opening(
-                                state,
-                                io::Error::other(format!("CONNECT rejected with status {code}")),
-                            );
-                            state.receive_state = ReceiveState::Finished;
-                            state.send_state = SendState::Finished;
-                        }
-                        None => {}
-                    }
+                    self.process_h3_headers(stream_id, &list, more_frames, command_tx);
                 }
                 Ok((stream_id, quiche::h3::Event::Data)) => {
                     if let Some(state) = self.streams.get_mut(&stream_id) {
@@ -725,6 +673,68 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn process_h3_headers(
+        &mut self,
+        stream_id: u64,
+        headers: &[quiche::h3::Header],
+        more_frames: bool,
+        command_tx: &mpsc::WeakSender<Command>,
+    ) {
+        let status = status_code(headers);
+        let Some(state) = self.streams.get_mut(&stream_id) else {
+            return;
+        };
+        if !state.is_opening() {
+            return;
+        }
+        match status {
+            Some(code) if code < 200 => {}
+            Some(code) if (200..300).contains(&code) && more_frames => {
+                let Some(bridge_tx) = command_tx.upgrade() else {
+                    fail_opening(
+                        state,
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "L4 client stopped before CONNECT completed",
+                        ),
+                    );
+                    state.receive_state = ReceiveState::Finished;
+                    state.send_state = SendState::Finished;
+                    return;
+                };
+                let (application, bridge) = tokio::io::duplex(STREAM_BRIDGE_BYTES);
+                spawn_stream_bridge(stream_id, bridge, bridge_tx);
+                if let Some(reply) = state.mark_open() {
+                    let _ = reply.send(Ok(application));
+                }
+                log::debug!(
+                    "L4 CONNECT {} opened on H3 stream {stream_id}",
+                    state.authority
+                );
+            }
+            Some(code) if (200..300).contains(&code) => {
+                fail_opening(
+                    state,
+                    io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "CONNECT response closed the request stream",
+                    ),
+                );
+                state.receive_state = ReceiveState::Finished;
+                state.send_state = SendState::Finished;
+            }
+            Some(code) => {
+                fail_opening(
+                    state,
+                    io::Error::other(format!("CONNECT rejected with status {code}")),
+                );
+                state.receive_state = ReceiveState::Finished;
+                state.send_state = SendState::Finished;
+            }
+            None => {}
+        }
     }
 
     fn expire_connects(&mut self) {
