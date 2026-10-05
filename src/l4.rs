@@ -335,16 +335,13 @@ impl L4Client {
         }
 
         for record in &message.answers {
-            let address = match record.data() {
+            let address = match &record.data {
                 RData::A(value) => Some(IpAddr::V4(value.0)),
                 RData::AAAA(value) => Some(IpAddr::V6(value.0)),
                 _ => None,
             };
             if let Some(address) = address {
-                return Ok(Some((
-                    address,
-                    Duration::from_secs(u64::from(record.ttl())),
-                )));
+                return Ok(Some((address, Duration::from_secs(u64::from(record.ttl)))));
             }
         }
         Ok(None)
