@@ -12,11 +12,11 @@ path = "src/main.rs"
 
 [features]
 default = ["tun", "http-proxy", "https-proxy", "socks5-proxy", "register"]
-tun = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:thiserror", "dep:datagram-socket", "dep:futures", "dep:octets", "dep:rtnetlink", "dep:tun-rs"]
-http-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util"]
-https-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/http1", "hyper/server", "dep:hyper-util"]
-socks5-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:fast-socks5"]
-register = ["dep:reqwest", "dep:rustls", "dep:webpki-roots"]
+tun = ["dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:thiserror", "dep:datagram-socket", "dep:futures", "dep:octets", "dep:rtnetlink", "dep:tun-rs"]
+http-proxy = ["dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util"]
+https-proxy = ["dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/http1", "hyper/server", "dep:hyper-util"]
+socks5-proxy = ["dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:fast-socks5"]
+register = ["dep:env_logger", "dep:reqwest", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 quiche = { version = "0.30.0", optional = true }
@@ -33,7 +33,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = { version = "1", optional = true }
 base64 = "0.23"
 log = "0.4"
-env_logger = "0.11"
+env_logger = { version = "0.11", optional = true }
 anyhow = "1"
 thiserror = { version = "2", optional = true }
 rcgen = "0.14"

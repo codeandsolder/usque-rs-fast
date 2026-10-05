@@ -500,16 +500,27 @@ fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<
 ))]
 mod tests {
     use super::*;
-    use clap::Parser;
-    use std::net::Ipv4Addr;
+    use clap::CommandFactory;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn proxy_defaults(command: &str) -> Result<(IpAddr, u16)> {
+        let matches = Cli::command().try_get_matches_from(["usque-rs", command])?;
+        let subcommand = matches
+            .subcommand_matches(command)
+            .ok_or_else(|| anyhow::anyhow!("expected {command} subcommand"))?;
+        let bind = *subcommand
+            .get_one::<IpAddr>("bind")
+            .ok_or_else(|| anyhow::anyhow!("missing bind default"))?;
+        let port = *subcommand
+            .get_one::<u16>("port")
+            .ok_or_else(|| anyhow::anyhow!("missing port default"))?;
+        Ok((bind, port))
+    }
 
     #[cfg(feature = "socks5-proxy")]
     #[test]
     fn socks_defaults_to_loopback() -> Result<()> {
-        let cli = Cli::try_parse_from(["usque-rs", "socks"])?;
-        let Commands::Socks { bind, port, .. } = cli.command else {
-            anyhow::bail!("expected SOCKS command");
-        };
+        let (bind, port) = proxy_defaults("socks")?;
         assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(port, 1080);
         Ok(())
@@ -518,10 +529,7 @@ mod tests {
     #[cfg(feature = "http-proxy")]
     #[test]
     fn http_proxy_defaults_to_loopback() -> Result<()> {
-        let cli = Cli::try_parse_from(["usque-rs", "http-proxy"])?;
-        let Commands::HttpProxy { bind, port, .. } = cli.command else {
-            anyhow::bail!("expected HTTP proxy command");
-        };
+        let (bind, port) = proxy_defaults("http-proxy")?;
         assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(port, 8000);
         Ok(())
@@ -530,20 +538,12 @@ mod tests {
     #[cfg(feature = "https-proxy")]
     #[test]
     fn https_proxy_defaults_to_loopback() -> Result<()> {
-        let cli = Cli::try_parse_from(["usque-rs", "https-proxy"])?;
-        let Commands::HttpsProxy { bind, port, .. } = cli.command else {
-            anyhow::bail!("expected HTTPS proxy command");
-        };
+        let (bind, port) = proxy_defaults("https-proxy")?;
         assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(port, 8000);
         Ok(())
     }
 
-    #[cfg(any(
-        feature = "http-proxy",
-        feature = "https-proxy",
-        feature = "socks5-proxy"
-    ))]
     #[test]
     fn proxy_authentication_requires_a_complete_pair() {
         assert!(validate_auth_pair(None, None).is_ok());
