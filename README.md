@@ -84,7 +84,7 @@ Since my router is a literal **hot potato**, I wanted to get this working with z
 
 Performance is measured with a two-tier end-to-end CONNECT-IP harness rather than process CPU alone. The primary metric is raw host-wide CPU seconds per steady inner-L3 Gbit, with separate low-end MT7621 and high-end EPYC targets, calibrated 8-second steady windows, quality/saturation gates, and pinned-stack A/B comparisons across usque, quiche, and tun-rs.
 
-See [Performance benchmarking](docs/BENCHMARKING.md) for the complete methodology, calibration, profiler workflow, representative results, negative results, and the mistakes future benchmark work should avoid.
+See [Performance benchmarking](docs/BENCHMARKING.md) for the complete methodology, calibration, profiler workflow, and representative results. Before proposing another native-TUN optimization, also search [Rejected, neutral, and superseded performance experiments](docs/REJECTED_OPTIMIZATIONS.md); it records the dead ends, policy variants, aliases, and conditions that would actually justify revisiting them.
 
 As a separate field datapoint, the project has also saturated a 150 Mbit/s downstream / 30 Mbit/s upstream residential link on a `Cudy WR3000P v1` (MediaTek dual-core Cortex-A53). That observation is not used as controlled benchmark evidence.
 

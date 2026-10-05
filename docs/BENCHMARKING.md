@@ -258,28 +258,19 @@ Representative matched RX results for the `adaptive4` candidate:
 
 The exact best policy evolved during the campaign; the durable result is that TUN write aggregation is a real whole-host lever, but it must be bounded to avoid latency/pathological buffering.
 
-### Checksum work
+### Checksum work — early positive screen, later rejected
 
-A checksum-path optimization was independently measurable at high-tier RX 100 Mbit/s:
+An early high-tier RX 100 Mbit/s comparison made the checksum candidate look independently useful:
 
 - baseline: 3.319 host s/Gbit,
 - checksum candidate: 3.228 host s/Gbit,
 - approximately **-2.73%** raw host CPU/Gbit.
 
-It also reduced kernel CPU/Gbit materially in that comparison, which is why host-wide accounting was useful.
+The same campaign also had an early adaptive-TUN-write + checksum combination at 3.100 host s/Gbit versus the 3.319 baseline (about **-6.59%**) with matched inner throughput.
 
-### Combined adaptive TUN write + checksum
+Those runs are retained as historical evidence of why repeated current-stack confirmation matters, **not** as the final checksum conclusion. After the surrounding stack stabilized, two independent five-pair RX100 campaigns produced ten accepted current-stack pairs: checksum SAD had a **+2.17% median idle-adjusted host CPU/Gbit**, +2.14% raw-host median, and only 2/10 host wins. The final native profiles also put checksum at only about 0.7–1.2% self cycles.
 
-At the same matched high-tier RX 100 Mbit/s point:
-
-- baseline: 3.319 host s/Gbit,
-- combined: 3.100 host s/Gbit,
-- approximately **-6.59%** raw host CPU/Gbit,
-- inner throughput was effectively unchanged.
-
-The combined gain was larger than either single change in that run and included a substantial kernel-CPU reduction.
-
-This is a good example of why a whole-stack harness is needed even when the code changes live in different repositories.
+**Current disposition: reject checksum SAD as an end-to-end tunnel optimization.** See [Rejected, neutral, and superseded performance experiments](REJECTED_OPTIMIZATIONS.md#8-tun-rs-checksum-specialization) for the local microbenchmark gains and the superseding whole-tunnel result.
 
 ### quiche receive/hot-path work
 
@@ -358,6 +349,8 @@ Those numbers are useful only inside the profiler experiment. Do not compare the
 ## Experiment families explored
 
 The campaign generated many intermediate candidates. Their names are useful breadcrumbs if archived artifacts are available, but names alone are not evidence.
+
+Before proposing another native-TUN optimization, also read [Rejected, neutral, and superseded performance experiments](REJECTED_OPTIMIZATIONS.md). It records the failed variants, neutral results, superseded policy revisions, aliases, and the conditions under which a closed idea is actually worth revisiting. In particular, the roughly fifty named candidate configurations collapse to about a dozen mechanism families; much of the count came from controlled policy and parameter variants rather than independent architectural ideas.
 
 ### Harness / measurement
 - cgroup-v2 accounting correction,
