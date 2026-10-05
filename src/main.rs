@@ -11,7 +11,9 @@
 
 //! usque-rs - MASQUE client for Cloudflare WARP.
 
-use anyhow::{Context, Result};
+#[cfg(feature = "register")]
+use anyhow::Context;
+use anyhow::Result;
 #[cfg(any(
     feature = "http-proxy",
     feature = "https-proxy",
@@ -32,6 +34,7 @@ use std::net::IpAddr;
     feature = "socks5-proxy"
 ))]
 use std::time::Duration;
+#[cfg(any(feature = "register", feature = "tun"))]
 use usque_rs::config;
 #[cfg(any(
     feature = "http-proxy",
@@ -188,75 +191,93 @@ enum Commands {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    env_logger::init();
-    let cli = Cli::parse();
+    #[cfg(not(any(
+        feature = "register",
+        feature = "tun",
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    )))]
+    anyhow::bail!("usque-rs was built without any capability feature");
 
-    match cli.command {
-        #[cfg(feature = "register")]
-        Commands::Register {
-            locale,
-            model,
-            name,
-            jwt,
-        } => cmd_register(&cli.config, &locale, &model, name, jwt).await,
+    #[cfg(any(
+        feature = "register",
+        feature = "tun",
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    ))]
+    {
+        env_logger::init();
+        let cli = Cli::parse();
 
-        #[cfg(feature = "tun")]
-        Commands::NativeTun {
-            connect_port,
-            ipv6,
-            no_tunnel_ipv4,
-            no_tunnel_ipv6,
-            sni_address,
-            keepalive_period,
-            mtu,
-            no_iproute2,
-            interface_name,
-        } => {
-            cmd_nativetun(
-                &cli.config,
-                NativeTunOptions {
-                    connect_port,
-                    addresses: AddressSelection {
-                        use_ipv6_endpoint: ipv6,
-                        no_tunnel_ipv4,
-                        no_tunnel_ipv6,
+        match cli.command {
+            #[cfg(feature = "register")]
+            Commands::Register {
+                locale,
+                model,
+                name,
+                jwt,
+            } => cmd_register(&cli.config, &locale, &model, name, jwt).await,
+
+            #[cfg(feature = "tun")]
+            Commands::NativeTun {
+                connect_port,
+                ipv6,
+                no_tunnel_ipv4,
+                no_tunnel_ipv6,
+                sni_address,
+                keepalive_period,
+                mtu,
+                no_iproute2,
+                interface_name,
+            } => {
+                cmd_nativetun(
+                    &cli.config,
+                    NativeTunOptions {
+                        connect_port,
+                        addresses: AddressSelection {
+                            use_ipv6_endpoint: ipv6,
+                            no_tunnel_ipv4,
+                            no_tunnel_ipv6,
+                        },
+                        sni: sni_address,
+                        keepalive_period: Duration::from_secs(keepalive_period),
+                        mtu,
+                        no_iproute2,
+                        interface_name,
                     },
-                    sni: sni_address,
-                    keepalive_period: Duration::from_secs(keepalive_period),
-                    mtu,
-                    no_iproute2,
-                    interface_name,
-                },
-            )
-            .await
+                )
+                .await
+            }
+
+            #[cfg(feature = "socks5-proxy")]
+            Commands::Socks {
+                bind,
+                port,
+                username,
+                password,
+                transport,
+            } => cmd_socks(&cli.config, bind, port, username, password, &transport).await,
+
+            #[cfg(feature = "http-proxy")]
+            Commands::HttpProxy {
+                bind,
+                port,
+                username,
+                password,
+                transport,
+            } => cmd_http_proxy(&cli.config, bind, port, username, password, &transport).await,
+
+            #[cfg(feature = "https-proxy")]
+            Commands::HttpsProxy {
+                bind,
+                port,
+                username,
+                password,
+                transport,
+            } => cmd_https_proxy(&cli.config, bind, port, username, password, &transport).await,
         }
-
-        #[cfg(feature = "socks5-proxy")]
-        Commands::Socks {
-            bind,
-            port,
-            username,
-            password,
-            transport,
-        } => cmd_socks(&cli.config, bind, port, username, password, &transport).await,
-
-        #[cfg(feature = "http-proxy")]
-        Commands::HttpProxy {
-            bind,
-            port,
-            username,
-            password,
-            transport,
-        } => cmd_http_proxy(&cli.config, bind, port, username, password, &transport).await,
-
-        #[cfg(feature = "https-proxy")]
-        Commands::HttpsProxy {
-            bind,
-            port,
-            username,
-            password,
-            transport,
-        } => cmd_https_proxy(&cli.config, bind, port, username, password, &transport).await,
     }
 }
 
