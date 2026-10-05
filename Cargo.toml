@@ -3,19 +3,26 @@ name = "usque-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Tiny Rust MASQUE (CONNECT-IP) client for Cloudflare WARP (unofficial)"
+description = "Rust MASQUE client for Cloudflare WARP with native TUN and direct-L4 proxy modes (unofficial)"
 license = "MIT"
 
 [[bin]]
 name = "usque-rs"
 path = "src/main.rs"
 
-[dependencies]
-quiche = "0.30.0"
-octets = "0.3"
-bytes = "1"
+[features]
+default = ["tun", "http-proxy", "https-proxy", "socks5-proxy"]
+tun = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:datagram-socket", "dep:futures", "dep:octets", "dep:rtnetlink", "dep:tun-rs"]
+http-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util"]
+https-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/http1", "hyper/server", "dep:hyper-util"]
+socks5-proxy = ["tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:hickory-proto", "dep:fast-socks5"]
 
-tokio = { version = "1", features = ["io-util", "net", "macros", "rt", "sync", "time"] }
+[dependencies]
+quiche = { version = "0.30.0", optional = true }
+octets = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
+
+tokio = { version = "1", features = ["macros", "rt"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,20 +38,19 @@ thiserror = "2"
 rcgen = "0.14"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pem", "std"] }
 x509-cert = { version = "0.3", default-features = false, features = ["pem"] }
-tun-rs = { version = "2.8.8", features = ["async"] }
-rtnetlink = "0.23"
-futures = "0.3"
+tun-rs = { version = "2.8.8", features = ["async"], optional = true }
+rtnetlink = { version = "0.23", optional = true }
+futures = { version = "0.3", optional = true }
 tempfile = "3"
 time = "0.3"
-socket2 = "0.6"
-nix = { version = "0.31.3", features = ["net", "socket", "time", "uio"] }
-datagram-socket = "0.8.0"
-fast-socks5 = "1"
-smoltcp = { version = "0.14", default-features = false, features = ["std", "async", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "socket-tcp", "socket-tcp-reno", "socket-udp", "socket-dns", "dns-max-result-count-8", "dns-max-server-count-4"] }
-hyper = { version = "1", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-quick_cache = "0.7.0"
+socket2 = { version = "0.6", optional = true }
+nix = { version = "0.31.3", features = ["net", "socket", "time", "uio"], optional = true }
+datagram-socket = { version = "0.8.0", optional = true }
+fast-socks5 = { version = "1", optional = true }
+hyper = { version = "1", default-features = false, optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hickory-proto = { version = "0.26.3", optional = true }
 
 [lints.rust]
 unsafe_code = "deny"

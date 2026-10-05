@@ -1,12 +1,13 @@
-use super::net::VirtualNet;
+use crate::l4::L4Client;
 use anyhow::Result;
 use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
+#[cfg(feature = "http-proxy")]
+use hyper::client::conn::http1 as client_http1;
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
     body::Incoming,
-    client::conn::http1 as client_http1,
     header::{CONNECTION, HOST, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
     server::conn::http1 as server_http1,
     service::service_fn,
@@ -25,12 +26,17 @@ pub struct HttpConfig {
     pub password: Option<String>,
 }
 
-/// Serve HTTP/1.1 forward-proxy and CONNECT requests on the configured listener.
+/// Serve whichever HTTP proxy modes were compiled and enabled by the caller.
 ///
 /// # Errors
-/// Returns an error when authentication configuration is incomplete, the listener
-/// cannot be bound or accepted, or the underlying userspace WARP network stops.
-pub async fn serve(config: HttpConfig, net: Arc<VirtualNet>) -> Result<()> {
+/// Returns an error when authentication configuration is incomplete or the listener
+/// cannot be bound or accepted.
+pub async fn serve(
+    config: HttpConfig,
+    l4: Arc<L4Client>,
+    allow_forward_http: bool,
+    allow_connect: bool,
+) -> Result<()> {
     let expected_auth = match (&config.username, &config.password) {
         (Some(username), Some(password)) => Some(format!(
             "Basic {}",
@@ -43,21 +49,26 @@ pub async fn serve(config: HttpConfig, net: Arc<VirtualNet>) -> Result<()> {
     let listener = TcpListener::bind(config.bind).await?;
     log::info!("HTTP proxy listening on {}", config.bind);
 
-    let closed = net.wait_closed();
-    tokio::pin!(closed);
-
     loop {
-        let (stream, peer) = tokio::select! {
-            result = listener.accept() => result?,
-            () = &mut closed => anyhow::bail!("userspace WARP network stopped"),
-        };
-        let net = net.clone();
+        let (stream, peer) = listener.accept().await?;
+        let l4 = l4.clone();
         let expected_auth = expected_auth.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
-                let net = net.clone();
+                let l4 = l4.clone();
                 let expected_auth = expected_auth.clone();
-                async move { Ok::<_, Infallible>(handle(request, net, expected_auth.as_deref()).await) }
+                async move {
+                    Ok::<_, Infallible>(
+                        handle(
+                            request,
+                            l4,
+                            expected_auth.as_deref(),
+                            allow_forward_http,
+                            allow_connect,
+                        )
+                        .await,
+                    )
+                }
             });
 
             if let Err(error) = server_http1::Builder::new()
@@ -74,9 +85,11 @@ pub async fn serve(config: HttpConfig, net: Arc<VirtualNet>) -> Result<()> {
 }
 
 async fn handle(
-    mut request: Request<Incoming>,
-    net: Arc<VirtualNet>,
+    request: Request<Incoming>,
+    l4: Arc<L4Client>,
     expected_auth: Option<&str>,
+    allow_forward_http: bool,
+    allow_connect: bool,
 ) -> Response<ProxyBody> {
     if let Some(expected) = expected_auth {
         let provided = request
@@ -95,9 +108,32 @@ async fn handle(
     }
 
     if request.method() == Method::CONNECT {
-        return handle_connect(request, net).await;
+        #[cfg(feature = "https-proxy")]
+        if allow_connect {
+            return handle_connect(request, l4).await;
+        }
+        let _ = allow_connect;
+        return text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "CONNECT proxy support is not compiled/enabled",
+        );
     }
 
+    #[cfg(feature = "http-proxy")]
+    {
+        if allow_forward_http {
+            return handle_forward(request, l4).await;
+        }
+    }
+    let _ = (request, l4, allow_forward_http);
+    text_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "plain HTTP proxy support is not compiled/enabled",
+    )
+}
+
+#[cfg(feature = "http-proxy")]
+async fn handle_forward(mut request: Request<Incoming>, l4: Arc<L4Client>) -> Response<ProxyBody> {
     let (host, port) = match request_target(&request, 80) {
         Ok(target) => target,
         Err(message) => return text_response(StatusCode::BAD_REQUEST, message),
@@ -114,7 +150,7 @@ async fn handle(
         );
     }
 
-    let remote = match net.dial_host(&host, port).await {
+    let remote = match l4.dial_host(&host, port).await {
         Ok(remote) => remote,
         Err(error) => {
             log::debug!("HTTP proxy dial to {host}:{port} failed: {error}");
@@ -158,13 +194,14 @@ async fn handle(
     )
 }
 
-async fn handle_connect(request: Request<Incoming>, net: Arc<VirtualNet>) -> Response<ProxyBody> {
+#[cfg(feature = "https-proxy")]
+async fn handle_connect(request: Request<Incoming>, l4: Arc<L4Client>) -> Response<ProxyBody> {
     let (host, port) = match request_target(&request, 443) {
         Ok(target) => target,
         Err(message) => return text_response(StatusCode::BAD_REQUEST, message),
     };
 
-    let mut remote = match net.dial_host(&host, port).await {
+    let mut remote = match l4.dial_host(&host, port).await {
         Ok(remote) => remote,
         Err(error) => {
             log::debug!("HTTP CONNECT dial to {host}:{port} failed: {error}");
@@ -188,6 +225,7 @@ async fn handle_connect(request: Request<Incoming>, net: Arc<VirtualNet>) -> Res
     response_with_status(StatusCode::OK, empty_body())
 }
 
+#[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
 fn request_target(
     request: &Request<Incoming>,
     default_port: u16,
@@ -239,6 +277,7 @@ fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), 
     }
 }
 
+#[cfg(feature = "http-proxy")]
 fn rewrite_for_origin<B>(request: &mut Request<B>) -> Result<(), &'static str> {
     let authority = request.uri().authority().cloned();
     let path_and_query = request
@@ -258,6 +297,7 @@ fn rewrite_for_origin<B>(request: &mut Request<B>) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[cfg(feature = "http-proxy")]
 fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
     let connection_tokens = headers
         .get_all(CONNECTION)
@@ -313,6 +353,7 @@ fn text_response(status: StatusCode, message: &'static str) -> Response<ProxyBod
 mod tests {
     use super::*;
 
+    #[cfg(feature = "http-proxy")]
     #[test]
     fn absolute_form_request_rewrites_host_for_origin() -> Result<()> {
         let mut request = Request::builder()
@@ -330,6 +371,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "http-proxy")]
     #[test]
     fn origin_form_request_keeps_existing_host() -> Result<()> {
         let mut request = Request::builder()
@@ -347,6 +389,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "http-proxy")]
     #[test]
     fn strips_connection_named_hop_by_hop_headers() {
         let mut headers = hyper::HeaderMap::new();

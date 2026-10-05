@@ -1,4 +1,4 @@
+#[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
 pub mod http;
-pub mod net;
-pub mod session;
+#[cfg(feature = "socks5-proxy")]
 pub mod socks;

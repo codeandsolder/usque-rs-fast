@@ -92,6 +92,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
 ///
 /// Returns an error if quiche rejects the TLS/QUIC configuration or if the
 /// temporary certificate/key paths cannot be represented as UTF-8.
+#[cfg(feature = "tun")]
 pub fn build_quic_config(
     tls_material: &TlsMaterial,
     max_datagram_size: usize,
@@ -142,6 +143,65 @@ pub fn build_quic_config(
     quic_config.set_initial_max_streams_uni(100);
     quic_config.set_disable_active_migration(true);
     quic_config.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
+
+    Ok(quic_config)
+}
+
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+/// Build the QUIC configuration used by the direct L4 HTTP/3 CONNECT transport.
+///
+/// Unlike CONNECT-IP, this transport carries byte streams and intentionally
+/// leaves QUIC DATAGRAM support disabled.
+///
+/// # Errors
+/// Returns an error if quiche rejects the TLS/QUIC configuration or if the
+/// temporary certificate/key paths cannot be represented as UTF-8.
+pub fn build_l4_quic_config(
+    tls_material: &TlsMaterial,
+    max_datagram_size: usize,
+) -> Result<quiche::Config> {
+    let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
+        .map_err(|error| anyhow::anyhow!("quiche config: {error}"))?;
+
+    quic_config.verify_peer(false);
+    quic_config
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .map_err(|error| anyhow::anyhow!("set ALPN: {error}"))?;
+    quic_config
+        .set_curves_list("X25519:P-256:P-384")
+        .map_err(|error| anyhow::anyhow!("set TLS curves: {error}"))?;
+
+    let cert_path = tls_material
+        .cert_pem_file
+        .path()
+        .to_str()
+        .context("temporary certificate path is not valid UTF-8")?;
+    let key_path = tls_material
+        .key_pem_file
+        .path()
+        .to_str()
+        .context("temporary private-key path is not valid UTF-8")?;
+    quic_config
+        .load_cert_chain_from_pem_file(cert_path)
+        .map_err(|error| anyhow::anyhow!("load cert: {error}"))?;
+    quic_config
+        .load_priv_key_from_pem_file(key_path)
+        .map_err(|error| anyhow::anyhow!("load key: {error}"))?;
+
+    quic_config.set_max_idle_timeout(0);
+    quic_config.set_max_recv_udp_payload_size(max_datagram_size);
+    quic_config.set_max_send_udp_payload_size(max_datagram_size);
+    quic_config.set_initial_max_data(10_000_000);
+    quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
+    quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    quic_config.set_initial_max_stream_data_uni(1_000_000);
+    quic_config.set_initial_max_streams_bidi(100);
+    quic_config.set_initial_max_streams_uni(100);
+    quic_config.set_disable_active_migration(true);
 
     Ok(quic_config)
 }

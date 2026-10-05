@@ -1,3 +1,5 @@
+#![cfg(feature = "tun")]
+
 //! Integration tests for tunnel MTU handling.
 //!
 //! **Requires root or `CAP_NET_ADMIN`** - tests are skipped otherwise.
