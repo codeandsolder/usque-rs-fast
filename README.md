@@ -29,16 +29,16 @@ cargo build --release --no-default-features --features socks5-proxy
 cargo build --release --no-default-features --features register
 ```
 
-Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends or Hyper; a SOCKS5-only build likewise avoids Hyper and rustls. Registration uses the same Hyper/rustls stack as the full build instead of a second HTTP-client stack. Saved-config parsing remains available to every runtime build. The `register` feature is separate and is included in the default feature set for backwards compatibility.
+Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends or Hyper; a SOCKS5-only build likewise avoids Hyper and rustls. Registration uses the same Hyper/rustls stack as the full build instead of a second HTTP-client stack. Saved-config parsing remains available to every runtime build. The `register` feature is separate and is included in the default feature set.
 
 ## Proxy modes
 
-All proxy listeners bind to loopback by default. Binding to a non-loopback address is explicit; if you do that, configure `--username` and `--password` together unless you deliberately want an unauthenticated proxy.
+All proxy frontends run under a single `proxy` command. The command creates one shared direct-L4 WARP session, then attaches any selected SOCKS5, HTTP, and HTTPS listeners to that same session. Multiple listeners therefore share the same outer QUIC/HTTP/3 connection and WARP egress identity.
 
-Start a SOCKS5 proxy:
+Expose a SOCKS5/SOCKS5h listener:
 
 ```sh
-usque-rs -c config.json socks
+usque-rs -c config.json proxy --socks5 127.0.0.1:1080
 ```
 
 The distinction between SOCKS5 and SOCKS5h is made by the client. SOCKS5h hostnames are resolved with a small in-tree DNS-over-TCP implementation through the same WARP L4 transport, so hostname resolution does not fall back to the host resolver. Repeat `--dns-server IP` to select resolvers; the default pair is `1.1.1.1` and `8.8.8.8`. Positive answers are cached with their DNS TTL in a bounded cache. Hostnames are expected in ASCII DNS form; normal clients already send IDNA names as punycode, while raw non-ASCII input is rejected.
@@ -53,17 +53,18 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 
 Direct L4 is TCP-only. SOCKS5 UDP ASSOCIATE is deliberately reported as unsupported rather than pulling CONNECT-IP and a userspace packet stack back into a SOCKS-only build.
 
-Start the plaintext HTTP proxy. It supports both ordinary forward-proxy requests and CONNECT:
+Expose a plaintext HTTP proxy. It supports both ordinary forward-proxy requests and CONNECT:
 
 ```sh
-usque-rs -c config.json http-proxy
+usque-rs -c config.json proxy --http 127.0.0.1:8000
 curl --proxy http://127.0.0.1:8000 http://example.com/
 ```
 
-Start the HTTPS proxy (HTTP proxy protocol over a TLS-protected client-to-proxy connection). A certificate chain and private key are required:
+Expose an HTTPS proxy (HTTP proxy protocol over a TLS-protected client-to-proxy connection). A certificate chain and private key are required:
 
 ```sh
-usque-rs -c config.json https-proxy \
+usque-rs -c config.json proxy \
+  --https 127.0.0.1:8443 \
   --tls-cert proxy-chain.pem \
   --tls-key proxy-key.pem
 
@@ -73,16 +74,28 @@ curl --proxy https://127.0.0.1:8443 \
   https://example.com/
 ```
 
-Both HTTP and HTTPS proxy listeners support ordinary HTTP forwarding and CONNECT. The feature distinction is the client-to-proxy transport: `http-proxy` is plaintext HTTP, while `https-proxy` wraps the same proxy semantics in TLS.
+Expose all three at once. All listeners below use the same `L4Client` and therefore the same outer MASQUE session:
+
+```sh
+usque-rs -c config.json proxy \
+  --socks5 127.0.0.1:1080 \
+  --http 127.0.0.1:8000 \
+  --https 127.0.0.1:8443 \
+  --tls-cert proxy-chain.pem \
+  --tls-key proxy-key.pem
+```
+
+Both HTTP and HTTPS listeners support ordinary HTTP forwarding and CONNECT. The distinction is the client-to-proxy transport: HTTP is plaintext, while HTTPS wraps the same proxy semantics in TLS.
 
 SOCKS5 and HTTP CONNECT relay application bytes unchanged, preserving the client TLS/application fingerprint end-to-end. Plain HTTP forwarding necessarily parses and rewrites proxy-form requests, but preserves original HTTP/1 header casing where Hyper supports proxy-style forwarding.
 
-Optional proxy authentication uses the same flags in all proxy modes:
+Optional proxy authentication is shared by all selected listeners:
 
 ```sh
-usque-rs -c config.json socks --username alice --password secret
-usque-rs -c config.json http-proxy --username alice --password secret
-usque-rs -c config.json https-proxy --tls-cert proxy-chain.pem --tls-key proxy-key.pem --username alice --password secret
+usque-rs -c config.json proxy \
+  --socks5 127.0.0.1:1080 \
+  --http 127.0.0.1:8000 \
+  --username alice --password secret
 ```
 
 For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected. `--source-ip` pins the shared outer MASQUE UDP socket to a specific host address.
