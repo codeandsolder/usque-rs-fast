@@ -35,11 +35,13 @@ Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling
 
 All proxy frontends run under a single `proxy` command. The command creates one shared direct-L4 WARP session, then attaches any selected SOCKS5, HTTP, and HTTPS listeners to that same session. Multiple listeners therefore share the same outer QUIC/HTTP/3 connection and WARP egress identity.
 
-Expose a SOCKS5/SOCKS5h listener:
+Expose an explicit passwordless SOCKS5/SOCKS5h listener on a non-public address:
 
 ```sh
-usque-rs -c config.json proxy --socks5 127.0.0.1:1080
+usque-rs -c config.json proxy --socks5-no-auth 127.0.0.1:1080
 ```
+
+`--socks5-no-auth` rejects public, wildcard, multicast, and documentation-only bind addresses. Allowed namespaces are loopback, RFC1918 LAN, CGNAT/Tailscale `100.64.0.0/10`, IPv4 link-local, `198.18.0.0/15` benchmark/lab space, IPv6 ULA, and IPv6 link-local. Authenticated `--socks5` requires credentials and is the only SOCKS mode permitted on globally routable binds.
 
 The distinction between SOCKS5 and SOCKS5h is made by the client. SOCKS5h hostnames are resolved with a small in-tree DNS-over-TCP implementation through the same WARP L4 transport, so hostname resolution does not fall back to the host resolver. Repeat `--dns-server IP` to select resolvers; the default pair is `1.1.1.1` and `8.8.8.8`. Positive answers are cached with their DNS TTL in a bounded cache. Hostnames are expected in ASCII DNS form; normal clients already send IDNA names as punycode, while raw non-ASCII input is rejected.
 
@@ -82,14 +84,15 @@ usque-rs -c config.json proxy \
   --http 127.0.0.1:8000 \
   --https 127.0.0.1:8443 \
   --tls-cert proxy-chain.pem \
-  --tls-key proxy-key.pem
+  --tls-key proxy-key.pem \
+  --username alice --password secret
 ```
 
 Both HTTP and HTTPS listeners support ordinary HTTP forwarding and CONNECT. The distinction is the client-to-proxy transport: HTTP is plaintext, while HTTPS wraps the same proxy semantics in TLS.
 
 SOCKS5 and HTTP CONNECT relay application bytes unchanged, preserving the client TLS/application fingerprint end-to-end. Plain HTTP forwarding necessarily parses and rewrites proxy-form requests, but preserves original HTTP/1 header casing where Hyper supports proxy-style forwarding.
 
-Optional proxy authentication is shared by all selected listeners:
+Proxy credentials are shared by authenticated listeners. SOCKS5 is deliberately split into authenticated `--socks5` and explicit private-only `--socks5-no-auth`:
 
 ```sh
 usque-rs -c config.json proxy \
@@ -98,7 +101,7 @@ usque-rs -c config.json proxy \
   --username alice --password secret
 ```
 
-For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected. `--source-ip` pins the shared outer MASQUE UDP socket to a specific host address.
+For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected. `--auth-file PATH` reads the same `username:password` pair without placing credentials in argv. `--source-ip` pins the shared outer MASQUE UDP socket to a specific host address.
 
 ## Why the rewrite?
 
