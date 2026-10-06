@@ -41,7 +41,7 @@ Start a SOCKS5 proxy:
 usque-rs -c config.json socks
 ```
 
-The distinction between SOCKS5 and SOCKS5h is made by the client. SOCKS5h hostnames are resolved with DNS-over-TCP through the same WARP L4 transport, so hostname resolution does not fall back to the host resolver. Repeat `--dns-server IP` to select resolvers; the default pair is `1.1.1.1` and `8.8.8.8`. Positive answers are cached with their DNS TTL in a bounded cache.
+The distinction between SOCKS5 and SOCKS5h is made by the client. SOCKS5h hostnames are resolved with a small in-tree DNS-over-TCP implementation through the same WARP L4 transport, so hostname resolution does not fall back to the host resolver. Repeat `--dns-server IP` to select resolvers; the default pair is `1.1.1.1` and `8.8.8.8`. Positive answers are cached with their DNS TTL in a bounded cache. Hostnames are expected in ASCII DNS form; normal clients already send IDNA names as punycode, while raw non-ASCII input is rejected.
 
 ```sh
 # Client-side DNS; the proxy receives an IP address.
@@ -74,6 +74,8 @@ curl --proxy https://127.0.0.1:8443 \
 ```
 
 Both HTTP and HTTPS proxy listeners support ordinary HTTP forwarding and CONNECT. The feature distinction is the client-to-proxy transport: `http-proxy` is plaintext HTTP, while `https-proxy` wraps the same proxy semantics in TLS.
+
+SOCKS5 and HTTP CONNECT relay application bytes unchanged, preserving the client TLS/application fingerprint end-to-end. Plain HTTP forwarding necessarily parses and rewrites proxy-form requests, but preserves original HTTP/1 header casing where Hyper supports proxy-style forwarding.
 
 Optional proxy authentication uses the same flags in all proxy modes:
 

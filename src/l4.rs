@@ -1,16 +1,12 @@
 use anyhow::{Context, Result, bail};
-use hickory_proto::{
-    op::{Message, MessageType, Query, ResponseCode},
-    rr::{Name, RData, RecordType},
-};
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use std::{
     collections::HashMap,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant as StdInstant},
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
@@ -18,7 +14,7 @@ use tokio::{
     time::Instant,
 };
 
-use crate::{config, tls, udp_socket::bind_udp_socket};
+use crate::{config, dns, tls, udp_socket::bind_udp_socket};
 
 const MAX_QUIC_DATAGRAM_SIZE: usize = 1350;
 const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,13 +51,7 @@ impl Default for L4Config {
 pub struct L4Client {
     command_tx: mpsc::Sender<Command>,
     dns_servers: Arc<Vec<IpAddr>>,
-    dns_cache: Arc<Mutex<HashMap<String, CachedAddress>>>,
-}
-
-#[derive(Clone, Copy)]
-struct CachedAddress {
-    address: IpAddr,
-    expires_at: StdInstant,
+    dns_cache: Arc<dns::Cache>,
 }
 
 struct DriverConfig {
@@ -237,7 +227,7 @@ impl L4Client {
         Ok(Arc::new(Self {
             command_tx,
             dns_servers: Arc::new(dns_servers),
-            dns_cache: Arc::new(Mutex::new(HashMap::new())),
+            dns_cache: Arc::new(dns::Cache::new(DEFAULT_DNS_CACHE_ENTRIES)),
         }))
     }
 
@@ -278,15 +268,14 @@ impl L4Client {
     }
 
     async fn resolve(&self, host: &str) -> io::Result<IpAddr> {
-        if let Some(address) = self.cached(host)? {
+        let name = dns::canonical_ascii_name(host)?;
+        if let Some(address) = self.dns_cache.get(&name)? {
             return Ok(address);
         }
 
-        let name = Name::from_ascii(host)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let mut queries = tokio::task::JoinSet::new();
         for server in self.dns_servers.iter().copied() {
-            for record_type in [RecordType::A, RecordType::AAAA] {
+            for record_type in [dns::RecordType::A, dns::RecordType::Aaaa] {
                 let client = self.clone();
                 let name = name.clone();
                 queries.spawn(async move { client.query_dns(server, &name, record_type).await });
@@ -298,9 +287,7 @@ impl L4Client {
             match result {
                 Ok(Ok(Some((address, ttl)))) => {
                     queries.abort_all();
-                    if !ttl.is_zero() {
-                        self.cache(host, address, ttl)?;
-                    }
+                    self.dns_cache.insert(&name, address, ttl)?;
                     return Ok(address);
                 }
                 Ok(Ok(None)) => {}
@@ -314,63 +301,24 @@ impl L4Client {
         Err(last_error.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("DNS returned no address for {host}"),
+                format!("DNS returned no address for {name}"),
             )
         }))
-    }
-
-    fn cached(&self, host: &str) -> io::Result<Option<IpAddr>> {
-        let mut cache = self
-            .dns_cache
-            .lock()
-            .map_err(|_| io::Error::other("DNS cache lock poisoned"))?;
-        let cached = match cache.get(host).copied() {
-            Some(entry) if entry.expires_at > StdInstant::now() => Some(entry.address),
-            Some(_) => {
-                cache.remove(host);
-                None
-            }
-            None => None,
-        };
-        drop(cache);
-        Ok(cached)
-    }
-
-    fn cache(&self, host: &str, address: IpAddr, ttl: Duration) -> io::Result<()> {
-        let mut cache = self
-            .dns_cache
-            .lock()
-            .map_err(|_| io::Error::other("DNS cache lock poisoned"))?;
-        if cache.len() >= DEFAULT_DNS_CACHE_ENTRIES && !cache.contains_key(host) {
-            cache.retain(|_, entry| entry.expires_at > StdInstant::now());
-            if cache.len() >= DEFAULT_DNS_CACHE_ENTRIES {
-                cache.clear();
-            }
-        }
-        cache.insert(
-            host.to_owned(),
-            CachedAddress {
-                address,
-                expires_at: StdInstant::now() + ttl.max(Duration::from_secs(1)),
-            },
-        );
-        drop(cache);
-        Ok(())
     }
 
     async fn query_dns(
         &self,
         server: IpAddr,
-        name: &Name,
-        record_type: RecordType,
+        name: &str,
+        record_type: dns::RecordType,
     ) -> io::Result<Option<(IpAddr, Duration)>> {
         let mut stream = self.dial_addr(SocketAddr::new(server, 53)).await?;
-        let mut request = Message::query();
-        request.add_query(Query::query(name.clone(), record_type));
-        let request_id = request.metadata.id;
-        let payload = request
-            .to_vec()
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut id_bytes = [0_u8; 2];
+        ring::rand::SystemRandom::new()
+            .fill(&mut id_bytes)
+            .map_err(|_| io::Error::other("failed to generate DNS query ID"))?;
+        let request_id = u16::from_be_bytes(id_bytes);
+        let payload = dns::build_query(name, record_type, request_id)?;
         let length = u16::try_from(payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "DNS request too large"))?;
         stream.write_all(&length.to_be_bytes()).await?;
@@ -382,38 +330,17 @@ impl L4Client {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))??;
         let response_len = usize::from(u16::from_be_bytes(length_buf));
+        if response_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS server returned an empty message",
+            ));
+        }
         let mut response = vec![0_u8; response_len];
         tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut response))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS response timed out"))??;
-        let message = Message::from_vec(&response)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        if message.metadata.id != request_id
-            || message.metadata.message_type != MessageType::Response
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "DNS response does not match the request",
-            ));
-        }
-        if message.metadata.response_code != ResponseCode::NoError {
-            return Err(io::Error::other(format!(
-                "DNS server returned {}",
-                message.metadata.response_code
-            )));
-        }
-
-        for record in &message.answers {
-            let address = match &record.data {
-                RData::A(value) => Some(IpAddr::V4(value.0)),
-                RData::AAAA(value) => Some(IpAddr::V6(value.0)),
-                _ => None,
-            };
-            if let Some(address) = address {
-                return Ok(Some((address, Duration::from_secs(u64::from(record.ttl)))));
-            }
-        }
-        Ok(None)
+        dns::parse_response(&response, request_id, name, record_type)
     }
 }
 

@@ -11,6 +11,12 @@
 
 pub mod account;
 pub mod config;
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+mod dns;
 #[cfg(feature = "tun")]
 pub mod icmp;
 #[cfg(any(
