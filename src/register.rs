@@ -13,12 +13,9 @@ use hyper::{
     header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderName, HeaderValue, USER_AGENT},
 };
 use hyper_util::rt::TokioIo;
-use ring::rand::SecureRandom;
-use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
 
 const API_HOST: &str = "api.cloudflareclient.com";
 const API_VERSION: &str = "v0a4471";
@@ -69,17 +66,13 @@ struct ApiResponse {
 
 fn random_wg_pubkey() -> Result<String> {
     let mut key = [0u8; 32];
-    ring::rand::SystemRandom::new()
-        .fill(&mut key)
-        .map_err(|_| anyhow::anyhow!("RNG failure"))?;
+    boring::rand::rand_bytes(&mut key).context("RNG failure")?;
     Ok(base64::engine::general_purpose::STANDARD.encode(key))
 }
 
 fn random_android_serial() -> Result<String> {
     let mut serial = [0u8; 8];
-    ring::rand::SystemRandom::new()
-        .fill(&mut serial)
-        .map_err(|_| anyhow::anyhow!("RNG failure"))?;
+    boring::rand::rand_bytes(&mut serial).context("RNG failure")?;
     Ok(format!("{:016x}", u64::from_be_bytes(serial)))
 }
 
@@ -97,17 +90,14 @@ fn cf_time_string() -> String {
     )
 }
 
-fn registration_tls_config() -> Result<Arc<ClientConfig>> {
-    let roots = RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let config =
-        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-            .with_safe_default_protocol_versions()
-            .context("failed to configure TLS protocol versions")?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-    Ok(Arc::new(config))
+fn registration_tls_connector() -> Result<boring::ssl::SslConnector> {
+    use boring::ssl::{SslConnector, SslMethod};
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).context("failed to configure TLS")?;
+    builder
+        .set_alpn_protos(b"\x08http/1.1")
+        .context("failed to configure HTTP/1.1 ALPN")?;
+    Ok(builder.build())
 }
 
 async fn api_request(
@@ -133,12 +123,16 @@ async fn api_request_inner(
     let tcp = TcpStream::connect((API_HOST, 443))
         .await
         .context("failed to connect to Cloudflare registration API")?;
-    let server_name =
-        ServerName::try_from(API_HOST).context("invalid Cloudflare registration API hostname")?;
-    let tls = TlsConnector::from(registration_tls_config()?)
-        .connect(server_name, tcp)
-        .await
-        .context("registration TLS handshake failed")?;
+    let connector = registration_tls_connector()?;
+    let tls = tokio_boring::connect(
+        connector
+            .configure()
+            .context("failed to configure TLS connection")?,
+        API_HOST,
+        tcp,
+    )
+    .await
+    .context("registration TLS handshake failed")?;
 
     let (mut sender, connection) = http1::Builder::new()
         .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
@@ -298,8 +292,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registration_tls_config_builds_with_explicit_ring_and_webpki_roots() {
-        assert!(registration_tls_config().is_ok());
+    fn registration_tls_connector_builds() {
+        assert!(registration_tls_connector().is_ok());
     }
 
     #[test]

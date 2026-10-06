@@ -17,8 +17,6 @@ use std::path::PathBuf;
 use std::{convert::Infallible, error::Error, net::SocketAddr, sync::Arc};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-#[cfg(feature = "https-proxy")]
-use tokio_rustls::TlsAcceptor;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -65,23 +63,17 @@ pub async fn serve_plain(config: HttpConfig, l4: Arc<L4Client>) -> Result<()> {
 /// Returns an error when TLS material cannot be loaded, authentication configuration
 /// is incomplete, or the listener cannot be bound or accepted.
 pub async fn serve_tls(config: HttpConfig, tls: HttpsConfig, l4: Arc<L4Client>) -> Result<()> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use boring::ssl::{AlpnError, SslAcceptor, SslFiletype, SslMethod, select_next_proto};
 
-    let certificates = CertificateDer::pem_file_iter(&tls.certificate)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    anyhow::ensure!(
-        !certificates.is_empty(),
-        "HTTPS proxy certificate file is empty"
-    );
-    let private_key = PrivateKeyDer::from_pem_file(&tls.private_key)?;
-    let mut server_config = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()?
-    .with_no_client_auth()
-    .with_single_cert(certificates, private_key)?;
-    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())?;
+    builder.set_certificate_chain_file(&tls.certificate)?;
+    builder.set_private_key_file(&tls.private_key, SslFiletype::PEM)?;
+    builder.check_private_key()?;
+    builder.set_alpn_select_callback(|_, client| {
+        select_next_proto(b"\x08http/1.1", client).ok_or(AlpnError::NOACK)
+    });
+    let acceptor = Arc::new(builder.build());
+
     let expected_auth = expected_proxy_auth(&config)?;
     let listener = TcpListener::bind(config.bind).await?;
     log::info!("HTTPS proxy listening on {}", config.bind);
@@ -92,7 +84,7 @@ pub async fn serve_tls(config: HttpConfig, tls: HttpsConfig, l4: Arc<L4Client>) 
         let l4 = l4.clone();
         let expected_auth = expected_auth.clone();
         tokio::spawn(async move {
-            match acceptor.accept(stream).await {
+            match tokio_boring::accept(&acceptor, stream).await {
                 Ok(stream) => serve_connection(stream, peer, l4, expected_auth).await,
                 Err(error) => log::debug!("HTTPS proxy TLS handshake from {peer} failed: {error}"),
             }

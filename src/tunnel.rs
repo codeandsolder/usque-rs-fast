@@ -1,7 +1,6 @@
 use anyhow::{Result, bail};
 use datagram_socket::DatagramSocketRecvExt;
 use quiche::h3::NameValue;
-use ring::rand::SecureRandom;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -688,9 +687,7 @@ async fn open_native_quic(config: &Config, tunnel_cfg: &TunnelConfig) -> Result<
     log::info!("UDP GSO enabled: {udp_gso}");
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    ring::rand::SystemRandom::new()
-        .fill(&mut scid)
-        .map_err(|_| anyhow::anyhow!("RNG failure"))?;
+    boring::rand::rand_bytes(&mut scid)?;
     let scid = quiche::ConnectionId::from_ref(&scid);
     let conn = quiche::connect(
         Some(&tunnel_cfg.sni),

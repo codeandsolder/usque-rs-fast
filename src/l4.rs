@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use quiche::h3::NameValue;
-use ring::rand::SecureRandom;
 use std::{
     collections::HashMap,
     io,
@@ -314,8 +313,7 @@ impl L4Client {
     ) -> io::Result<Option<(IpAddr, Duration)>> {
         let mut stream = self.dial_addr(SocketAddr::new(server, 53)).await?;
         let mut id_bytes = [0_u8; 2];
-        ring::rand::SystemRandom::new()
-            .fill(&mut id_bytes)
+        boring::rand::rand_bytes(&mut id_bytes)
             .map_err(|_| io::Error::other("failed to generate DNS query ID"))?;
         let request_id = u16::from_be_bytes(id_bytes);
         let payload = dns::build_query(name, record_type, request_id)?;
@@ -353,9 +351,7 @@ impl Session {
         let local_addr = socket.local_addr()?;
 
         let mut scid = [0_u8; quiche::MAX_CONN_ID_LEN];
-        ring::rand::SystemRandom::new()
-            .fill(&mut scid)
-            .map_err(|_| anyhow::anyhow!("RNG failure"))?;
+        boring::rand::rand_bytes(&mut scid).context("RNG failure")?;
         let scid = quiche::ConnectionId::from_ref(&scid);
         let mut conn = quiche::connect(
             Some(L4_SNI),

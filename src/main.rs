@@ -396,12 +396,10 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
             Some(cfg.ipv6.clone())
         },
     };
-    let tun_dev = tun_device::create_tun(&tun_cfg)?;
+    let tun_dev = tun_device::create_tun(&tun_cfg, !no_iproute2)?;
 
     if no_iproute2 {
         eprintln!("Skipping address setup (--no-iproute2)");
-    } else {
-        tun_device::configure_tun(&tun_cfg, &tun_dev).await?;
     }
 
     let tunnel_cfg = tunnel::TunnelConfig {
