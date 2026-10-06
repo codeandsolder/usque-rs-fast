@@ -35,6 +35,12 @@ pub mod packet;
 pub mod proxy;
 #[cfg(feature = "register")]
 pub mod register;
+#[cfg(any(
+    feature = "tun",
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 pub mod tls;
 #[cfg(feature = "tun")]
 pub mod tun_device;

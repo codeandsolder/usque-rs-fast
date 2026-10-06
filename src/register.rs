@@ -1,15 +1,31 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::Generate;
-use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+use boring::{
+    ec::{EcGroup, EcKey},
+    nid::Nid,
+    pkey::PKey,
+};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::{
+    Method, Request, StatusCode,
+    client::conn::http1,
+    header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderName, HeaderValue, USER_AGENT},
+};
+use hyper_util::rt::TokioIo;
 use ring::rand::SecureRandom;
+use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Duration};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
-const API_URL: &str = "https://api.cloudflareclient.com";
+const API_HOST: &str = "api.cloudflareclient.com";
 const API_VERSION: &str = "v0a4471";
 const DEFAULT_USER_AGENT: &str = "WARP for Android";
 const CF_CLIENT_VERSION: &str = "a-6.35-4471";
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_API_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Serialize)]
 struct Registration {
@@ -46,6 +62,11 @@ pub struct ErrorInfo {
     pub message: String,
 }
 
+struct ApiResponse {
+    status: StatusCode,
+    body: Bytes,
+}
+
 fn random_wg_pubkey() -> Result<String> {
     let mut key = [0u8; 32];
     ring::rand::SystemRandom::new()
@@ -76,52 +97,100 @@ fn cf_time_string() -> String {
     )
 }
 
-fn build_client() -> Result<reqwest::Client> {
-    use reqwest::header::{HeaderMap, HeaderValue};
-    let mut headers = HeaderMap::new();
-    headers.insert("User-Agent", HeaderValue::from_static(DEFAULT_USER_AGENT));
-    headers.insert(
-        "CF-Client-Version",
-        HeaderValue::from_static(CF_CLIENT_VERSION),
-    );
-    headers.insert(
-        "Content-Type",
-        HeaderValue::from_static("application/json; charset=UTF-8"),
-    );
-    headers.insert("Connection", HeaderValue::from_static("Keep-Alive"));
-
-    // Reqwest 0.13 defaults to AWS-LC and platform-native roots. Keep the
-    // client self-contained for static router builds while reusing the ring
-    // provider already present elsewhere in the dependency graph.
-    let roots = rustls::RootCertStore {
+fn registration_tls_config() -> Result<Arc<ClientConfig>> {
+    let roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let tls = rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .context("failed to configure TLS protocol versions")?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let config =
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .context("failed to configure TLS protocol versions")?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    Ok(Arc::new(config))
+}
 
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
-        .default_headers(headers)
-        .build()
-        .context("failed to build HTTP client")
+async fn api_request(
+    method: Method,
+    path: &str,
+    body: Vec<u8>,
+    extra_headers: &[(HeaderName, HeaderValue)],
+) -> Result<ApiResponse> {
+    tokio::time::timeout(
+        API_REQUEST_TIMEOUT,
+        api_request_inner(method, path, body, extra_headers),
+    )
+    .await
+    .context("Cloudflare registration API request timed out")?
+}
+
+async fn api_request_inner(
+    method: Method,
+    path: &str,
+    body: Vec<u8>,
+    extra_headers: &[(HeaderName, HeaderValue)],
+) -> Result<ApiResponse> {
+    let tcp = TcpStream::connect((API_HOST, 443))
+        .await
+        .context("failed to connect to Cloudflare registration API")?;
+    let server_name =
+        ServerName::try_from(API_HOST).context("invalid Cloudflare registration API hostname")?;
+    let tls = TlsConnector::from(registration_tls_config()?)
+        .connect(server_name, tcp)
+        .await
+        .context("registration TLS handshake failed")?;
+
+    let (mut sender, connection) = http1::Builder::new()
+        .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
+        .await
+        .context("registration HTTP handshake failed")?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            log::debug!("registration HTTP connection ended with error: {error}");
+        }
+    });
+
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(HOST, API_HOST)
+        .header(USER_AGENT, DEFAULT_USER_AGENT)
+        .header("CF-Client-Version", CF_CLIENT_VERSION)
+        .header(CONTENT_TYPE, "application/json; charset=UTF-8")
+        .header(CONNECTION, "Keep-Alive");
+    for (name, value) in extra_headers {
+        request = request.header(name, value);
+    }
+    let request = request
+        .body(Full::new(Bytes::from(body)))
+        .context("failed to build registration HTTP request")?;
+
+    let response = sender
+        .send_request(request)
+        .await
+        .context("registration HTTP request failed")?;
+    let status = response.status();
+    let body = Limited::new(response.into_body(), MAX_API_RESPONSE_BYTES)
+        .collect()
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to read registration response body: {error}"))?
+        .to_bytes();
+    Ok(ApiResponse { status, body })
+}
+
+fn response_text(body: &Bytes) -> String {
+    String::from_utf8_lossy(body).into_owned()
 }
 
 /// Register a new WARP device.
 ///
 /// # Errors
 ///
-/// Returns an error if client construction, randomness, the HTTP request,
-/// or response decoding fails, or if Cloudflare rejects registration.
+/// Returns an error if randomness, TLS/HTTP, or response decoding fails, or if
+/// Cloudflare rejects registration.
 pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<AccountData> {
-    let client = build_client()?;
     let wg_key = random_wg_pubkey()?;
     let serial = random_android_serial()?;
-
     let reg = Registration {
         key: wg_key,
         install_id: String::new(),
@@ -134,22 +203,24 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<Ac
         tunnel_type: "wireguard".to_string(),
         locale: locale.to_string(),
     };
-
-    let url = format!("{API_URL}/{API_VERSION}/reg");
-    let mut req = client.post(&url).json(&reg);
+    let body = serde_json::to_vec(&reg).context("failed to encode registration request")?;
+    let mut headers = Vec::new();
     if let Some(jwt) = jwt {
-        req = req.header("CF-Access-Jwt-Assertion", jwt);
+        headers.push((
+            HeaderName::from_static("cf-access-jwt-assertion"),
+            HeaderValue::from_str(jwt).context("invalid access JWT header value")?,
+        ));
     }
-
-    let resp = req.send().await.context("registration request failed")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("registration failed: {status} - {body}");
+    let response =
+        api_request(Method::POST, &format!("/{API_VERSION}/reg"), body, &headers).await?;
+    if !response.status.is_success() {
+        bail!(
+            "registration failed: {} - {}",
+            response.status,
+            response_text(&response.body)
+        );
     }
-
-    resp.json::<AccountData>()
-        .await
+    serde_json::from_slice::<AccountData>(&response.body)
         .context("failed to parse registration response")
 }
 
@@ -159,64 +230,66 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<Ac
 ///
 /// Returns an error if the generated keys cannot be encoded to DER.
 pub fn generate_ec_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
-    let signing_key = SigningKey::generate();
-
-    let priv_key_der = signing_key
-        .to_pkcs8_der()
-        .context("failed to encode private key to DER")?;
-    let pub_key_spki = signing_key
-        .verifying_key()
-        .to_public_key_der()
-        .context("failed to encode public key to DER")?;
-
-    Ok((
-        priv_key_der.as_bytes().to_vec(),
-        pub_key_spki.as_bytes().to_vec(),
-    ))
+    let group =
+        EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).context("failed to select P-256 group")?;
+    let ec_key = EcKey::generate(&group).context("failed to generate P-256 key")?;
+    let key = PKey::from_ec_key(ec_key).context("failed to wrap P-256 key")?;
+    let private_key = key
+        .private_key_to_der_pkcs8()
+        .context("failed to encode private key as PKCS#8 DER")?;
+    let public_key = key
+        .public_key_to_der()
+        .context("failed to encode public key as SPKI DER")?;
+    Ok((private_key, public_key))
 }
 
 /// Replace the registration key with the generated MASQUE EC public key.
 ///
 /// # Errors
 ///
-/// Returns an error if client construction, the enrollment request, or
-/// response decoding fails, or if Cloudflare rejects the update.
+/// Returns an error if TLS/HTTP or response decoding fails, or if Cloudflare
+/// rejects the update.
 pub async fn enroll_key(
     account: &AccountData,
     pub_key_der: &[u8],
     device_name: Option<&str>,
 ) -> Result<AccountData> {
-    let client = build_client()?;
     let pub_key_b64 = base64::engine::general_purpose::STANDARD.encode(pub_key_der);
-
     let update = DeviceUpdate {
         key: pub_key_b64,
         key_type: "secp256r1".to_string(),
         tunnel_type: "masque".to_string(),
         name: device_name.map(String::from),
     };
+    let body = serde_json::to_vec(&update).context("failed to encode enrollment request")?;
+    let authorization = HeaderValue::from_str(&format!("Bearer {}", account.token))
+        .context("invalid registration bearer token")?;
+    let response = api_request(
+        Method::PATCH,
+        &format!("/{API_VERSION}/reg/{}", account.id),
+        body,
+        &[(AUTHORIZATION, authorization)],
+    )
+    .await?;
 
-    let url = format!("{API_URL}/{API_VERSION}/reg/{}", account.id);
-    let resp = client
-        .patch(&url)
-        .header("Authorization", format!("Bearer {}", account.token))
-        .json(&update)
-        .send()
-        .await
-        .context("enrollment request failed")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
-            let msgs: Vec<_> = api_err.errors.iter().map(|e| e.message.as_str()).collect();
-            bail!("enrollment failed: {status} - {}", msgs.join("; "));
+    if !response.status.is_success() {
+        let text = response_text(&response.body);
+        if let Ok(api_err) = serde_json::from_slice::<ApiError>(&response.body) {
+            let msgs: Vec<_> = api_err
+                .errors
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect();
+            bail!(
+                "enrollment failed: {} - {}",
+                response.status,
+                msgs.join("; ")
+            );
         }
-        bail!("enrollment failed: {status} - {body}");
+        bail!("enrollment failed: {} - {text}", response.status);
     }
 
-    resp.json::<AccountData>()
-        .await
+    serde_json::from_slice::<AccountData>(&response.body)
         .context("failed to parse enrollment response")
 }
 
@@ -225,11 +298,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_client_builds_with_explicit_ring_and_webpki_roots() {
-        assert!(
-            build_client().is_ok(),
-            "registration HTTP client should build"
-        );
+    fn registration_tls_config_builds_with_explicit_ring_and_webpki_roots() {
+        assert!(registration_tls_config().is_ok());
     }
 
     #[test]
