@@ -619,6 +619,11 @@ fn safe_no_auth_bind(ip: std::net::IpAddr) -> bool {
     }
 }
 
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 fn resolve_proxy_auth(options: &ProxyArgs) -> Result<(Option<String>, Option<String>)> {
     let Some(path) = options.auth_file.as_deref() else {
         return Ok((options.username.clone(), options.password.clone()));
@@ -636,6 +641,11 @@ fn resolve_proxy_auth(options: &ProxyArgs) -> Result<(Option<String>, Option<Str
     Ok((Some(username.to_owned()), Some(password.to_owned())))
 }
 
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<()> {
     match (username, password) {
         (Some(_), Some(_)) | (None, None) => Ok(()),
