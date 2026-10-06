@@ -189,14 +189,18 @@ async fn handle_forward(mut request: Request<Incoming>, l4: Arc<L4Client>) -> Re
         }
     };
 
-    let (mut sender, connection) =
-        match client_http1::handshake::<_, Incoming>(TokioIo::new(remote)).await {
-            Ok(parts) => parts,
-            Err(error) => {
-                log::debug!("HTTP upstream handshake failed: {error}");
-                return text_response(StatusCode::BAD_GATEWAY, "upstream handshake failed");
-            }
-        };
+    let mut client_builder = client_http1::Builder::new();
+    client_builder.preserve_header_case(true);
+    let (mut sender, connection) = match client_builder
+        .handshake::<_, Incoming>(TokioIo::new(remote))
+        .await
+    {
+        Ok(parts) => parts,
+        Err(error) => {
+            log::debug!("HTTP upstream handshake failed: {error}");
+            return text_response(StatusCode::BAD_GATEWAY, "upstream handshake failed");
+        }
+    };
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             log::debug!("HTTP upstream connection failed: {error}");
