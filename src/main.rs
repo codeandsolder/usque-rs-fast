@@ -11,7 +11,12 @@
 
 //! usque-rs - MASQUE client for Cloudflare WARP.
 
-#[cfg(feature = "register")]
+#[cfg(any(
+    feature = "register",
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 use anyhow::Context;
 use anyhow::Result;
 #[cfg(any(
@@ -111,10 +116,16 @@ struct NativeTunOptions {
 ))]
 #[derive(Args, Clone)]
 struct ProxyArgs {
-    /// Expose a SOCKS5/SOCKS5h listener on this address.
+    /// Expose a SOCKS5/SOCKS5h listener on this address. Repeat for multiple listeners.
     #[cfg(feature = "socks5-proxy")]
     #[arg(long, value_name = "ADDR")]
-    socks5: Option<SocketAddr>,
+    socks5: Vec<SocketAddr>,
+
+    /// Permit SOCKS5 connections from loopback source addresses to use no-auth.
+    /// Non-loopback peers still require configured username/password authentication.
+    #[cfg(feature = "socks5-proxy")]
+    #[arg(long)]
+    allow_passwordless_loopback: bool,
 
     /// Expose a plaintext HTTP proxy listener on this address.
     #[cfg(feature = "http-proxy")]
@@ -142,6 +153,10 @@ struct ProxyArgs {
     #[arg(short = 'w', long)]
     password: Option<String>,
 
+    /// Read proxy credentials as `username:password` from this file.
+    #[arg(long, value_name = "PATH")]
+    auth_file: Option<String>,
+
     #[command(flatten)]
     transport: L4TransportArgs,
 }
@@ -155,8 +170,8 @@ impl ProxyArgs {
     const fn listener_count(&self) -> usize {
         let mut count = 0;
         #[cfg(feature = "socks5-proxy")]
-        if self.socks5.is_some() {
-            count += 1;
+        {
+            count += self.socks5.len();
         }
         #[cfg(feature = "http-proxy")]
         if self.http.is_some() {
@@ -426,11 +441,31 @@ async fn create_l4(
     feature = "socks5-proxy"
 ))]
 fn validate_proxy_args(options: &ProxyArgs) -> Result<()> {
-    validate_auth_pair(options.username.as_deref(), options.password.as_deref())?;
+    if options.auth_file.is_some() {
+        anyhow::ensure!(
+            options.username.is_none() && options.password.is_none(),
+            "--auth-file conflicts with --username/--password"
+        );
+    } else {
+        validate_auth_pair(options.username.as_deref(), options.password.as_deref())?;
+    }
     anyhow::ensure!(
         options.listener_count() > 0,
         "proxy requires at least one listener (--socks5, --http, or --https)"
     );
+
+    #[cfg(feature = "socks5-proxy")]
+    if options.allow_passwordless_loopback {
+        anyhow::ensure!(
+            options.auth_file.is_some()
+                || (options.username.is_some() && options.password.is_some()),
+            "--allow-passwordless-loopback requires configured proxy authentication"
+        );
+        anyhow::ensure!(
+            !options.socks5.is_empty(),
+            "--allow-passwordless-loopback requires at least one --socks5 listener"
+        );
+    }
 
     #[cfg(feature = "https-proxy")]
     match (
@@ -457,20 +492,23 @@ fn validate_proxy_args(options: &ProxyArgs) -> Result<()> {
 ))]
 async fn cmd_proxy(config_path: &str, options: ProxyArgs) -> Result<()> {
     validate_proxy_args(&options)?;
+    let (username, password) = resolve_proxy_auth(&options)?;
     let l4 = create_l4(config_path, &options.transport).await?;
     let mut listeners = tokio::task::JoinSet::<Result<()>>::new();
 
     #[cfg(feature = "socks5-proxy")]
-    if let Some(bind) = options.socks5 {
+    for bind in options.socks5 {
         let l4 = l4.clone();
-        let username = options.username.clone();
-        let password = options.password.clone();
+        let username = username.clone();
+        let password = password.clone();
+        let allow_passwordless_loopback = options.allow_passwordless_loopback;
         listeners.spawn(async move {
             socks::serve(
                 SocksConfig {
                     bind,
                     username,
                     password,
+                    allow_passwordless_loopback,
                 },
                 l4,
             )
@@ -481,8 +519,8 @@ async fn cmd_proxy(config_path: &str, options: ProxyArgs) -> Result<()> {
     #[cfg(feature = "http-proxy")]
     if let Some(bind) = options.http {
         let l4 = l4.clone();
-        let username = options.username.clone();
-        let password = options.password.clone();
+        let username = username.clone();
+        let password = password.clone();
         listeners.spawn(async move {
             http_proxy::serve_plain(
                 HttpConfig {
@@ -499,8 +537,8 @@ async fn cmd_proxy(config_path: &str, options: ProxyArgs) -> Result<()> {
     #[cfg(feature = "https-proxy")]
     if let Some(bind) = options.https {
         let l4 = l4.clone();
-        let username = options.username.clone();
-        let password = options.password.clone();
+        let username = username.clone();
+        let password = password.clone();
         let certificate = options
             .tls_cert
             .clone()
@@ -544,6 +582,23 @@ async fn cmd_proxy(config_path: &str, options: ProxyArgs) -> Result<()> {
     feature = "https-proxy",
     feature = "socks5-proxy"
 ))]
+fn resolve_proxy_auth(options: &ProxyArgs) -> Result<(Option<String>, Option<String>)> {
+    let Some(path) = options.auth_file.as_deref() else {
+        return Ok((options.username.clone(), options.password.clone()));
+    };
+    let value = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read proxy auth file {path:?}"))?;
+    let (username, password) = value
+        .trim()
+        .split_once(':')
+        .context("proxy auth file must contain username:password")?;
+    anyhow::ensure!(
+        !username.is_empty() && !password.is_empty(),
+        "proxy auth file username/password must be non-empty"
+    );
+    Ok((Some(username.to_owned()), Some(password.to_owned())))
+}
+
 fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<()> {
     match (username, password) {
         (Some(_), Some(_)) | (None, None) => Ok(()),
@@ -584,7 +639,29 @@ mod tests {
     #[test]
     fn proxy_accepts_socks5_listener() -> Result<()> {
         let options = proxy_options(&["usque-rs", "proxy", "--socks5", "127.0.0.1:1080"])?;
-        assert_eq!(options.socks5, Some("127.0.0.1:1080".parse()?));
+        assert_eq!(options.socks5, ["127.0.0.1:1080".parse()?]);
+        assert!(validate_proxy_args(&options).is_ok());
+        Ok(())
+    }
+
+    #[cfg(feature = "socks5-proxy")]
+    #[test]
+    fn proxy_accepts_repeated_socks5_listeners() -> Result<()> {
+        let options = proxy_options(&[
+            "usque-rs",
+            "proxy",
+            "--socks5",
+            "[2001:db8::1]:1080",
+            "--socks5",
+            "127.0.0.1:1080",
+            "--allow-passwordless-loopback",
+            "--username",
+            "user",
+            "--password",
+            "pass",
+        ])?;
+        assert_eq!(options.socks5.len(), 2);
+        assert!(options.allow_passwordless_loopback);
         assert!(validate_proxy_args(&options).is_ok());
         Ok(())
     }

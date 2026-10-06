@@ -13,6 +13,7 @@ pub struct SocksConfig {
     pub bind: SocketAddr,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub allow_passwordless_loopback: bool,
 }
 
 /// Serve TCP-only SOCKS5/SOCKS5h CONNECT requests over direct L4 MASQUE.
@@ -34,8 +35,18 @@ pub async fn serve(config: SocksConfig, l4: Arc<L4Client>) -> Result<()> {
         let l4 = l4.clone();
         let username = config.username.clone();
         let password = config.password.clone();
+        let allow_passwordless_loopback = config.allow_passwordless_loopback;
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, l4, username, password).await {
+            if let Err(error) = serve_connection(
+                stream,
+                peer,
+                l4,
+                username,
+                password,
+                allow_passwordless_loopback,
+            )
+            .await
+            {
                 log::debug!("SOCKS connection from {peer} failed: {error:#}");
             }
         });
@@ -44,20 +55,26 @@ pub async fn serve(config: SocksConfig, l4: Arc<L4Client>) -> Result<()> {
 
 async fn serve_connection(
     stream: TcpStream,
+    peer: SocketAddr,
     l4: Arc<L4Client>,
     username: Option<String>,
     password: Option<String>,
+    allow_passwordless_loopback: bool,
 ) -> Result<()> {
-    let protocol = match (username, password) {
-        (Some(username), Some(password)) => {
-            Socks5ServerProtocol::accept_password_auth(stream, move |user, pass| {
-                user == username && pass == password
-            })
-            .await?
-            .0
+    let protocol = if allow_passwordless_loopback && peer.ip().is_loopback() {
+        Socks5ServerProtocol::accept_no_auth(stream).await?
+    } else {
+        match (username, password) {
+            (Some(username), Some(password)) => {
+                Socks5ServerProtocol::accept_password_auth(stream, move |user, pass| {
+                    user == username && pass == password
+                })
+                .await?
+                .0
+            }
+            (None, None) => Socks5ServerProtocol::accept_no_auth(stream).await?,
+            _ => anyhow::bail!("SOCKS username and password must be configured together"),
         }
-        (None, None) => Socks5ServerProtocol::accept_no_auth(stream).await?,
-        _ => anyhow::bail!("SOCKS username and password must be configured together"),
     };
 
     let (protocol, command, target) = protocol.read_command().await?;
@@ -109,6 +126,20 @@ fn map_connect_error(error: &io::Error) -> ReplyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_detection_covers_ipv4_and_ipv6_only() -> Result<()> {
+        assert!("127.0.0.1:1234".parse::<SocketAddr>()?.ip().is_loopback());
+        assert!("[::1]:1234".parse::<SocketAddr>()?.ip().is_loopback());
+        assert!(!"192.0.2.1:1234".parse::<SocketAddr>()?.ip().is_loopback());
+        assert!(
+            !"[2001:db8::1]:1234"
+                .parse::<SocketAddr>()?
+                .ip()
+                .is_loopback()
+        );
+        Ok(())
+    }
 
     #[test]
     fn maps_common_connect_errors_to_socks_replies() {
