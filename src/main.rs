@@ -121,11 +121,11 @@ struct ProxyArgs {
     #[arg(long, value_name = "ADDR")]
     socks5: Vec<SocketAddr>,
 
-    /// Permit SOCKS5 connections from loopback source addresses to use no-auth.
-    /// Non-loopback peers still require configured username/password authentication.
+    /// Expose an explicitly unauthenticated SOCKS5/SOCKS5h listener.
+    /// Only loopback, private/LAN, CGNAT, link-local, benchmark-lab, and IPv6 ULA addresses are accepted.
     #[cfg(feature = "socks5-proxy")]
-    #[arg(long)]
-    allow_passwordless_loopback: bool,
+    #[arg(long, value_name = "ADDR")]
+    socks5_no_auth: Vec<SocketAddr>,
 
     /// Expose a plaintext HTTP proxy listener on this address.
     #[cfg(feature = "http-proxy")]
@@ -171,7 +171,7 @@ impl ProxyArgs {
         let mut count = 0;
         #[cfg(feature = "socks5-proxy")]
         {
-            count += self.socks5.len();
+            count += self.socks5.len() + self.socks5_no_auth.len();
         }
         #[cfg(feature = "http-proxy")]
         if self.http.is_some() {
@@ -455,16 +455,22 @@ fn validate_proxy_args(options: &ProxyArgs) -> Result<()> {
     );
 
     #[cfg(feature = "socks5-proxy")]
-    if options.allow_passwordless_loopback {
-        anyhow::ensure!(
-            options.auth_file.is_some()
-                || (options.username.is_some() && options.password.is_some()),
-            "--allow-passwordless-loopback requires configured proxy authentication"
-        );
-        anyhow::ensure!(
-            !options.socks5.is_empty(),
-            "--allow-passwordless-loopback requires at least one --socks5 listener"
-        );
+    {
+        let has_auth = options.auth_file.is_some()
+            || (options.username.is_some() && options.password.is_some());
+        if !options.socks5.is_empty() {
+            anyhow::ensure!(
+                has_auth,
+                "--socks5 requires proxy authentication; use --socks5-no-auth for an explicit private no-auth listener"
+            );
+        }
+        for bind in &options.socks5_no_auth {
+            anyhow::ensure!(
+                safe_no_auth_bind(bind.ip()),
+                "--socks5-no-auth rejects globally routable, wildcard, multicast, and documentation-only bind address {}",
+                bind.ip()
+            );
+        }
     }
 
     #[cfg(feature = "https-proxy")]
@@ -501,14 +507,28 @@ async fn cmd_proxy(config_path: &str, options: ProxyArgs) -> Result<()> {
         let l4 = l4.clone();
         let username = username.clone();
         let password = password.clone();
-        let allow_passwordless_loopback = options.allow_passwordless_loopback;
         listeners.spawn(async move {
             socks::serve(
                 SocksConfig {
                     bind,
                     username,
                     password,
-                    allow_passwordless_loopback,
+                },
+                l4,
+            )
+            .await
+        });
+    }
+
+    #[cfg(feature = "socks5-proxy")]
+    for bind in options.socks5_no_auth {
+        let l4 = l4.clone();
+        listeners.spawn(async move {
+            socks::serve(
+                SocksConfig {
+                    bind,
+                    username: None,
+                    password: None,
                 },
                 l4,
             )
@@ -577,6 +597,28 @@ async fn cmd_proxy(config_path: &str, options: ProxyArgs) -> Result<()> {
     }
 }
 
+#[cfg(feature = "socks5-proxy")]
+fn safe_no_auth_bind(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, ..] = ip.octets();
+            a == 127
+                || a == 10
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 198 && (b == 18 || b == 19))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            ip.is_loopback()
+                || (octets[0] & 0xfe) == 0xfc
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
+}
+
 #[cfg(any(
     feature = "http-proxy",
     feature = "https-proxy",
@@ -599,6 +641,11 @@ fn resolve_proxy_auth(options: &ProxyArgs) -> Result<(Option<String>, Option<Str
     Ok((Some(username.to_owned()), Some(password.to_owned())))
 }
 
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
 fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<()> {
     match (username, password) {
         (Some(_), Some(_)) | (None, None) => Ok(()),
@@ -637,32 +684,69 @@ mod tests {
 
     #[cfg(feature = "socks5-proxy")]
     #[test]
-    fn proxy_accepts_socks5_listener() -> Result<()> {
+    fn authenticated_socks5_requires_auth() -> Result<()> {
         let options = proxy_options(&["usque-rs", "proxy", "--socks5", "127.0.0.1:1080"])?;
-        assert_eq!(options.socks5, ["127.0.0.1:1080".parse()?]);
+        assert!(validate_proxy_args(&options).is_err());
+
+        let options = proxy_options(&[
+            "usque-rs",
+            "proxy",
+            "--socks5",
+            "[2001:db8::1]:1080",
+            "--username",
+            "user",
+            "--password",
+            "pass",
+        ])?;
+        assert_eq!(options.socks5, ["[2001:db8::1]:1080".parse()?]);
         assert!(validate_proxy_args(&options).is_ok());
         Ok(())
     }
 
     #[cfg(feature = "socks5-proxy")]
     #[test]
-    fn proxy_accepts_repeated_socks5_listeners() -> Result<()> {
-        let options = proxy_options(&[
-            "usque-rs",
-            "proxy",
-            "--socks5",
-            "[2001:db8::1]:1080",
-            "--socks5",
+    fn passwordless_socks5_accepts_only_private_namespaces() -> Result<()> {
+        for address in [
             "127.0.0.1:1080",
-            "--allow-passwordless-loopback",
-            "--username",
-            "user",
-            "--password",
-            "pass",
-        ])?;
-        assert_eq!(options.socks5.len(), 2);
-        assert!(options.allow_passwordless_loopback);
-        assert!(validate_proxy_args(&options).is_ok());
+            "10.1.2.3:1080",
+            "172.16.0.1:1080",
+            "172.31.255.254:1080",
+            "192.168.1.1:1080",
+            "100.64.0.1:1080",
+            "100.127.255.254:1080",
+            "169.254.1.2:1080",
+            "198.18.0.1:1080",
+            "198.19.255.254:1080",
+            "[::1]:1080",
+            "[fc00::1]:1080",
+            "[fd7a:115c:a1e0::1]:1080",
+            "[fe80::1]:1080",
+        ] {
+            let options = proxy_options(&["usque-rs", "proxy", "--socks5-no-auth", address])?;
+            assert!(
+                validate_proxy_args(&options).is_ok(),
+                "should permit {address}"
+            );
+        }
+
+        for address in [
+            "0.0.0.0:1080",
+            "8.8.8.8:1080",
+            "100.63.255.255:1080",
+            "100.128.0.0:1080",
+            "192.0.2.1:1080",
+            "224.0.0.1:1080",
+            "[::]:1080",
+            "[2001:db8::1]:1080",
+            "[2606:4700:4700::1111]:1080",
+            "[ff02::1]:1080",
+        ] {
+            let options = proxy_options(&["usque-rs", "proxy", "--socks5-no-auth", address])?;
+            assert!(
+                validate_proxy_args(&options).is_err(),
+                "should reject {address}"
+            );
+        }
         Ok(())
     }
 
@@ -686,6 +770,10 @@ mod tests {
             "proxy",
             "--socks5",
             "127.0.0.1:1080",
+            "--username",
+            "user",
+            "--password",
+            "pass",
             "--http",
             "127.0.0.1:8000",
             "--https",
