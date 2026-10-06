@@ -29,7 +29,7 @@ cargo build --release --no-default-features --features socks5-proxy
 cargo build --release --no-default-features --features register
 ```
 
-Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends, Hyper, or reqwest; a SOCKS5-only build likewise avoids Hyper and reqwest. Saved-config parsing remains available to every runtime build. The `register` feature is separate and is included in the default feature set for backwards compatibility.
+Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends or Hyper; a SOCKS5-only build likewise avoids Hyper and rustls. Registration uses the same Hyper/rustls stack as the full build instead of a second HTTP-client stack. Saved-config parsing remains available to every runtime build. The `register` feature is separate and is included in the default feature set for backwards compatibility.
 
 ## Proxy modes
 

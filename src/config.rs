@@ -183,13 +183,16 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error when the configured PEM is invalid or cannot be encoded.
+    #[cfg(any(
+        feature = "tun",
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    ))]
     pub fn get_endpoint_pub_key_der(&self) -> Result<Vec<u8>> {
-        use x509_cert::der::{DecodePem, Encode};
-
-        let spki =
-            x509_cert::spki::SubjectPublicKeyInfoOwned::from_pem(self.endpoint_pub_key.as_bytes())
-                .context("failed to parse endpoint public key PEM")?;
-        spki.to_der()
+        let key = boring::pkey::PKey::public_key_from_pem(self.endpoint_pub_key.as_bytes())
+            .context("failed to parse endpoint public key PEM")?;
+        key.public_key_to_der()
             .context("failed to encode endpoint public key as SPKI DER")
     }
 }
