@@ -84,7 +84,7 @@ portable-atomic = "1.15"
 [patch.crates-io]
 quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "b83f6ef880da88642de5a2f1d234d79f4be00d64" }
 octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "b83f6ef880da88642de5a2f1d234d79f4be00d64" }
-tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "61b9f82fda9056804f94e789c69b84f228c98e69" }
+tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "a5d146b7e49ad69b0a072dbf58f62ccc0023517c" }
 datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "b83f6ef880da88642de5a2f1d234d79f4be00d64" }
 
 [profile.release]
