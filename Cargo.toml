@@ -45,7 +45,7 @@ time = { version = "0.3", optional = true }
 socket2 = { version = "0.6", optional = true }
 nix = { version = "0.31.3", features = ["net", "socket", "time", "uio"], optional = true }
 datagram-socket = { version = "0.8.0", optional = true }
-fast-socks5 = { git = "https://github.com/codeandsolder/fast-socks5-fast", rev = "f47ed18f6bf9a326cf5918ee5e44812ff4f9e1eb", optional = true }
+fast-socks5 = { git = "https://github.com/codeandsolder/fast-socks5-fast", rev = "237336b5c8bc5be14efacf849c9c2bc0efe6c1f8", optional = true }
 hyper = { version = "1", default-features = false, optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }

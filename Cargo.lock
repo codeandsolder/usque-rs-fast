@@ -424,11 +424,9 @@ dependencies = [
 [[package]]
 name = "fast-socks5"
 version = "1.0.0"
-source = "git+https://github.com/codeandsolder/fast-socks5-fast?rev=f47ed18f6bf9a326cf5918ee5e44812ff4f9e1eb#f47ed18f6bf9a326cf5918ee5e44812ff4f9e1eb"
+source = "git+https://github.com/codeandsolder/fast-socks5-fast?rev=237336b5c8bc5be14efacf849c9c2bc0efe6c1f8#237336b5c8bc5be14efacf849c9c2bc0efe6c1f8"
 dependencies = [
- "anyhow",
  "log",
- "socket2",
  "thiserror",
  "tokio",
 ]
