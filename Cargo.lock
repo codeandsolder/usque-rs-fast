@@ -172,12 +172,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1250,10 +1244,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tun-rs"
 version = "2.8.11"
-source = "git+https://github.com/codeandsolder/tun-rs-fast.git?rev=156e887e8a41f9cfb323274ad6e004ab3be7bb8c#156e887e8a41f9cfb323274ad6e004ab3be7bb8c"
+source = "git+https://github.com/codeandsolder/tun-rs-fast.git?rev=61b9f82fda9056804f94e789c69b84f228c98e69#61b9f82fda9056804f94e789c69b84f228c98e69"
 dependencies = [
  "blocking",
- "byteorder",
  "bytes",
  "encoding_rs",
  "getifaddrs",
