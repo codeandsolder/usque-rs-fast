@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand};
     feature = "https-proxy",
     feature = "socks5-proxy"
 ))]
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(any(
     feature = "tun",
     feature = "http-proxy",
@@ -104,15 +104,70 @@ struct NativeTunOptions {
     interface_name: Option<String>,
 }
 
-#[cfg(feature = "https-proxy")]
-struct HttpsProxyOptions {
-    bind: IpAddr,
-    port: u16,
-    tls_cert: String,
-    tls_key: String,
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+#[derive(Args, Clone)]
+struct ProxyArgs {
+    /// Expose a SOCKS5/SOCKS5h listener on this address.
+    #[cfg(feature = "socks5-proxy")]
+    #[arg(long, value_name = "ADDR")]
+    socks5: Option<SocketAddr>,
+
+    /// Expose a plaintext HTTP proxy listener on this address.
+    #[cfg(feature = "http-proxy")]
+    #[arg(long, value_name = "ADDR")]
+    http: Option<SocketAddr>,
+
+    /// Expose a TLS-wrapped HTTP proxy listener on this address.
+    #[cfg(feature = "https-proxy")]
+    #[arg(long, value_name = "ADDR")]
+    https: Option<SocketAddr>,
+
+    /// Certificate chain for the HTTPS proxy listener.
+    #[cfg(feature = "https-proxy")]
+    #[arg(long, value_name = "PATH", requires = "https")]
+    tls_cert: Option<String>,
+
+    /// Private key for the HTTPS proxy listener.
+    #[cfg(feature = "https-proxy")]
+    #[arg(long, value_name = "PATH", requires = "https")]
+    tls_key: Option<String>,
+
+    #[arg(short, long)]
     username: Option<String>,
+
+    #[arg(short = 'w', long)]
     password: Option<String>,
+
+    #[command(flatten)]
     transport: L4TransportArgs,
+}
+
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+impl ProxyArgs {
+    const fn listener_count(&self) -> usize {
+        let mut count = 0;
+        #[cfg(feature = "socks5-proxy")]
+        if self.socks5.is_some() {
+            count += 1;
+        }
+        #[cfg(feature = "http-proxy")]
+        if self.http.is_some() {
+            count += 1;
+        }
+        #[cfg(feature = "https-proxy")]
+        if self.https.is_some() {
+            count += 1;
+        }
+        count
+    }
 }
 
 #[derive(Subcommand)]
@@ -154,55 +209,15 @@ enum Commands {
         interface_name: Option<String>,
     },
 
-    /// Expose WARP as a direct-L4 TCP-only SOCKS5/SOCKS5h proxy.
-    #[cfg(feature = "socks5-proxy")]
-    Socks {
-        #[arg(short, long, default_value = "127.0.0.1")]
-        bind: IpAddr,
-        #[arg(short, long, default_value_t = 1080)]
-        port: u16,
-        #[arg(short, long)]
-        username: Option<String>,
-        #[arg(short = 'w', long)]
-        password: Option<String>,
+    /// Expose one shared WARP L4 session through one or more proxy listeners.
+    #[cfg(any(
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    ))]
+    Proxy {
         #[command(flatten)]
-        transport: L4TransportArgs,
-    },
-
-    /// Expose WARP as a plaintext HTTP proxy (forward requests and CONNECT).
-    #[cfg(feature = "http-proxy")]
-    #[command(name = "http-proxy")]
-    HttpProxy {
-        #[arg(short, long, default_value = "127.0.0.1")]
-        bind: IpAddr,
-        #[arg(short, long, default_value_t = 8000)]
-        port: u16,
-        #[arg(short, long)]
-        username: Option<String>,
-        #[arg(short = 'w', long)]
-        password: Option<String>,
-        #[command(flatten)]
-        transport: L4TransportArgs,
-    },
-
-    /// Expose WARP as a TLS-wrapped HTTP proxy (HTTPS proxy protocol).
-    #[cfg(feature = "https-proxy")]
-    #[command(name = "https-proxy")]
-    HttpsProxy {
-        #[arg(short, long, default_value = "127.0.0.1")]
-        bind: IpAddr,
-        #[arg(short, long, default_value_t = 8443)]
-        port: u16,
-        #[arg(long, value_name = "PATH")]
-        tls_cert: String,
-        #[arg(long, value_name = "PATH")]
-        tls_key: String,
-        #[arg(short, long)]
-        username: Option<String>,
-        #[arg(short = 'w', long)]
-        password: Option<String>,
-        #[command(flatten)]
-        transport: L4TransportArgs,
+        options: ProxyArgs,
     },
 }
 
@@ -268,48 +283,12 @@ async fn main() -> Result<()> {
                 .await
             }
 
-            #[cfg(feature = "socks5-proxy")]
-            Commands::Socks {
-                bind,
-                port,
-                username,
-                password,
-                transport,
-            } => cmd_socks(&cli.config, bind, port, username, password, &transport).await,
-
-            #[cfg(feature = "http-proxy")]
-            Commands::HttpProxy {
-                bind,
-                port,
-                username,
-                password,
-                transport,
-            } => cmd_http_proxy(&cli.config, bind, port, username, password, &transport).await,
-
-            #[cfg(feature = "https-proxy")]
-            Commands::HttpsProxy {
-                bind,
-                port,
-                tls_cert,
-                tls_key,
-                username,
-                password,
-                transport,
-            } => {
-                cmd_https_proxy(
-                    &cli.config,
-                    HttpsProxyOptions {
-                        bind,
-                        port,
-                        tls_cert,
-                        tls_key,
-                        username,
-                        password,
-                        transport,
-                    },
-                )
-                .await
-            }
+            #[cfg(any(
+                feature = "http-proxy",
+                feature = "https-proxy",
+                feature = "socks5-proxy"
+            ))]
+            Commands::Proxy { options } => cmd_proxy(&cli.config, options).await,
         }
     }
 }
@@ -441,76 +420,123 @@ async fn create_l4(
     .await
 }
 
-#[cfg(feature = "socks5-proxy")]
-async fn cmd_socks(
-    config_path: &str,
-    bind: IpAddr,
-    port: u16,
-    username: Option<String>,
-    password: Option<String>,
-    transport: &L4TransportArgs,
-) -> Result<()> {
-    validate_auth_pair(username.as_deref(), password.as_deref())?;
-    let l4 = create_l4(config_path, transport).await?;
-    socks::serve(
-        SocksConfig {
-            bind: std::net::SocketAddr::new(bind, port),
-            username,
-            password,
-        },
-        l4,
-    )
-    .await
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+fn validate_proxy_args(options: &ProxyArgs) -> Result<()> {
+    validate_auth_pair(options.username.as_deref(), options.password.as_deref())?;
+    anyhow::ensure!(
+        options.listener_count() > 0,
+        "proxy requires at least one listener (--socks5, --http, or --https)"
+    );
+
+    #[cfg(feature = "https-proxy")]
+    match (
+        options.https,
+        options.tls_cert.as_deref(),
+        options.tls_key.as_deref(),
+    ) {
+        (Some(_), Some(_), Some(_)) | (None, None, None) => {}
+        (Some(_), _, _) => {
+            anyhow::bail!("HTTPS proxy listener requires both --tls-cert and --tls-key");
+        }
+        (None, _, _) => {
+            anyhow::bail!("--tls-cert/--tls-key require an --https listener");
+        }
+    }
+
+    Ok(())
 }
 
-#[cfg(feature = "http-proxy")]
-async fn cmd_http_proxy(
-    config_path: &str,
-    bind: IpAddr,
-    port: u16,
-    username: Option<String>,
-    password: Option<String>,
-    transport: &L4TransportArgs,
-) -> Result<()> {
-    validate_auth_pair(username.as_deref(), password.as_deref())?;
-    let l4 = create_l4(config_path, transport).await?;
-    http_proxy::serve_plain(
-        HttpConfig {
-            bind: std::net::SocketAddr::new(bind, port),
-            username,
-            password,
-        },
-        l4,
-    )
-    .await
-}
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+async fn cmd_proxy(config_path: &str, options: ProxyArgs) -> Result<()> {
+    validate_proxy_args(&options)?;
+    let l4 = create_l4(config_path, &options.transport).await?;
+    let mut listeners = tokio::task::JoinSet::<Result<()>>::new();
 
-#[cfg(feature = "https-proxy")]
-async fn cmd_https_proxy(config_path: &str, options: HttpsProxyOptions) -> Result<()> {
-    let HttpsProxyOptions {
-        bind,
-        port,
-        tls_cert,
-        tls_key,
-        username,
-        password,
-        transport,
-    } = options;
-    validate_auth_pair(username.as_deref(), password.as_deref())?;
-    let l4 = create_l4(config_path, &transport).await?;
-    http_proxy::serve_tls(
-        HttpConfig {
-            bind: std::net::SocketAddr::new(bind, port),
-            username,
-            password,
-        },
-        HttpsConfig {
-            certificate: tls_cert.into(),
-            private_key: tls_key.into(),
-        },
-        l4,
-    )
-    .await
+    #[cfg(feature = "socks5-proxy")]
+    if let Some(bind) = options.socks5 {
+        let l4 = l4.clone();
+        let username = options.username.clone();
+        let password = options.password.clone();
+        listeners.spawn(async move {
+            socks::serve(
+                SocksConfig {
+                    bind,
+                    username,
+                    password,
+                },
+                l4,
+            )
+            .await
+        });
+    }
+
+    #[cfg(feature = "http-proxy")]
+    if let Some(bind) = options.http {
+        let l4 = l4.clone();
+        let username = options.username.clone();
+        let password = options.password.clone();
+        listeners.spawn(async move {
+            http_proxy::serve_plain(
+                HttpConfig {
+                    bind,
+                    username,
+                    password,
+                },
+                l4,
+            )
+            .await
+        });
+    }
+
+    #[cfg(feature = "https-proxy")]
+    if let Some(bind) = options.https {
+        let l4 = l4.clone();
+        let username = options.username.clone();
+        let password = options.password.clone();
+        let certificate = options
+            .tls_cert
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing HTTPS certificate after validation"))?;
+        let private_key = options
+            .tls_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing HTTPS private key after validation"))?;
+        listeners.spawn(async move {
+            http_proxy::serve_tls(
+                HttpConfig {
+                    bind,
+                    username,
+                    password,
+                },
+                HttpsConfig {
+                    certificate: certificate.into(),
+                    private_key: private_key.into(),
+                },
+                l4,
+            )
+            .await
+        });
+    }
+
+    let result = listeners
+        .join_next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("proxy listener set unexpectedly empty"))?;
+    listeners.abort_all();
+
+    match result {
+        Ok(Ok(())) => anyhow::bail!("proxy listener exited unexpectedly"),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(any(
@@ -535,57 +561,65 @@ fn validate_auth_pair(username: Option<&str>, password: Option<&str>) -> Result<
 ))]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
-    use std::net::{IpAddr, Ipv4Addr};
 
-    fn proxy_defaults(command: &str, args: &[&str]) -> Result<(IpAddr, u16)> {
-        let matches = Cli::command().try_get_matches_from(args.iter().copied())?;
-        let subcommand = matches
-            .subcommand_matches(command)
-            .ok_or_else(|| anyhow::anyhow!("expected {command} subcommand"))?;
-        let bind = *subcommand
-            .get_one::<IpAddr>("bind")
-            .ok_or_else(|| anyhow::anyhow!("missing bind default"))?;
-        let port = *subcommand
-            .get_one::<u16>("port")
-            .ok_or_else(|| anyhow::anyhow!("missing port default"))?;
-        Ok((bind, port))
+    fn proxy_options(args: &[&str]) -> Result<ProxyArgs> {
+        let cli = Cli::try_parse_from(args.iter().copied())?;
+        match cli.command {
+            Commands::Proxy { options } => Ok(options),
+            #[cfg(feature = "register")]
+            Commands::Register { .. } => anyhow::bail!("expected proxy command"),
+            #[cfg(feature = "tun")]
+            Commands::NativeTun { .. } => anyhow::bail!("expected proxy command"),
+        }
+    }
+
+    #[test]
+    fn proxy_requires_at_least_one_listener() -> Result<()> {
+        let options = proxy_options(&["usque-rs", "proxy"])?;
+        assert!(validate_proxy_args(&options).is_err());
+        Ok(())
     }
 
     #[cfg(feature = "socks5-proxy")]
     #[test]
-    fn socks_defaults_to_loopback() -> Result<()> {
-        let (bind, port) = proxy_defaults("socks", &["usque-rs", "socks"])?;
-        assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(port, 1080);
-        Ok(())
-    }
-
-    #[cfg(feature = "http-proxy")]
-    #[test]
-    fn http_proxy_defaults_to_loopback() -> Result<()> {
-        let (bind, port) = proxy_defaults("http-proxy", &["usque-rs", "http-proxy"])?;
-        assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(port, 8000);
+    fn proxy_accepts_socks5_listener() -> Result<()> {
+        let options = proxy_options(&["usque-rs", "proxy", "--socks5", "127.0.0.1:1080"])?;
+        assert_eq!(options.socks5, Some("127.0.0.1:1080".parse()?));
+        assert!(validate_proxy_args(&options).is_ok());
         Ok(())
     }
 
     #[cfg(feature = "https-proxy")]
     #[test]
-    fn https_proxy_defaults_to_loopback() -> Result<()> {
-        let (bind, port) = proxy_defaults(
-            "https-proxy",
-            &[
-                "usque-rs",
-                "https-proxy",
-                "--tls-cert",
-                "proxy.crt",
-                "--tls-key",
-                "proxy.key",
-            ],
-        )?;
-        assert_eq!(bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(port, 8443);
+    fn https_listener_requires_tls_material() -> Result<()> {
+        let options = proxy_options(&["usque-rs", "proxy", "--https", "127.0.0.1:8443"])?;
+        assert!(validate_proxy_args(&options).is_err());
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "socks5-proxy",
+        feature = "http-proxy",
+        feature = "https-proxy"
+    ))]
+    #[test]
+    fn proxy_listeners_are_composable() -> Result<()> {
+        let options = proxy_options(&[
+            "usque-rs",
+            "proxy",
+            "--socks5",
+            "127.0.0.1:1080",
+            "--http",
+            "127.0.0.1:8000",
+            "--https",
+            "127.0.0.1:8443",
+            "--tls-cert",
+            "proxy.crt",
+            "--tls-key",
+            "proxy.key",
+        ])?;
+        assert_eq!(options.listener_count(), 3);
+        assert!(validate_proxy_args(&options).is_ok());
         Ok(())
     }
 
