@@ -2,11 +2,17 @@ use crate::l4::L4Client;
 use anyhow::Result;
 use fast_socks5::{
     ReplyError, Socks5Command,
-    server::{Socks5ServerProtocol, states::CommandRead},
+    server::{
+        Socks5ServerProtocol, StandardAuthentication, StandardAuthenticationStarted,
+        states::{Authenticated, CommandRead},
+    },
     util::target_addr::TargetAddr,
 };
 use std::{io, net::SocketAddr, sync::Arc};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream},
+};
 
 #[derive(Clone, Debug)]
 pub struct SocksConfig {
@@ -56,7 +62,7 @@ async fn serve_connection(
             .await?
             .0
         }
-        (None, None) => Socks5ServerProtocol::accept_no_auth(stream).await?,
+        (None, None) => accept_open_auth(stream).await?,
         _ => anyhow::bail!("SOCKS username and password must be configured together"),
     };
 
@@ -70,6 +76,25 @@ async fn serve_connection(
             Ok(())
         }
     }
+}
+
+async fn accept_open_auth<T>(stream: T) -> Result<Socks5ServerProtocol<T, Authenticated>>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let auth = Socks5ServerProtocol::start(stream)
+        .negotiate_auth(StandardAuthentication::allow_no_auth(true))
+        .await?;
+
+    Ok(match auth {
+        StandardAuthenticationStarted::NoAuthentication(auth) => {
+            Socks5ServerProtocol::finish_auth(auth)
+        }
+        StandardAuthenticationStarted::PasswordAuthentication(auth) => {
+            let (_username, _password, auth) = auth.read_username_password().await?;
+            Socks5ServerProtocol::finish_auth(auth.accept().await?)
+        }
+    })
 }
 
 async fn serve_tcp_connect(
@@ -109,6 +134,7 @@ fn map_connect_error(error: &io::Error) -> ReplyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn maps_common_connect_errors_to_socks_replies() {
@@ -124,5 +150,38 @@ mod tests {
             map_connect_error(&io::Error::new(io::ErrorKind::NotFound, "dns")),
             ReplyError::HostUnreachable
         ));
+    }
+
+    #[tokio::test]
+    async fn open_listener_accepts_no_auth() -> Result<()> {
+        let (server, mut client) = tokio::io::duplex(64);
+        let task = tokio::spawn(async move { accept_open_auth(server).await });
+
+        client.write_all(&[5, 1, 0]).await?;
+        let mut reply = [0; 2];
+        client.read_exact(&mut reply).await?;
+        assert_eq!(reply, [5, 0]);
+
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_listener_accepts_arbitrary_password_auth() -> Result<()> {
+        let (server, mut client) = tokio::io::duplex(64);
+        let task = tokio::spawn(async move { accept_open_auth(server).await });
+
+        client.write_all(&[5, 1, 2]).await?;
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await?;
+        assert_eq!(method, [5, 2]);
+
+        client.write_all(&[1, 1, b'u', 1, b'p']).await?;
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await?;
+        assert_eq!(auth, [1, 0]);
+
+        task.await??;
+        Ok(())
     }
 }

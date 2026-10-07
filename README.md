@@ -41,7 +41,7 @@ Expose an explicit passwordless SOCKS5/SOCKS5h listener on a non-public address:
 usque-rs -c config.json proxy --socks5-no-auth 127.0.0.1:1080
 ```
 
-`--socks5-no-auth` rejects public, wildcard, multicast, and documentation-only bind addresses. Allowed namespaces are loopback, RFC1918 LAN, CGNAT/Tailscale `100.64.0.0/10`, IPv4 link-local, `198.18.0.0/15` benchmark/lab space, IPv6 ULA, and IPv6 link-local. Authenticated `--socks5` requires credentials and is the only SOCKS mode permitted on globally routable binds.
+`--socks5-no-auth` rejects public, wildcard, multicast, and documentation-only bind addresses. Allowed namespaces are loopback, RFC1918 LAN, CGNAT/Tailscale `100.64.0.0/10`, IPv4 link-local, `198.18.0.0/15` benchmark/lab space, IPv6 ULA, and IPv6 link-local. Private-open listeners require no credentials but accept and ignore any RFC1929 username/password pair for client compatibility. Authenticated SOCKS listeners require matching credentials and are the only SOCKS mode permitted on globally routable binds.
 
 The distinction between SOCKS5 and SOCKS5h is made by the client. SOCKS5h hostnames are resolved with a small in-tree DNS-over-TCP implementation through the same WARP L4 transport, so hostname resolution does not fall back to the host resolver. Repeat `--dns-server IP` to select resolvers; the default pair is `1.1.1.1` and `8.8.8.8`. Positive answers are cached with their DNS TTL in a bounded cache. Hostnames are expected in ASCII DNS form; normal clients already send IDNA names as punycode, while raw non-ASCII input is rejected.
 

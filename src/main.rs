@@ -121,7 +121,7 @@ struct ProxyArgs {
     #[arg(long, value_name = "ADDR")]
     socks5: Vec<SocketAddr>,
 
-    /// Expose an explicitly unauthenticated SOCKS5/SOCKS5h listener.
+    /// Expose a private open SOCKS5/SOCKS5h listener; no credentials are required and presented credentials are ignored.
     /// Only loopback, private/LAN, CGNAT, link-local, benchmark-lab, and IPv6 ULA addresses are accepted.
     #[cfg(feature = "socks5-proxy")]
     #[arg(long, value_name = "ADDR")]
@@ -459,7 +459,7 @@ fn validate_proxy_args(options: &ProxyArgs) -> Result<()> {
         if !options.socks5.is_empty() {
             anyhow::ensure!(
                 has_auth,
-                "--socks5 requires proxy authentication; use --socks5-no-auth for an explicit private no-auth listener"
+                "--socks5 requires proxy authentication; use --socks5-no-auth for an explicit private open listener"
             );
         }
         for bind in &options.socks5_no_auth {
