@@ -69,6 +69,12 @@ impl SocksServer {
         *self.local_addr.borrow()
     }
 
+    /// Return whether the listener task is still running.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
     /// Move future SOCKS accepts to a new local IP/port while preserving the
     /// existing shared MASQUE session and already accepted connections.
     ///
