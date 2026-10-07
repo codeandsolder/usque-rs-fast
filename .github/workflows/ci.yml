@@ -26,7 +26,7 @@ jobs:
         run: python3 -m py_compile .github/scripts/*.py
 
       - name: Install Rust 1.99.0
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: 1.99.0
           components: rustfmt
@@ -50,7 +50,7 @@ jobs:
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust 1.99.0
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: 1.99.0
           components: clippy
@@ -78,7 +78,7 @@ jobs:
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust 1.99.0
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: 1.99.0
 
@@ -137,7 +137,7 @@ jobs:
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: 1.88.0
 
@@ -167,7 +167,7 @@ jobs:
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust 1.99.0
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: 1.99.0
 
