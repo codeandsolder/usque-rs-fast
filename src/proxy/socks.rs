@@ -80,7 +80,7 @@ async fn serve_connection(
 
 async fn accept_open_auth<T>(stream: T) -> Result<Socks5ServerProtocol<T, Authenticated>>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let auth = Socks5ServerProtocol::start(stream)
         .negotiate_auth(StandardAuthentication::allow_no_auth(true))

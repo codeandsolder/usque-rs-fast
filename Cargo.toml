@@ -39,7 +39,7 @@ time = { version = "0.3", optional = true }
 socket2 = { version = "0.6", optional = true }
 nix = { version = "0.31.3", features = ["net", "socket", "time", "uio"], optional = true }
 datagram-socket = { version = "0.8.0", optional = true }
-fast-socks5 = { git = "https://github.com/codeandsolder/fast-socks5-fast", rev = "c4959c55d8a4019f84a8a1e229146229de2b4a90", optional = true }
+fast-socks5 = { git = "https://github.com/codeandsolder/fast-socks5-fast", rev = "d2068a90af77dc672f017c236376c26ed8f297ba", optional = true }
 hyper = { version = "1", default-features = false, optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
@@ -82,10 +82,10 @@ allow_attributes_without_reason = "deny"
 portable-atomic = "1.15"
 
 [patch.crates-io]
-quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "b83f6ef880da88642de5a2f1d234d79f4be00d64" }
-octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "b83f6ef880da88642de5a2f1d234d79f4be00d64" }
-tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "a5d146b7e49ad69b0a072dbf58f62ccc0023517c" }
-datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "b83f6ef880da88642de5a2f1d234d79f4be00d64" }
+quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "9ddf883381349d95fe845316fc4177d0f8cf42d4" }
+octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "9ddf883381349d95fe845316fc4177d0f8cf42d4" }
+tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "6731de0221a0c59856249d3b0a577f78b60c1ecc" }
+datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "9ddf883381349d95fe845316fc4177d0f8cf42d4" }
 
 [profile.release]
 opt-level = 3

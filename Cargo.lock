@@ -298,7 +298,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "datagram-socket"
 version = "0.8.1"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=b83f6ef880da88642de5a2f1d234d79f4be00d64#b83f6ef880da88642de5a2f1d234d79f4be00d64"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
 dependencies = [
  "bytes",
  "futures-util",
@@ -405,7 +405,7 @@ dependencies = [
 [[package]]
 name = "fast-socks5"
 version = "1.0.0"
-source = "git+https://github.com/codeandsolder/fast-socks5-fast?rev=c4959c55d8a4019f84a8a1e229146229de2b4a90#c4959c55d8a4019f84a8a1e229146229de2b4a90"
+source = "git+https://github.com/codeandsolder/fast-socks5-fast?rev=d2068a90af77dc672f017c236376c26ed8f297ba#d2068a90af77dc672f017c236376c26ed8f297ba"
 dependencies = [
  "log",
  "thiserror",
@@ -850,7 +850,7 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=b83f6ef880da88642de5a2f1d234d79f4be00d64#b83f6ef880da88642de5a2f1d234d79f4be00d64"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
 
 [[package]]
 name = "once_cell"
@@ -928,7 +928,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.30.0"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=b83f6ef880da88642de5a2f1d234d79f4be00d64#b83f6ef880da88642de5a2f1d234d79f4be00d64"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
 dependencies = [
  "boring",
  "boring-sys",
@@ -1254,7 +1254,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tun-rs"
 version = "2.8.11"
-source = "git+https://github.com/codeandsolder/tun-rs-fast.git?rev=a5d146b7e49ad69b0a072dbf58f62ccc0023517c#a5d146b7e49ad69b0a072dbf58f62ccc0023517c"
+source = "git+https://github.com/codeandsolder/tun-rs-fast.git?rev=6731de0221a0c59856249d3b0a577f78b60c1ecc#6731de0221a0c59856249d3b0a577f78b60c1ecc"
 dependencies = [
  "blocking",
  "bytes",
