@@ -82,10 +82,10 @@ allow_attributes_without_reason = "deny"
 portable-atomic = "1.15"
 
 [patch.crates-io]
-quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "9ddf883381349d95fe845316fc4177d0f8cf42d4" }
-octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "9ddf883381349d95fe845316fc4177d0f8cf42d4" }
+quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "a13b06d8bc168feb0d869384256d2084dd321e89" }
+octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "a13b06d8bc168feb0d869384256d2084dd321e89" }
 tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "6731de0221a0c59856249d3b0a577f78b60c1ecc" }
-datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "9ddf883381349d95fe845316fc4177d0f8cf42d4" }
+datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "a13b06d8bc168feb0d869384256d2084dd321e89" }
 
 [profile.release]
 opt-level = 3
