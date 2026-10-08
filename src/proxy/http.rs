@@ -42,9 +42,27 @@ pub struct HttpsConfig {
 /// Returns an error when authentication configuration is incomplete or the listener
 /// cannot be bound or accepted.
 pub async fn serve_plain(config: HttpConfig, l4: Arc<L4Client>) -> Result<()> {
-    let expected_auth = expected_proxy_auth(&config)?;
     let listener = TcpListener::bind(config.bind).await?;
-    log::info!("HTTP proxy listening on {}", config.bind);
+    serve_plain_on(listener, config, l4).await
+}
+
+#[cfg(feature = "http-proxy")]
+/// Serve a plaintext HTTP proxy on an already-bound listener.
+///
+/// This lets embedding applications reserve/validate the socket before the
+/// accept loop starts instead of racing an asynchronously spawned bind.
+///
+/// # Errors
+/// Returns an error when authentication configuration is incomplete or the
+/// listener cannot be inspected or accepted.
+pub async fn serve_plain_on(
+    listener: TcpListener,
+    config: HttpConfig,
+    l4: Arc<L4Client>,
+) -> Result<()> {
+    let expected_auth = expected_proxy_auth(&config)?;
+    let local_addr = listener.local_addr()?;
+    log::info!("HTTP proxy listening on {local_addr}");
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -63,6 +81,22 @@ pub async fn serve_plain(config: HttpConfig, l4: Arc<L4Client>) -> Result<()> {
 /// Returns an error when TLS material cannot be loaded, authentication configuration
 /// is incomplete, or the listener cannot be bound or accepted.
 pub async fn serve_tls(config: HttpConfig, tls: HttpsConfig, l4: Arc<L4Client>) -> Result<()> {
+    let listener = TcpListener::bind(config.bind).await?;
+    serve_tls_on(listener, config, tls, l4).await
+}
+
+#[cfg(feature = "https-proxy")]
+/// Serve an HTTPS proxy on an already-bound listener.
+///
+/// # Errors
+/// Returns an error when TLS/authentication configuration is invalid or the
+/// listener cannot be inspected or accepted.
+pub async fn serve_tls_on(
+    listener: TcpListener,
+    config: HttpConfig,
+    tls: HttpsConfig,
+    l4: Arc<L4Client>,
+) -> Result<()> {
     use boring::ssl::{AlpnError, SslAcceptor, SslFiletype, SslMethod, select_next_proto};
 
     let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())?;
@@ -73,10 +107,9 @@ pub async fn serve_tls(config: HttpConfig, tls: HttpsConfig, l4: Arc<L4Client>) 
         select_next_proto(b"\x08http/1.1", client).ok_or(AlpnError::NOACK)
     });
     let acceptor = Arc::new(builder.build());
-
     let expected_auth = expected_proxy_auth(&config)?;
-    let listener = TcpListener::bind(config.bind).await?;
-    log::info!("HTTPS proxy listening on {}", config.bind);
+    let local_addr = listener.local_addr()?;
+    log::info!("HTTPS proxy listening on {local_addr}");
 
     loop {
         let (stream, peer) = listener.accept().await?;
