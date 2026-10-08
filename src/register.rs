@@ -14,8 +14,11 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tokio::net::TcpStream;
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
+use tokio::net::{TcpSocket, TcpStream};
 
 const API_HOST: &str = "api.cloudflareclient.com";
 const API_VERSION: &str = "v0a4471";
@@ -105,10 +108,11 @@ async fn api_request(
     path: &str,
     body: Vec<u8>,
     extra_headers: &[(HeaderName, HeaderValue)],
+    source_ip: Option<IpAddr>,
 ) -> Result<ApiResponse> {
     tokio::time::timeout(
         API_REQUEST_TIMEOUT,
-        api_request_inner(method, path, body, extra_headers),
+        api_request_inner(method, path, body, extra_headers, source_ip),
     )
     .await
     .context("Cloudflare registration API request timed out")?
@@ -119,10 +123,9 @@ async fn api_request_inner(
     path: &str,
     body: Vec<u8>,
     extra_headers: &[(HeaderName, HeaderValue)],
+    source_ip: Option<IpAddr>,
 ) -> Result<ApiResponse> {
-    let tcp = TcpStream::connect((API_HOST, 443))
-        .await
-        .context("failed to connect to Cloudflare registration API")?;
+    let tcp = connect_api(source_ip).await?;
     let connector = registration_tls_connector()?;
     let tls = tokio_boring::connect(
         connector
@@ -172,6 +175,49 @@ async fn api_request_inner(
     Ok(ApiResponse { status, body })
 }
 
+async fn connect_api(source_ip: Option<IpAddr>) -> Result<TcpStream> {
+    let Some(source_ip) = source_ip else {
+        return TcpStream::connect((API_HOST, 443))
+            .await
+            .context("failed to connect to Cloudflare registration API");
+    };
+
+    let candidates = tokio::net::lookup_host((API_HOST, 443))
+        .await
+        .context("failed to resolve Cloudflare registration API")?
+        .filter(|address| address.is_ipv4() == source_ip.is_ipv4())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        bail!(
+            "Cloudflare registration API has no endpoint matching source address family for {source_ip}"
+        );
+    }
+
+    let mut last_error = None;
+    for endpoint in candidates {
+        let socket = if source_ip.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
+        .context("failed to create registration TCP socket")?;
+        socket
+            .bind(SocketAddr::new(source_ip, 0))
+            .with_context(|| format!("failed to bind registration source IP {source_ip}"))?;
+        match socket.connect(endpoint).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some((endpoint, error)),
+        }
+    }
+
+    let (endpoint, error) = last_error.context("registration endpoint set unexpectedly empty")?;
+    Err(error).with_context(|| {
+        format!(
+            "failed to connect to Cloudflare registration API endpoint {endpoint} from {source_ip}"
+        )
+    })
+}
+
 fn response_text(body: &Bytes) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
@@ -183,6 +229,30 @@ fn response_text(body: &Bytes) -> String {
 /// Returns an error if randomness, TLS/HTTP, or response decoding fails, or if
 /// Cloudflare rejects registration.
 pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<AccountData> {
+    register_inner(model, locale, jwt, None).await
+}
+
+/// Register a new WARP device with the registration connection bound to `source_ip`.
+///
+/// # Errors
+///
+/// Returns an error if the source address cannot be bound, randomness, TLS/HTTP,
+/// or response decoding fails, or if Cloudflare rejects registration.
+pub async fn register_from(
+    model: &str,
+    locale: &str,
+    jwt: Option<&str>,
+    source_ip: IpAddr,
+) -> Result<AccountData> {
+    register_inner(model, locale, jwt, Some(source_ip)).await
+}
+
+async fn register_inner(
+    model: &str,
+    locale: &str,
+    jwt: Option<&str>,
+    source_ip: Option<IpAddr>,
+) -> Result<AccountData> {
     let wg_key = random_wg_pubkey()?;
     let serial = random_android_serial()?;
     let reg = Registration {
@@ -205,8 +275,14 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<Ac
             HeaderValue::from_str(jwt).context("invalid access JWT header value")?,
         ));
     }
-    let response =
-        api_request(Method::POST, &format!("/{API_VERSION}/reg"), body, &headers).await?;
+    let response = api_request(
+        Method::POST,
+        &format!("/{API_VERSION}/reg"),
+        body,
+        &headers,
+        source_ip,
+    )
+    .await?;
     if !response.status.is_success() {
         bail!(
             "registration failed: {} - {}",
@@ -248,6 +324,30 @@ pub async fn enroll_key(
     pub_key_der: &[u8],
     device_name: Option<&str>,
 ) -> Result<AccountData> {
+    enroll_key_inner(account, pub_key_der, device_name, None).await
+}
+
+/// Enroll a MASQUE key with the API connection bound to `source_ip`.
+///
+/// # Errors
+///
+/// Returns an error if the source address cannot be bound, TLS/HTTP or response
+/// decoding fails, or if Cloudflare rejects the update.
+pub async fn enroll_key_from(
+    account: &AccountData,
+    pub_key_der: &[u8],
+    device_name: Option<&str>,
+    source_ip: IpAddr,
+) -> Result<AccountData> {
+    enroll_key_inner(account, pub_key_der, device_name, Some(source_ip)).await
+}
+
+async fn enroll_key_inner(
+    account: &AccountData,
+    pub_key_der: &[u8],
+    device_name: Option<&str>,
+    source_ip: Option<IpAddr>,
+) -> Result<AccountData> {
     let pub_key_b64 = base64::engine::general_purpose::STANDARD.encode(pub_key_der);
     let update = DeviceUpdate {
         key: pub_key_b64,
@@ -263,6 +363,7 @@ pub async fn enroll_key(
         &format!("/{API_VERSION}/reg/{}", account.id),
         body,
         &[(AUTHORIZATION, authorization)],
+        source_ip,
     )
     .await?;
 

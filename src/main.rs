@@ -198,6 +198,9 @@ enum Commands {
         name: Option<String>,
         #[arg(long)]
         jwt: Option<String>,
+        /// Bind registration and enrollment API connections to this source IP.
+        #[arg(long)]
+        source_ip: Option<IpAddr>,
     },
 
     /// Expose WARP as a native TUN device.
@@ -265,7 +268,8 @@ async fn main() -> Result<()> {
                 model,
                 name,
                 jwt,
-            } => cmd_register(&cli.config, &locale, &model, name, jwt).await,
+                source_ip,
+            } => cmd_register(&cli.config, &locale, &model, name, jwt, source_ip).await,
 
             #[cfg(feature = "tun")]
             Commands::NativeTun {
@@ -315,6 +319,7 @@ async fn cmd_register(
     model: &str,
     device_name: Option<String>,
     jwt: Option<String>,
+    source_ip: Option<IpAddr>,
 ) -> Result<()> {
     if std::path::Path::new(config_path)
         .try_exists()
@@ -334,12 +339,28 @@ async fn cmd_register(
         }
     }
 
-    log::info!("Registering with locale={locale} model={model}");
-    let account_data = register::register(model, locale, jwt.as_deref()).await?;
+    log::info!("Registering with locale={locale} model={model} source_ip={source_ip:?}");
+    let account_data = match source_ip {
+        Some(source_ip) => {
+            register::register_from(model, locale, jwt.as_deref(), source_ip).await?
+        }
+        None => register::register(model, locale, jwt.as_deref()).await?,
+    };
     log::info!("Registration successful, enrolling device key...");
 
     let (priv_key_der, pub_key_der) = register::generate_ec_keypair()?;
-    let updated = register::enroll_key(&account_data, &pub_key_der, device_name.as_deref()).await?;
+    let updated = match source_ip {
+        Some(source_ip) => {
+            register::enroll_key_from(
+                &account_data,
+                &pub_key_der,
+                device_name.as_deref(),
+                source_ip,
+            )
+            .await?
+        }
+        None => register::enroll_key(&account_data, &pub_key_der, device_name.as_deref()).await?,
+    };
 
     let cfg = config::Config::from_account_data(&updated, &account_data.token, &priv_key_der)?;
     cfg.save_async(config_path).await?;
