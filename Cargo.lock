@@ -298,7 +298,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "datagram-socket"
 version = "0.8.1"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=a13b06d8bc168feb0d869384256d2084dd321e89#a13b06d8bc168feb0d869384256d2084dd321e89"
 dependencies = [
  "bytes",
  "futures-util",
@@ -687,9 +687,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libloading"
@@ -840,7 +840,7 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=a13b06d8bc168feb0d869384256d2084dd321e89#a13b06d8bc168feb0d869384256d2084dd321e89"
 
 [[package]]
 name = "once_cell"
@@ -918,7 +918,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.30.0"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=a13b06d8bc168feb0d869384256d2084dd321e89#a13b06d8bc168feb0d869384256d2084dd321e89"
 dependencies = [
  "boring",
  "boring-sys",
