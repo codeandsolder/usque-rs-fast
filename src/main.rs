@@ -27,11 +27,18 @@ use anyhow::Result;
 use clap::Args;
 use clap::{Parser, Subcommand};
 #[cfg(any(
+    feature = "register",
     feature = "http-proxy",
     feature = "https-proxy",
     feature = "socks5-proxy"
 ))]
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+use std::net::SocketAddr;
 #[cfg(any(
     feature = "tun",
     feature = "http-proxy",
