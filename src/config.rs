@@ -4,8 +4,76 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+#[cfg(not(windows))]
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::account::AccountData;
+
+#[cfg(not(windows))]
+static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(windows))]
+struct TempConfigGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+#[cfg(not(windows))]
+impl TempConfigGuard {
+    fn commit(mut self, target: &Path) -> io::Result<()> {
+        fs::rename(&self.path, target)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for TempConfigGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn create_config_temp(parent: &Path) -> io::Result<(File, TempConfigGuard)> {
+    for _ in 0..64 {
+        let sequence = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".usque-config-{}-{sequence}", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        match options.open(&path) {
+            Ok(file) => {
+                return Ok((
+                    file,
+                    TempConfigGuard {
+                        path,
+                        committed: false,
+                    },
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary config file",
+    ))
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -75,35 +143,42 @@ impl Config {
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
 
-        let mut file = tempfile::Builder::new()
-            .prefix(".usque-config-")
-            .tempfile_in(parent)
-            .with_context(|| {
+        #[cfg(not(windows))]
+        {
+            let (mut file, temp) = create_config_temp(parent).with_context(|| {
                 format!("failed to create temporary config in {}", parent.display())
             })?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.as_file()
-                .set_permissions(fs::Permissions::from_mode(0o600))
-                .with_context(|| {
-                    format!(
-                        "failed to secure temporary config permissions in {}",
-                        parent.display()
-                    )
-                })?;
+            file.write_all(json.as_bytes())
+                .with_context(|| format!("failed to write config for {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync config for {}", path.display()))?;
+            drop(file);
+
+            temp.commit(path).with_context(|| {
+                format!("failed to atomically replace config {}", path.display())
+            })?;
         }
 
-        file.write_all(json.as_bytes())
-            .with_context(|| format!("failed to write config for {}", path.display()))?;
-        file.as_file()
-            .sync_all()
-            .with_context(|| format!("failed to sync config for {}", path.display()))?;
-
-        file.persist(path)
-            .map_err(|error| error.error)
-            .with_context(|| format!("failed to atomically replace config {}", path.display()))?;
+        #[cfg(windows)]
+        {
+            let mut file = tempfile::Builder::new()
+                .prefix(".usque-config-")
+                .tempfile_in(parent)
+                .with_context(|| {
+                    format!("failed to create temporary config in {}", parent.display())
+                })?;
+            file.write_all(json.as_bytes())
+                .with_context(|| format!("failed to write config for {}", path.display()))?;
+            file.as_file()
+                .sync_all()
+                .with_context(|| format!("failed to sync config for {}", path.display()))?;
+            file.persist(path)
+                .map_err(|error| error.error)
+                .with_context(|| {
+                    format!("failed to atomically replace config {}", path.display())
+                })?;
+        }
 
         #[cfg(unix)]
         fs::File::open(parent)
