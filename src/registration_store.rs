@@ -27,10 +27,13 @@ impl RegistrationStore {
         Self { root: root.into() }
     }
 
-    /// Return the MASQUE registration for `source_ip`, creating it on cache miss.
+    /// Return the selected MASQUE registration, creating it on cache miss.
     ///
-    /// Registrations are keyed by the selected outer source IP, not by transport:
-    /// native CONNECT-IP and direct-L4 share the same enrolled MASQUE identity.
+    /// By default registrations are keyed by the selected outer source IP, not
+    /// by transport: native CONNECT-IP and direct-L4 share the same enrolled
+    /// MASQUE identity. `explicit_key` overrides only cache identity; registration
+    /// and enrollment still bind to `source_ip`, so a stable identity can survive
+    /// deliberate source-IP rotation.
     ///
     /// # Errors
     /// Returns an error if the store cannot be locked/read/written or Cloudflare
@@ -38,10 +41,13 @@ impl RegistrationStore {
     pub async fn resolve(
         &self,
         source_ip: Option<IpAddr>,
+        explicit_key: Option<&str>,
         options: &RegistrationOptions,
     ) -> Result<Config> {
-        let entry_path = self.entry_path(source_ip);
-        let lock_path = self.lock_path(source_ip);
+        let key = registration_key(source_ip, explicit_key)?;
+        let source = display_source(source_ip);
+        let entry_path = self.entry_path(&key);
+        let lock_path = self.lock_path(&key);
         let root = self.root.clone();
         let lock = tokio::task::spawn_blocking(move || acquire_entry_lock(&root, &lock_path))
             .await
@@ -55,8 +61,7 @@ impl RegistrationStore {
             match Config::load_async(&entry_path).await {
                 Ok(config) => {
                     log::info!(
-                        "Reusing WARP registration for {} from {}",
-                        display_source(source_ip),
+                        "Reusing WARP registration {key} for source {source} from {}",
                         entry_path.display()
                     );
                     drop(lock);
@@ -64,8 +69,7 @@ impl RegistrationStore {
                 }
                 Err(error) => {
                     log::warn!(
-                        "Cached WARP registration for {} at {} is invalid; replacing it: {error:#}",
-                        display_source(source_ip),
+                        "Cached WARP registration {key} for source {source} at {} is invalid; replacing it: {error:#}",
                         entry_path.display()
                     );
                 }
@@ -73,8 +77,7 @@ impl RegistrationStore {
         }
 
         log::info!(
-            "Creating WARP registration for {}{}",
-            display_source(source_ip),
+            "Creating WARP registration {key} through source {source}{}",
             if options.reregister {
                 " (--reregister)"
             } else {
@@ -99,22 +102,19 @@ impl RegistrationStore {
         let config = Config::from_account_data(&enrolled, &account.token, &private_key)?;
         config.save_async(&entry_path).await?;
         log::info!(
-            "Saved WARP registration for {} to {}",
-            display_source(source_ip),
+            "Saved WARP registration {key} created through source {source} to {}",
             entry_path.display()
         );
         drop(lock);
         Ok(config)
     }
 
-    fn entry_path(&self, source_ip: Option<IpAddr>) -> PathBuf {
-        self.root
-            .join(format!("{}.json", registration_key(source_ip)))
+    fn entry_path(&self, key: &str) -> PathBuf {
+        self.root.join(format!("{key}.json"))
     }
 
-    fn lock_path(&self, source_ip: Option<IpAddr>) -> PathBuf {
-        self.root
-            .join(format!("{}.lock", registration_key(source_ip)))
+    fn lock_path(&self, key: &str) -> PathBuf {
+        self.root.join(format!("{key}.lock"))
     }
 }
 
@@ -144,12 +144,24 @@ fn acquire_entry_lock(root: &Path, lock_path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn registration_key(source_ip: Option<IpAddr>) -> String {
-    match source_ip {
+fn registration_key(source_ip: Option<IpAddr>, explicit_key: Option<&str>) -> Result<String> {
+    if let Some(key) = explicit_key {
+        anyhow::ensure!(
+            !key.is_empty() && key.len() <= 128,
+            "registration key must contain 1..=128 ASCII key characters"
+        );
+        anyhow::ensure!(
+            key.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "registration key may contain only ASCII letters, digits, '.', '_', and '-'"
+        );
+        return Ok(format!("named-{key}"));
+    }
+    Ok(match source_ip {
         Some(IpAddr::V4(ip)) => format!("v4-{ip}"),
         Some(IpAddr::V6(ip)) => format!("v6-{}", ip.to_string().replace(':', "_")),
         None => "default-route".to_string(),
-    }
+    })
 }
 
 fn display_source(source_ip: Option<IpAddr>) -> String {
@@ -176,12 +188,25 @@ mod tests {
 
     #[test]
     fn keys_are_stable_and_transport_agnostic() -> Result<()> {
-        assert_eq!(registration_key(None), "default-route");
-        assert_eq!(registration_key(Some("192.0.2.1".parse()?)), "v4-192.0.2.1");
+        assert_eq!(registration_key(None, None)?, "default-route");
         assert_eq!(
-            registration_key(Some("2001:db8::1".parse()?)),
+            registration_key(Some("192.0.2.1".parse()?), None)?,
+            "v4-192.0.2.1"
+        );
+        assert_eq!(
+            registration_key(Some("2001:db8::1".parse()?), None)?,
             "v6-2001_db8__1"
         );
+        assert_eq!(
+            registration_key(Some("2001:db8::1".parse()?), Some("pool-g0-s3"))?,
+            "named-pool-g0-s3"
+        );
+        assert_eq!(
+            registration_key(Some("2001:db8::2".parse()?), Some("pool-g0-s3"))?,
+            "named-pool-g0-s3"
+        );
+        assert!(registration_key(None, Some("../escape")).is_err());
+        assert!(registration_key(None, Some("")).is_err());
         Ok(())
     }
 
@@ -190,7 +215,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = RegistrationStore::new(dir.path());
         let source_ip = Some("2001:db8::1234".parse()?);
-        config("cached-token").save(store.entry_path(source_ip))?;
+        let key = registration_key(source_ip, None)?;
+        config("cached-token").save(store.entry_path(&key))?;
         let options = RegistrationOptions {
             locale: "en_US".to_string(),
             model: "PC".to_string(),
@@ -199,8 +225,33 @@ mod tests {
             reregister: false,
         };
 
-        let loaded = store.resolve(source_ip, &options).await?;
+        let loaded = store.resolve(source_ip, None, &options).await?;
         assert_eq!(loaded.access_token, "cached-token");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_key_reuses_identity_across_source_rotation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = RegistrationStore::new(dir.path());
+        let key = registration_key(None, Some("pool-g0-s3"))?;
+        config("stable-token").save(store.entry_path(&key))?;
+        let options = RegistrationOptions {
+            locale: "en_US".to_string(),
+            model: "PC".to_string(),
+            device_name: None,
+            jwt: None,
+            reregister: false,
+        };
+
+        let first = store
+            .resolve(Some("2001:db8::1".parse()?), Some("pool-g0-s3"), &options)
+            .await?;
+        let rotated = store
+            .resolve(Some("2001:db8::2".parse()?), Some("pool-g0-s3"), &options)
+            .await?;
+        assert_eq!(first.access_token, "stable-token");
+        assert_eq!(rotated.access_token, "stable-token");
         Ok(())
     }
 }

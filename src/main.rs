@@ -83,7 +83,12 @@ struct RegistrationArgs {
     #[arg(long, default_value = "registrations", global = true)]
     registration_store: std::path::PathBuf,
 
-    /// Replace the registration for the selected source IP before connecting.
+    /// Stable registration identity key. By default the selected source IP is the key.
+    /// Use this when one enrolled identity should survive source-IP rotation.
+    #[arg(long, global = true)]
+    registration_key: Option<String>,
+
+    /// Replace the selected registration before connecting.
     #[arg(long, default_value_t = false, global = true)]
     reregister: bool,
 
@@ -355,7 +360,9 @@ async fn resolve_registration(
         jwt: args.registration_jwt.clone(),
         reregister: args.reregister,
     };
-    store.resolve(source_ip, &options).await
+    store
+        .resolve(source_ip, args.registration_key.as_deref(), &options)
+        .await
 }
 
 #[cfg(feature = "tun")]
