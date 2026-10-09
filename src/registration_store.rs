@@ -52,14 +52,24 @@ impl RegistrationStore {
                 .try_exists()
                 .with_context(|| format!("failed to inspect {}", entry_path.display()))?
         {
-            let config = Config::load_async(&entry_path).await?;
-            log::info!(
-                "Reusing WARP registration for {} from {}",
-                display_source(source_ip),
-                entry_path.display()
-            );
-            drop(lock);
-            return Ok(config);
+            match Config::load_async(&entry_path).await {
+                Ok(config) => {
+                    log::info!(
+                        "Reusing WARP registration for {} from {}",
+                        display_source(source_ip),
+                        entry_path.display()
+                    );
+                    drop(lock);
+                    return Ok(config);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Cached WARP registration for {} at {} is invalid; replacing it: {error:#}",
+                        display_source(source_ip),
+                        entry_path.display()
+                    );
+                }
+            }
         }
 
         log::info!(
