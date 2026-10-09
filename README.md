@@ -32,7 +32,9 @@ Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling
 
 Registration is automatic. On connection, usque-rs looks up an enrolled MASQUE identity for the selected outer source IP in `--registration-store` (default: `registrations/`). A cache miss registers and enrolls a new identity through that same source IP, saves it atomically, and continues connecting. `--reregister` replaces the entry for the selected source before connecting.
 
-The registration is keyed by source IP, not by transport. Native CONNECT-IP and direct-L4 proxying therefore reuse the same enrolled MASQUE identity when they use the same source address. If no `--source-ip` is supplied, the default-routing identity is stored separately as `default-route`. Cross-process locking prevents two concurrent clients from registering the same source simultaneously.
+By default the registration is keyed by source IP, not by transport. Native CONNECT-IP and direct-L4 proxying therefore reuse the same enrolled MASQUE identity when they use the same source address. If no `--source-ip` is supplied, the default-routing identity is stored separately as `default-route`. Cross-process locking prevents two concurrent clients from registering the same key simultaneously.
+
+`--registration-key NAME` decouples cache identity from the current source address. This is useful for source-rotation workflows: a cache miss still registers and enrolls through the selected `--source-ip`, but later connections using the same registration key can move to a different source without creating a new WARP identity. `--reregister` replaces the selected key through the current source.
 
 For an explicitly routed IPv6 egress, for example:
 
