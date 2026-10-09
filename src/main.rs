@@ -12,22 +12,15 @@
 //! usque-rs - MASQUE client for Cloudflare WARP.
 
 #[cfg(any(
-    feature = "register",
     feature = "http-proxy",
     feature = "https-proxy",
     feature = "socks5-proxy"
 ))]
 use anyhow::Context;
 use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
 #[cfg(any(
-    feature = "http-proxy",
-    feature = "https-proxy",
-    feature = "socks5-proxy"
-))]
-use clap::Args;
-use clap::{Parser, Subcommand};
-#[cfg(any(
-    feature = "register",
+    feature = "tun",
     feature = "http-proxy",
     feature = "https-proxy",
     feature = "socks5-proxy"
@@ -46,8 +39,6 @@ use std::net::SocketAddr;
     feature = "socks5-proxy"
 ))]
 use std::time::Duration;
-#[cfg(any(feature = "register", feature = "tun"))]
-use usque_rs::config;
 #[cfg(any(
     feature = "http-proxy",
     feature = "https-proxy",
@@ -60,8 +51,16 @@ use usque_rs::proxy::http::HttpsConfig;
 use usque_rs::proxy::http::{self as http_proxy, HttpConfig};
 #[cfg(feature = "socks5-proxy")]
 use usque_rs::proxy::socks::{self, SocksConfig};
-#[cfg(feature = "register")]
-use usque_rs::register;
+#[cfg(any(
+    feature = "tun",
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+use usque_rs::{
+    config,
+    registration_store::{RegistrationOptions, RegistrationStore},
+};
 #[cfg(feature = "tun")]
 use usque_rs::{tun_device, tunnel};
 
@@ -71,11 +70,34 @@ use usque_rs::{tun_device, tunnel};
     about = "Unofficial Cloudflare WARP MASQUE client in Rust"
 )]
 struct Cli {
-    #[arg(short, long, default_value = "config.json")]
-    config: String,
+    #[command(flatten)]
+    registration: RegistrationArgs,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Args, Clone)]
+struct RegistrationArgs {
+    /// Directory containing one enrolled MASQUE identity per selected source IP.
+    #[arg(long, default_value = "registrations", global = true)]
+    registration_store: std::path::PathBuf,
+
+    /// Replace the registration for the selected source IP before connecting.
+    #[arg(long, default_value_t = false, global = true)]
+    reregister: bool,
+
+    #[arg(long, default_value = "en_US", global = true)]
+    registration_locale: String,
+
+    #[arg(long, default_value = "PC", global = true)]
+    registration_model: String,
+
+    #[arg(long, global = true)]
+    registration_name: Option<String>,
+
+    #[arg(long, global = true)]
+    registration_jwt: Option<String>,
 }
 
 #[cfg(any(
@@ -114,6 +136,7 @@ struct NativeTunOptions {
     mtu: u32,
     no_iproute2: bool,
     interface_name: Option<String>,
+    source_ip: Option<IpAddr>,
 }
 
 #[cfg(any(
@@ -194,22 +217,6 @@ impl ProxyArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Register a new client and enroll a device key.
-    #[cfg(feature = "register")]
-    Register {
-        #[arg(short, long, default_value = "en_US")]
-        locale: String,
-        #[arg(short, long, default_value = "PC")]
-        model: String,
-        #[arg(short, long)]
-        name: Option<String>,
-        #[arg(long)]
-        jwt: Option<String>,
-        /// Bind registration and enrollment API connections to this source IP.
-        #[arg(long)]
-        source_ip: Option<IpAddr>,
-    },
-
     /// Expose WARP as a native TUN device.
     #[cfg(feature = "tun")]
     #[command(name = "nativetun")]
@@ -218,6 +225,9 @@ enum Commands {
         connect_port: u16,
         #[arg(short = '6', long, default_value_t = false)]
         ipv6: bool,
+        /// Bind registration and the outer MASQUE connection to this source IP.
+        #[arg(long)]
+        source_ip: Option<IpAddr>,
         #[arg(short = 'F', long, default_value_t = false)]
         no_tunnel_ipv4: bool,
         #[arg(short = 'S', long, default_value_t = false)]
@@ -242,14 +252,13 @@ enum Commands {
     ))]
     Proxy {
         #[command(flatten)]
-        options: ProxyArgs,
+        options: Box<ProxyArgs>,
     },
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     #[cfg(not(any(
-        feature = "register",
         feature = "tun",
         feature = "http-proxy",
         feature = "https-proxy",
@@ -258,7 +267,6 @@ async fn main() -> Result<()> {
     anyhow::bail!("usque-rs was built without any capability feature");
 
     #[cfg(any(
-        feature = "register",
         feature = "tun",
         feature = "http-proxy",
         feature = "https-proxy",
@@ -267,21 +275,14 @@ async fn main() -> Result<()> {
     {
         env_logger::init();
         let cli = Cli::parse();
+        let registration = cli.registration;
 
         match cli.command {
-            #[cfg(feature = "register")]
-            Commands::Register {
-                locale,
-                model,
-                name,
-                jwt,
-                source_ip,
-            } => cmd_register(&cli.config, &locale, &model, name, jwt, source_ip).await,
-
             #[cfg(feature = "tun")]
             Commands::NativeTun {
                 connect_port,
                 ipv6,
+                source_ip,
                 no_tunnel_ipv4,
                 no_tunnel_ipv6,
                 sni_address,
@@ -291,7 +292,7 @@ async fn main() -> Result<()> {
                 interface_name,
             } => {
                 cmd_nativetun(
-                    &cli.config,
+                    &registration,
                     NativeTunOptions {
                         connect_port,
                         addresses: AddressSelection {
@@ -304,6 +305,7 @@ async fn main() -> Result<()> {
                         mtu,
                         no_iproute2,
                         interface_name,
+                        source_ip,
                     },
                 )
                 .await
@@ -314,69 +316,50 @@ async fn main() -> Result<()> {
                 feature = "https-proxy",
                 feature = "socks5-proxy"
             ))]
-            Commands::Proxy { options } => cmd_proxy(&cli.config, options).await,
+            Commands::Proxy { options } => cmd_proxy(&registration, *options).await,
         }
     }
 }
 
-#[cfg(feature = "register")]
-async fn cmd_register(
-    config_path: &str,
-    locale: &str,
-    model: &str,
-    device_name: Option<String>,
-    jwt: Option<String>,
-    source_ip: Option<IpAddr>,
-) -> Result<()> {
-    if std::path::Path::new(config_path)
-        .try_exists()
-        .with_context(|| format!("failed to inspect config path {config_path}"))?
-    {
-        let response = tokio::task::spawn_blocking(|| {
-            eprint!("Config already exists. Overwrite? (y/n): ");
-            let mut response = String::new();
-            std::io::stdin().read_line(&mut response)?;
-            Ok::<_, std::io::Error>(response)
-        })
-        .await
-        .context("overwrite prompt task failed")??;
-        if response.trim() != "y" {
-            log::info!("Aborted.");
-            return Ok(());
-        }
+#[cfg(any(
+    feature = "tun",
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+fn validate_source_family(source_ip: Option<IpAddr>, use_ipv6_endpoint: bool) -> Result<()> {
+    if let Some(source_ip) = source_ip {
+        anyhow::ensure!(
+            source_ip.is_ipv6() == use_ipv6_endpoint,
+            "source IP {source_ip} does not match the selected MASQUE endpoint family; use --ipv6 for an IPv6 source"
+        );
     }
-
-    log::info!("Registering with locale={locale} model={model} source_ip={source_ip:?}");
-    let account_data = match source_ip {
-        Some(source_ip) => {
-            register::register_from(model, locale, jwt.as_deref(), source_ip).await?
-        }
-        None => register::register(model, locale, jwt.as_deref()).await?,
-    };
-    log::info!("Registration successful, enrolling device key...");
-
-    let (priv_key_der, pub_key_der) = register::generate_ec_keypair()?;
-    let updated = match source_ip {
-        Some(source_ip) => {
-            register::enroll_key_from(
-                &account_data,
-                &pub_key_der,
-                device_name.as_deref(),
-                source_ip,
-            )
-            .await?
-        }
-        None => register::enroll_key(&account_data, &pub_key_der, device_name.as_deref()).await?,
-    };
-
-    let cfg = config::Config::from_account_data(&updated, &account_data.token, &priv_key_der)?;
-    cfg.save_async(config_path).await?;
-    log::info!("Config saved to {config_path}");
     Ok(())
 }
 
+#[cfg(any(
+    feature = "tun",
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+async fn resolve_registration(
+    args: &RegistrationArgs,
+    source_ip: Option<IpAddr>,
+) -> Result<config::Config> {
+    let store = RegistrationStore::new(args.registration_store.clone());
+    let options = RegistrationOptions {
+        locale: args.registration_locale.clone(),
+        model: args.registration_model.clone(),
+        device_name: args.registration_name.clone(),
+        jwt: args.registration_jwt.clone(),
+        reregister: args.reregister,
+    };
+    store.resolve(source_ip, &options).await
+}
+
 #[cfg(feature = "tun")]
-async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<()> {
+async fn cmd_nativetun(registration: &RegistrationArgs, options: NativeTunOptions) -> Result<()> {
     let NativeTunOptions {
         connect_port,
         addresses:
@@ -390,6 +373,7 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
         mtu,
         no_iproute2,
         interface_name,
+        source_ip,
     } = options;
     if keepalive_period.is_zero() {
         anyhow::bail!("keepalive period must be greater than zero");
@@ -400,8 +384,8 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
         );
     }
 
-    let cfg = config::Config::load_async(config_path).await?;
-    eprintln!("Config loaded from {config_path}");
+    validate_source_family(source_ip, use_ipv6_endpoint)?;
+    let cfg = resolve_registration(registration, source_ip).await?;
 
     let endpoint_ip: std::net::IpAddr = if use_ipv6_endpoint {
         cfg.endpoint_v6.parse()?
@@ -435,6 +419,7 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
         sni,
         keepalive_period,
         mtu,
+        source_ip,
     };
     tunnel::maintain_tunnel(&cfg, &tunnel_cfg, tun_dev).await
 }
@@ -445,11 +430,11 @@ async fn cmd_nativetun(config_path: &str, options: NativeTunOptions) -> Result<(
     feature = "socks5-proxy"
 ))]
 async fn create_l4(
-    config_path: &str,
+    config: config::Config,
     transport: &L4TransportArgs,
 ) -> Result<std::sync::Arc<L4Client>> {
     L4Client::connect(
-        config_path,
+        config,
         &L4Config {
             connect_port: transport.connect_port,
             use_ipv6_endpoint: transport.ipv6,
@@ -522,10 +507,12 @@ fn validate_proxy_args(options: &ProxyArgs) -> Result<()> {
     feature = "https-proxy",
     feature = "socks5-proxy"
 ))]
-async fn cmd_proxy(config_path: &str, options: ProxyArgs) -> Result<()> {
+async fn cmd_proxy(registration: &RegistrationArgs, options: ProxyArgs) -> Result<()> {
     validate_proxy_args(&options)?;
     let (username, password) = resolve_proxy_auth(&options)?;
-    let l4 = create_l4(config_path, &options.transport).await?;
+    validate_source_family(options.transport.source_ip, options.transport.ipv6)?;
+    let config = resolve_registration(registration, options.transport.source_ip).await?;
+    let l4 = create_l4(config, &options.transport).await?;
     let mut listeners = tokio::task::JoinSet::<Result<()>>::new();
 
     #[cfg(feature = "socks5-proxy")]
@@ -693,9 +680,7 @@ mod tests {
     fn proxy_options(args: &[&str]) -> Result<ProxyArgs> {
         let cli = Cli::try_parse_from(args.iter().copied())?;
         match cli.command {
-            Commands::Proxy { options } => Ok(options),
-            #[cfg(feature = "register")]
-            Commands::Register { .. } => anyhow::bail!("expected proxy command"),
+            Commands::Proxy { options } => Ok(*options),
             #[cfg(feature = "tun")]
             Commands::NativeTun { .. } => anyhow::bail!("expected proxy command"),
         }
@@ -820,5 +805,29 @@ mod tests {
         assert!(validate_auth_pair(Some("user"), Some("pass")).is_ok());
         assert!(validate_auth_pair(Some("user"), None).is_err());
         assert!(validate_auth_pair(None, Some("pass")).is_err());
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "tun",
+        feature = "http-proxy",
+        feature = "https-proxy",
+        feature = "socks5-proxy"
+    )
+))]
+mod registration_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_source_must_match_selected_endpoint_family() -> Result<()> {
+        assert!(validate_source_family(Some("192.0.2.1".parse()?), false).is_ok());
+        assert!(validate_source_family(Some("2001:db8::1".parse()?), true).is_ok());
+        assert!(validate_source_family(Some("192.0.2.1".parse()?), true).is_err());
+        assert!(validate_source_family(Some("2001:db8::1".parse()?), false).is_err());
+        assert!(validate_source_family(None, false).is_ok());
+        assert!(validate_source_family(None, true).is_ok());
+        Ok(())
     }
 }
