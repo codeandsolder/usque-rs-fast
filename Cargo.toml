@@ -11,11 +11,11 @@ name = "usque-rs"
 path = "src/main.rs"
 
 [features]
-default = ["tun", "http-proxy", "https-proxy", "socks5-proxy", "register"]
-tun = ["dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:thiserror", "dep:datagram-socket", "dep:octets", "dep:tun-rs", "dep:boring", "dep:log"]
-http-proxy = ["dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:boring", "dep:log"]
-https-proxy = ["dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:tokio-boring", "dep:boring", "dep:log"]
-socks5-proxy = ["dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:fast-socks5", "dep:boring", "dep:log"]
+default = ["tun", "http-proxy", "https-proxy", "socks5-proxy"]
+tun = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:thiserror", "dep:datagram-socket", "dep:octets", "dep:tun-rs", "dep:boring", "dep:log"]
+http-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:boring", "dep:log"]
+https-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:tokio-boring", "dep:boring", "dep:log"]
+socks5-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:fast-socks5", "dep:boring", "dep:log"]
 register = ["dep:env_logger", "dep:time", "tokio/io-util", "tokio/net", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "dep:hyper-util", "dep:tokio-boring", "dep:boring", "dep:log"]
 
 [dependencies]
@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["macros", "rt"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+fs2 = "0.4"
 boring = { version = "5.2", optional = true }
 tokio-boring = { version = "5.2", optional = true }
 base64 = "0.23"

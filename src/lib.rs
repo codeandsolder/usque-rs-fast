@@ -34,7 +34,9 @@ pub mod packet;
 ))]
 pub mod proxy;
 #[cfg(feature = "register")]
-pub mod register;
+mod register;
+#[cfg(feature = "register")]
+pub mod registration_store;
 #[cfg(any(
     feature = "tun",
     feature = "http-proxy",

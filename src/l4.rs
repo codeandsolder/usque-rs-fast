@@ -175,12 +175,12 @@ impl L4Client {
     /// # Errors
     /// Returns an error for malformed configuration, address-family mismatch,
     /// TLS/QUIC handshake failure, or endpoint key mismatch.
-    pub async fn connect(config_path: &str, l4: &L4Config) -> Result<Arc<Self>> {
+    pub async fn connect(config: config::Config, l4: &L4Config) -> Result<Arc<Self>> {
         if l4.keepalive_period.is_zero() {
             bail!("keepalive period must be greater than zero");
         }
 
-        let config = Arc::new(config::Config::load_async(config_path).await?);
+        let config = Arc::new(config);
         let endpoint_ip: IpAddr = if l4.use_ipv6_endpoint {
             config.endpoint_v6.parse()?
         } else {

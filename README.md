@@ -10,7 +10,7 @@ Read [SETUP_NOTES.md](SETUP_NOTES.md) for my use-case.
 
 ## Cargo features
 
-The default build enables all four runtime capabilities plus the registration command. The runtime capabilities can also be compiled independently, without registration-only HTTP/TLS dependencies:
+The default build enables all four runtime capabilities. Each runtime capability includes the registration/enrollment support it needs, so a fresh installation can connect without a separate setup command:
 
 ```sh
 # Native TUN only
@@ -24,12 +24,23 @@ cargo build --release --no-default-features --features https-proxy
 
 # TCP-only SOCKS5/SOCKS5h proxy only
 cargo build --release --no-default-features --features socks5-proxy
-
-# Registration/enrollment utility only
-cargo build --release --no-default-features --features register
 ```
 
-Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends or Hyper; a SOCKS5-only build likewise avoids Hyper and rustls. Registration uses the same Hyper/rustls stack as the full build instead of a second HTTP-client stack. Saved-config parsing remains available to every runtime build. The `register` feature is separate and is included in the default feature set.
+Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends, while a SOCKS5-only build avoids the HTTP proxy frontend. Registration/enrollment is part of connection setup rather than a standalone application mode.
+
+## Registration lifecycle
+
+Registration is automatic. On connection, usque-rs looks up an enrolled MASQUE identity for the selected outer source IP in `--registration-store` (default: `registrations/`). A cache miss registers and enrolls a new identity through that same source IP, saves it atomically, and continues connecting. `--reregister` replaces the entry for the selected source before connecting.
+
+The registration is keyed by source IP, not by transport. Native CONNECT-IP and direct-L4 proxying therefore reuse the same enrolled MASQUE identity when they use the same source address. If no `--source-ip` is supplied, the default-routing identity is stored separately as `default-route`. Cross-process locking prevents two concurrent clients from registering the same source simultaneously.
+
+For an explicitly routed IPv6 egress, for example:
+
+```sh
+usque-rs proxy --ipv6 --source-ip 2001:db8::1234 --socks5-no-auth 127.0.0.1:1080
+```
+
+Both the registration/enrollment HTTP connections and the outer MASQUE UDP connection are bound to `2001:db8::1234`.
 
 ## Proxy modes
 
@@ -38,7 +49,7 @@ All proxy frontends run under a single `proxy` command. The command creates one 
 Expose an explicit passwordless SOCKS5/SOCKS5h listener on a non-public address:
 
 ```sh
-usque-rs -c config.json proxy --socks5-no-auth 127.0.0.1:1080
+usque-rs proxy --socks5-no-auth 127.0.0.1:1080
 ```
 
 `--socks5-no-auth` rejects public, wildcard, multicast, and documentation-only bind addresses. Allowed namespaces are loopback, RFC1918 LAN, CGNAT/Tailscale `100.64.0.0/10`, IPv4 link-local, `198.18.0.0/15` benchmark/lab space, IPv6 ULA, and IPv6 link-local. Private-open listeners require no credentials but accept and ignore any RFC1929 username/password pair for client compatibility. Authenticated SOCKS listeners require matching credentials and are the only SOCKS mode permitted on globally routable binds.
@@ -58,14 +69,14 @@ Direct L4 is TCP-only. SOCKS5 UDP ASSOCIATE is deliberately reported as unsuppor
 Expose a plaintext HTTP proxy. It supports both ordinary forward-proxy requests and CONNECT:
 
 ```sh
-usque-rs -c config.json proxy --http 127.0.0.1:8000
+usque-rs proxy --http 127.0.0.1:8000
 curl --proxy http://127.0.0.1:8000 http://example.com/
 ```
 
 Expose an HTTPS proxy (HTTP proxy protocol over a TLS-protected client-to-proxy connection). A certificate chain and private key are required:
 
 ```sh
-usque-rs -c config.json proxy \
+usque-rs proxy \
   --https 127.0.0.1:8443 \
   --tls-cert proxy-chain.pem \
   --tls-key proxy-key.pem
@@ -79,7 +90,7 @@ curl --proxy https://127.0.0.1:8443 \
 Expose all three at once. All listeners below use the same `L4Client` and therefore the same outer MASQUE session:
 
 ```sh
-usque-rs -c config.json proxy \
+usque-rs proxy \
   --socks5 127.0.0.1:1080 \
   --http 127.0.0.1:8000 \
   --https 127.0.0.1:8443 \
@@ -95,13 +106,13 @@ SOCKS5 and HTTP CONNECT relay application bytes unchanged, preserving the client
 Proxy credentials are shared by authenticated listeners. SOCKS5 is deliberately split into authenticated `--socks5` and explicit private-only `--socks5-no-auth`:
 
 ```sh
-usque-rs -c config.json proxy \
+usque-rs proxy \
   --socks5 127.0.0.1:1080 \
   --http 127.0.0.1:8000 \
   --username alice --password secret
 ```
 
-For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected. `--auth-file PATH` reads the same `username:password` pair without placing credentials in argv. `--source-ip` pins the shared outer MASQUE UDP socket to a specific host address.
+For authenticated curl tests, add `--proxy-user alice:secret`. Supplying only one of `--username` or `--password` is rejected. `--auth-file PATH` reads the same `username:password` pair without placing credentials in argv. `--source-ip` pins registration/enrollment and the shared outer MASQUE UDP socket to the same host address.
 
 ## Why the rewrite?
 

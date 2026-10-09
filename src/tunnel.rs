@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use datagram_socket::DatagramSocketRecvExt;
 use quiche::h3::NameValue;
 use std::collections::VecDeque;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -161,6 +161,7 @@ pub struct TunnelConfig {
     pub sni: String,
     pub keepalive_period: Duration,
     pub mtu: u32,
+    pub source_ip: Option<IpAddr>,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -675,10 +676,17 @@ impl TunnelStats {
 async fn open_native_quic(config: &Config, tunnel_cfg: &TunnelConfig) -> Result<NativeQuic> {
     let tls_material = tls::prepare_tls_material(config)?;
     let mut quic_config = tls::build_quic_config(&tls_material, MAX_DATAGRAM_SIZE)?;
-    let bind_addr = match tunnel_cfg.endpoint {
-        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-    };
+    let bind_ip = tunnel_cfg.source_ip.unwrap_or(match tunnel_cfg.endpoint {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    });
+    if bind_ip.is_ipv4() != tunnel_cfg.endpoint.is_ipv4() {
+        bail!(
+            "source IP {bind_ip} and MASQUE endpoint {} use different address families",
+            tunnel_cfg.endpoint
+        );
+    }
+    let bind_addr = SocketAddr::new(bind_ip, 0);
 
     let socket = bind_udp_socket(bind_addr, "masque-native-tunnel")?;
     socket.connect(tunnel_cfg.endpoint).await?;

@@ -222,32 +222,12 @@ fn response_text(body: &Bytes) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
-/// Register a new WARP device.
+/// Register a new WARP device using the selected outer source address.
 ///
 /// # Errors
-///
-/// Returns an error if randomness, TLS/HTTP, or response decoding fails, or if
-/// Cloudflare rejects registration.
-pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<AccountData> {
-    register_inner(model, locale, jwt, None).await
-}
-
-/// Register a new WARP device with the registration connection bound to `source_ip`.
-///
-/// # Errors
-///
 /// Returns an error if the source address cannot be bound, randomness, TLS/HTTP,
 /// or response decoding fails, or if Cloudflare rejects registration.
-pub async fn register_from(
-    model: &str,
-    locale: &str,
-    jwt: Option<&str>,
-    source_ip: IpAddr,
-) -> Result<AccountData> {
-    register_inner(model, locale, jwt, Some(source_ip)).await
-}
-
-async fn register_inner(
+pub async fn register(
     model: &str,
     locale: &str,
     jwt: Option<&str>,
@@ -313,36 +293,13 @@ pub fn generate_ec_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((private_key, public_key))
 }
 
-/// Replace the registration key with the generated MASQUE EC public key.
+/// Replace the registration key with the generated MASQUE EC public key, using
+/// the same selected outer source address as registration.
 ///
 /// # Errors
-///
-/// Returns an error if TLS/HTTP or response decoding fails, or if Cloudflare
-/// rejects the update.
-pub async fn enroll_key(
-    account: &AccountData,
-    pub_key_der: &[u8],
-    device_name: Option<&str>,
-) -> Result<AccountData> {
-    enroll_key_inner(account, pub_key_der, device_name, None).await
-}
-
-/// Enroll a MASQUE key with the API connection bound to `source_ip`.
-///
-/// # Errors
-///
 /// Returns an error if the source address cannot be bound, TLS/HTTP or response
 /// decoding fails, or if Cloudflare rejects the update.
-pub async fn enroll_key_from(
-    account: &AccountData,
-    pub_key_der: &[u8],
-    device_name: Option<&str>,
-    source_ip: IpAddr,
-) -> Result<AccountData> {
-    enroll_key_inner(account, pub_key_der, device_name, Some(source_ip)).await
-}
-
-async fn enroll_key_inner(
+pub async fn enroll_key(
     account: &AccountData,
     pub_key_der: &[u8],
     device_name: Option<&str>,
