@@ -1,8 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended",
-    "helpers:pinGitHubActionDigests"
+    "config:best-practices"
   ],
   "dependencyDashboard": true,
   "minimumReleaseAge": "3 days",
@@ -14,22 +13,19 @@
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": [
-      "before 3am"
+      "before 5am on monday"
     ],
     "automerge": true,
     "automergeType": "pr"
   },
   "packageRules": [
     {
-      "description": "The Rust 1.88 workflow entry is an intentional MSRV floor, not an update target",
+      "description": "Keep Cargo manifest requirements semver-ranged; Cargo.lock provides reproducibility",
       "matchManagers": [
-        "github-actions"
+        "cargo"
       ],
-      "matchDepNames": [
-        "rust"
-      ],
-      "matchFileNames": [
-        ".github/workflows/ci.yml"
+      "matchUpdateTypes": [
+        "pin"
       ],
       "enabled": false
     },

@@ -88,8 +88,9 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
-      - name: Check independently selectable features
+      - name: Check default and independently selectable features
         run: |
+          cargo check --all-targets
           cargo check --all-targets --no-default-features
           for features in \
             register \
@@ -109,12 +110,13 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@67b13fe5fac98b5387cbbaa74ee4cff3013357c6
     with:
       command: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go perl pkg-config clang libclang-dev nasm
         cargo +1.99.0 test --all-features
+        cargo +1.99.0 check --all-targets
         cargo +1.99.0 check --all-targets --no-default-features
         for features in register tun http-proxy https-proxy socks5-proxy http-proxy,https-proxy,socks5-proxy; do
           cargo +1.99.0 check --all-targets --no-default-features --features "$features"
@@ -122,32 +124,6 @@ jobs:
       rust-toolchain: "1.99.0"
       rustflags: "-C target-cpu=x86-64-v2"
 
-  msrv:
-    name: Rust 1.88 MSRV
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go perl \
-            pkg-config clang libclang-dev nasm
-
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
-        with:
-          toolchain: 1.88.0
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: msrv-1.88
-
-      - name: Check MSRV
-        run: cargo check --all-targets --all-features
 
   x86-codegen:
     name: x86 codegen / ${{ matrix.cpu }}

@@ -11,4 +11,4 @@ too-many-arguments-threshold = 10
 max-fn-params-bools = 4
 # Allowed wildcard imports (for test helpers)
 allowed-wildcard-imports = ["super::*"]
-msrv = "1.88"
+msrv = "1.99"

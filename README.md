@@ -10,9 +10,12 @@ Read [SETUP_NOTES.md](SETUP_NOTES.md) for my use-case.
 
 ## Cargo features
 
-The default build enables all four runtime capabilities. Each runtime capability includes the registration/enrollment support it needs, so a fresh installation can connect without a separate setup command:
+The default build is deliberately lean and enables only the SOCKS5/SOCKS5h proxy. Each runtime capability includes the registration/enrollment support it needs, so a fresh installation can connect without a separate setup command. Opt into the heavier frontends explicitly:
 
 ```sh
+# Default: TCP-only SOCKS5/SOCKS5h proxy
+cargo build --release
+
 # Native TUN only
 cargo build --release --no-default-features --features tun
 
@@ -22,8 +25,11 @@ cargo build --release --no-default-features --features http-proxy
 # TLS-wrapped HTTPS proxy only
 cargo build --release --no-default-features --features https-proxy
 
-# TCP-only SOCKS5/SOCKS5h proxy only
+# TCP-only SOCKS5/SOCKS5h proxy only (equivalent to the default build)
 cargo build --release --no-default-features --features socks5-proxy
+
+# All four runtime capabilities
+cargo build --release --all-features
 ```
 
 Proxy-only builds do not compile `tun-rs`, rtnetlink, CONNECT-IP packet handling, or a userspace TCP/IP stack. A TUN-only build does not compile the proxy frontends, while a SOCKS5-only build avoids the HTTP proxy frontend. Registration/enrollment is part of connection setup rather than a standalone application mode.
@@ -146,7 +152,7 @@ As a separate field datapoint, the project has also saturated a 150 Mbit/s downs
 
 ## Release binaries
 
-Building from source requires Rust 1.88 or newer.
+Building from source requires Rust 1.99 or newer.
 
 x86-64 releases are built at three ISA levels:
 

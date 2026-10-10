@@ -139,7 +139,7 @@ fn acquire_entry_lock(root: &Path, lock_path: &Path) -> Result<File> {
     let file = options
         .open(lock_path)
         .with_context(|| format!("failed to open registration lock {}", lock_path.display()))?;
-    fs2::FileExt::lock_exclusive(&file)
+    file.lock()
         .with_context(|| format!("failed to lock registration {}", lock_path.display()))?;
     Ok(file)
 }

@@ -2,7 +2,7 @@
 name = "usque-rs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99.0"
 description = "Rust MASQUE client for Cloudflare WARP with native TUN and direct-L4 proxy modes (unofficial)"
 license = "MIT"
 
@@ -11,12 +11,12 @@ name = "usque-rs"
 path = "src/main.rs"
 
 [features]
-default = ["tun", "http-proxy", "https-proxy", "socks5-proxy"]
+default = ["socks5-proxy"]
 tun = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:thiserror", "dep:datagram-socket", "dep:octets", "dep:tun-rs", "dep:boring", "dep:log"]
 http-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:boring", "dep:log"]
 https-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:tokio-boring", "dep:boring", "dep:log"]
 socks5-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:fast-socks5", "dep:boring", "dep:log"]
-register = ["dep:env_logger", "dep:time", "tokio/io-util", "tokio/net", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "dep:hyper-util", "dep:tokio-boring", "dep:boring", "dep:log"]
+register = ["dep:time", "tokio/io-util", "tokio/net", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "dep:hyper-util", "dep:tokio-boring", "dep:boring", "dep:log"]
 
 [dependencies]
 quiche = { version = "0.30.0", optional = true }
@@ -27,7 +27,6 @@ tokio = { version = "1", features = ["macros", "rt"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-fs2 = "0.4"
 boring = { version = "5.2", optional = true }
 tokio-boring = { version = "5.2", optional = true }
 base64 = "0.23"
@@ -79,8 +78,6 @@ await_holding_lock = "deny"
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 
-[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
-portable-atomic = "1.15"
 
 [patch.crates-io]
 quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "9ddf883381349d95fe845316fc4177d0f8cf42d4" }
