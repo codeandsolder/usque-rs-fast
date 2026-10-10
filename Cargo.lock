@@ -298,7 +298,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "datagram-socket"
 version = "0.8.1"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=ae0e0667df3d9134b1b9a51038305e2ecf38dec0#ae0e0667df3d9134b1b9a51038305e2ecf38dec0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -307,12 +307,6 @@ dependencies = [
  "smallvec",
  "tokio",
 ]
-
-[[package]]
-name = "debug_panic"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9377eb110cece2e9431deb8d7d2ec8c116510b896741f9f2bf02b352147aa2a6"
 
 [[package]]
 name = "deranged"
@@ -404,8 +398,8 @@ dependencies = [
 
 [[package]]
 name = "fast-socks5"
-version = "1.0.0"
-source = "git+https://github.com/codeandsolder/fast-socks5-fast?rev=d2068a90af77dc672f017c236376c26ed8f297ba#d2068a90af77dc672f017c236376c26ed8f297ba"
+version = "2.0.0"
+source = "git+https://github.com/codeandsolder/fast-socks5-fast?rev=a8b5af56f4ae9aabf1de35a5b23b7fbb753373d8#a8b5af56f4ae9aabf1de35a5b23b7fbb753373d8"
 dependencies = [
  "log",
  "thiserror",
@@ -465,16 +459,6 @@ name = "foreign-types-shared"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
-
-[[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
 
 [[package]]
 name = "fs_extra"
@@ -850,7 +834,7 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=ae0e0667df3d9134b1b9a51038305e2ecf38dec0#ae0e0667df3d9134b1b9a51038305e2ecf38dec0"
 
 [[package]]
 name = "once_cell"
@@ -928,12 +912,11 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.30.0"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=9ddf883381349d95fe845316fc4177d0f8cf42d4#9ddf883381349d95fe845316fc4177d0f8cf42d4"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=ae0e0667df3d9134b1b9a51038305e2ecf38dec0#ae0e0667df3d9134b1b9a51038305e2ecf38dec0"
 dependencies = [
  "boring",
  "boring-sys",
  "bytes",
- "debug_panic",
  "either",
  "enum_dispatch",
  "foreign-types-shared",
@@ -1254,7 +1237,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tun-rs"
 version = "2.8.11"
-source = "git+https://github.com/codeandsolder/tun-rs-fast.git?rev=6731de0221a0c59856249d3b0a577f78b60c1ecc#6731de0221a0c59856249d3b0a577f78b60c1ecc"
+source = "git+https://github.com/codeandsolder/tun-rs-fast.git?rev=724850d6c65253fcb9a36ff4b6b2090a9e8b3d6c#724850d6c65253fcb9a36ff4b6b2090a9e8b3d6c"
 dependencies = [
  "blocking",
  "bytes",
@@ -1291,14 +1274,12 @@ dependencies = [
  "datagram-socket",
  "env_logger",
  "fast-socks5",
- "fs2",
  "http-body-util",
  "hyper",
  "hyper-util",
  "log",
  "nix",
  "octets",
- "portable-atomic",
  "quiche",
  "serde",
  "serde_json",
