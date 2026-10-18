@@ -15,12 +15,12 @@ permissions:
 jobs:
   retry:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       actions: write
-      contents: read
+      contents: write
       issues: write
-      pull-requests: read
+      pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -87,7 +87,7 @@ jobs:
             echo "The frozen snapshot is still quarantined; leaving it untouched."
           fi
 
-      - name: Re-run quarantine check or request Renovate rebase
+      - name: Finalize the cleared snapshot
         if: steps.pr.outputs.found == 'true' && steps.probe.outputs.eligible == 'true'
         shell: bash
         env:
@@ -125,23 +125,88 @@ jobs:
             exit 0
           fi
 
-          run_id=$(
+          get_run() {
+            local workflow=$1
             gh api --method GET \
-              "repos/${GH_REPO}/actions/workflows/dependency-quarantine.yml/runs" \
+              "repos/${GH_REPO}/actions/workflows/${workflow}/runs" \
               -f event=pull_request \
               -f branch=renovate/lock-file-maintenance \
-              -f status=failure \
               -f per_page=20 \
-              --jq ".workflow_runs[] | select(.head_sha == \"${HEAD_SHA}\") | .id" |
+              --jq ".workflow_runs[] | select(.head_sha == \"${HEAD_SHA}\") | [.id, .status, (.conclusion // \"\"), .run_attempt] | @tsv" |
               head -n 1
-          )
+          }
 
-          if [[ -z "${run_id}" ]]; then
-            echo "No failed quarantine run exists for the current head; nothing to re-run."
+          quarantine_run=$(get_run dependency-quarantine.yml)
+          if [[ -z "${quarantine_run}" ]]; then
+            echo "No quarantine run exists for the current head; refusing to merge."
             exit 0
           fi
 
-          gh api --method POST \
-            "repos/${GH_REPO}/actions/runs/${run_id}/rerun-failed-jobs" \
-            >/dev/null
-          echo "Re-running the existing quarantine check for the unchanged snapshot."
+          IFS=$'\t' read -r quarantine_id quarantine_status quarantine_conclusion quarantine_attempt <<<"${quarantine_run}"
+          if [[ "${quarantine_status}" != "completed" ]]; then
+            echo "Quarantine check is still ${quarantine_status}; leaving the PR untouched."
+            exit 0
+          fi
+
+          if [[ "${quarantine_conclusion}" == "failure" ]]; then
+            gh api --method POST \
+              "repos/${GH_REPO}/actions/runs/${quarantine_id}/rerun-failed-jobs" \
+              >/dev/null
+            echo "Re-running the existing quarantine check for the unchanged snapshot."
+
+            for _ in {1..30}; do
+              sleep 10
+              run_json=$(gh api "repos/${GH_REPO}/actions/runs/${quarantine_id}")
+              attempt=$(jq -r '.run_attempt' <<<"${run_json}")
+              status=$(jq -r '.status' <<<"${run_json}")
+              conclusion=$(jq -r '.conclusion // ""' <<<"${run_json}")
+              if (( attempt > quarantine_attempt )) && [[ "${status}" == "completed" ]]; then
+                quarantine_status=${status}
+                quarantine_conclusion=${conclusion}
+                break
+              fi
+            done
+          fi
+
+          if [[ "${quarantine_status}" != "completed" || "${quarantine_conclusion}" != "success" ]]; then
+            echo "Quarantine has not produced a successful result for the frozen head yet; refusing to merge."
+            exit 0
+          fi
+
+          for workflow in ci.yml rust-skills2-strict.yml; do
+            run=$(get_run "${workflow}")
+            if [[ -z "${run}" ]]; then
+              echo "No ${workflow} pull-request run exists for the current head; refusing to merge."
+              exit 0
+            fi
+
+            IFS=$'\t' read -r _ status conclusion _ <<<"${run}"
+            if [[ "${status}" != "completed" || "${conclusion}" != "success" ]]; then
+              echo "${workflow} is ${status}/${conclusion}; refusing to merge."
+              exit 0
+            fi
+          done
+
+          pr_json=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}")
+          current_head=$(jq -r '.head.sha' <<<"${pr_json}")
+          if [[ "${current_head}" != "${HEAD_SHA}" ]]; then
+            echo "PR head moved after validation; refusing to merge."
+            exit 0
+          fi
+
+          merge_json=$(
+            gh api --method PUT "repos/${GH_REPO}/pulls/${PR_NUMBER}/merge" \
+              -f "sha=${HEAD_SHA}" \
+              -f merge_method=squash
+          )
+          if [[ "$(jq -r '.merged' <<<"${merge_json}")" != "true" ]]; then
+            echo "GitHub did not merge the PR: $(jq -r '.message // "unknown reason"' <<<"${merge_json}")"
+            exit 0
+          fi
+
+          echo "Merged the cleared frozen snapshot without regenerating Cargo.lock."
+
+          # GITHUB_TOKEN-authored merges do not recursively trigger push workflows.
+          # Explicit dispatch preserves the repository's normal post-merge validation.
+          gh workflow run ci.yml --repo "${GH_REPO}" --ref main
+          gh workflow run rust-skills2-strict.yml --repo "${GH_REPO}" --ref main
