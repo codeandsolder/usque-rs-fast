@@ -1,0 +1,147 @@
+name: Cargo quarantine retry
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: cargo-quarantine-retry
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  retry:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Find open lockfile maintenance PR
+        id: pr
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          owner=${GH_REPO%%/*}
+          pr_json=$(
+            gh api --method GET "repos/${GH_REPO}/pulls" \
+              -f state=open \
+              -f "head=${owner}:renovate/lock-file-maintenance" \
+              -f per_page=1
+          )
+
+          number=$(jq -r '.[0].number // empty' <<<"${pr_json}")
+          if [[ -z "${number}" ]]; then
+            echo "found=false" >>"${GITHUB_OUTPUT}"
+            echo "No open lockfile-maintenance PR."
+            exit 0
+          fi
+
+          echo "found=true" >>"${GITHUB_OUTPUT}"
+          echo "number=${number}" >>"${GITHUB_OUTPUT}"
+          echo "head_sha=$(jq -r '.[0].head.sha' <<<"${pr_json}")" >>"${GITHUB_OUTPUT}"
+          echo "base_sha=$(jq -r '.[0].base.sha' <<<"${pr_json}")" >>"${GITHUB_OUTPUT}"
+
+      - name: Check out the frozen snapshot
+        if: steps.pr.outputs.found == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Probe release-age eligibility without changing the branch
+        if: steps.pr.outputs.found == 'true'
+        id: probe
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "${BASE_SHA}"
+          git show "${BASE_SHA}:.github/scripts/cargo-release-quarantine.py" \
+            >"${RUNNER_TEMP}/cargo-release-quarantine.py"
+
+          set +e
+          python3 "${RUNNER_TEMP}/cargo-release-quarantine.py" \
+            --base-ref "${BASE_SHA}" \
+            --hours 72
+          status=$?
+          set -e
+
+          if (( status == 0 )); then
+            echo "eligible=true" >>"${GITHUB_OUTPUT}"
+            echo "The frozen Cargo.lock snapshot has cleared quarantine."
+          else
+            echo "eligible=false" >>"${GITHUB_OUTPUT}"
+            echo "The frozen snapshot is still quarantined; leaving it untouched."
+          fi
+
+      - name: Re-run quarantine check or request Renovate rebase
+        if: steps.pr.outputs.found == 'true' && steps.probe.outputs.eligible == 'true'
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          pr_json=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}")
+          current_head=$(jq -r '.head.sha' <<<"${pr_json}")
+          if [[ "${current_head}" != "${HEAD_SHA}" ]]; then
+            echo "PR head moved during the probe; next scheduled run will evaluate the new snapshot."
+            exit 0
+          fi
+
+          mergeable=$(jq -r '.mergeable // "unknown"' <<<"${pr_json}")
+          if [[ "${mergeable}" == "false" ]]; then
+            if ! gh api "repos/${GH_REPO}/labels/rebase" >/dev/null 2>&1; then
+              gh api --method POST "repos/${GH_REPO}/labels" \
+                -f name=rebase \
+                -f color=d4c5f9 \
+                -f description='Request Renovate regeneration after quarantine clears' \
+                >/dev/null
+            fi
+
+            jq -nc '{labels:["rebase"]}' |
+              gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/labels" \
+                --input - >/dev/null
+            echo "Snapshot is old enough but conflicts with main; requested one Renovate regeneration."
+            exit 0
+          fi
+
+          if [[ "${mergeable}" != "true" ]]; then
+            echo "GitHub has not computed mergeability yet; retrying on the next schedule."
+            exit 0
+          fi
+
+          run_id=$(
+            gh api --method GET \
+              "repos/${GH_REPO}/actions/workflows/dependency-quarantine.yml/runs" \
+              -f event=pull_request \
+              -f branch=renovate/lock-file-maintenance \
+              -f status=failure \
+              -f per_page=20 \
+              --jq ".workflow_runs[] | select(.head_sha == \"${HEAD_SHA}\") | .id" |
+              head -n 1
+          )
+
+          if [[ -z "${run_id}" ]]; then
+            echo "No failed quarantine run exists for the current head; nothing to re-run."
+            exit 0
+          fi
+
+          gh api --method POST \
+            "repos/${GH_REPO}/actions/runs/${run_id}/rerun-failed-jobs" \
+            >/dev/null
+          echo "Re-running the existing quarantine check for the unchanged snapshot."
