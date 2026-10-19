@@ -119,9 +119,9 @@ Useful TUN options include:
 --source-ip IP         bind registration and outer MASQUE traffic to this source
 ```
 
-The inherited [`SETUP_NOTES.md`](SETUP_NOTES.md) is useful as an OpenWrt routing
-example, but it predates automatic registration. In particular, the old `login` step is
-obsolete.
+For an end-to-end OpenWrt IPv6-via-WARP example—including automatic registration,
+procd supervision, a dedicated firewall/NAT66 zone, Router Advertisements, and the
+IPv6 default route—see [`SETUP_NOTES.md`](SETUP_NOTES.md).
 
 ## Building
 
