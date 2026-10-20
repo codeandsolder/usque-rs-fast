@@ -18,7 +18,7 @@ env:
 jobs:
   fmt:
     name: Format
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -36,7 +36,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
@@ -64,7 +64,7 @@ jobs:
   test:
     if: github.event_name == 'pull_request'
     name: Test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
@@ -128,7 +128,7 @@ jobs:
   x86-codegen:
     name: x86 codegen / ${{ matrix.cpu }}
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         cpu: [x86-64-v2, x86-64-v3, znver1, znver2]
