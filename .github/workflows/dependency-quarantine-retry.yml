@@ -59,33 +59,25 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Check out pinned quarantine implementation
+        if: steps.pr.outputs.found == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: codeandsolder/ci-workflows
+          ref: b2414c5358d1061e9b442656298506e98c9d13e7
+          path: .ci-workflows-quarantine
+          persist-credentials: false
+          sparse-checkout: .github/actions/cargo-release-quarantine
+          sparse-checkout-cone-mode: true
+
       - name: Probe release-age eligibility without changing the branch
         if: steps.pr.outputs.found == 'true'
         id: probe
-        shell: bash
-        env:
-          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
-        run: |
-          set -euo pipefail
-
-          git fetch --no-tags origin "${BASE_SHA}"
-          git show "${BASE_SHA}:.github/scripts/cargo-release-quarantine.py" \
-            >"${RUNNER_TEMP}/cargo-release-quarantine.py"
-
-          set +e
-          python3 "${RUNNER_TEMP}/cargo-release-quarantine.py" \
-            --base-ref "${BASE_SHA}" \
-            --hours 72
-          status=$?
-          set -e
-
-          if (( status == 0 )); then
-            echo "eligible=true" >>"${GITHUB_OUTPUT}"
-            echo "The frozen Cargo.lock snapshot has cleared quarantine."
-          else
-            echo "eligible=false" >>"${GITHUB_OUTPUT}"
-            echo "The frozen snapshot is still quarantined; leaving it untouched."
-          fi
+        uses: ./.ci-workflows-quarantine/.github/actions/cargo-release-quarantine
+        with:
+          base-ref: ${{ steps.pr.outputs.base_sha }}
+          hours: "72"
+          fail-on-blocked: "false"
 
       - name: Finalize the cleared snapshot
         if: steps.pr.outputs.found == 'true' && steps.probe.outputs.eligible == 'true'

@@ -8,13 +8,6 @@ permissions:
 
 jobs:
   quarantine:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Enforce 72-hour crates.io quarantine
-        run: python3 .github/scripts/cargo-release-quarantine.py --base-ref "${{ github.event.pull_request.base.sha }}" --hours 72
+    uses: codeandsolder/ci-workflows/.github/workflows/cargo-release-quarantine.yml@b2414c5358d1061e9b442656298506e98c9d13e7
+    with:
+      hours: 72
