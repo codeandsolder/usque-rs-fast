@@ -64,7 +64,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: codeandsolder/ci-workflows
-          ref: 17f01769b600b997d7bd1760d917b6335e6cdbfe # pending ci-workflows #31
+          ref: b2414c5358d1061e9b442656298506e98c9d13e7
           path: .ci-workflows-quarantine
           persist-credentials: false
           sparse-checkout: .github/actions/cargo-release-quarantine
