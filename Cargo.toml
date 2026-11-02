@@ -34,7 +34,7 @@ log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", default-features = false, optional = true }
 anyhow = "1"
 thiserror = { version = "2", optional = true }
-tun-rs = { version = "2.8.8", default-features = false, features = ["async"], optional = true }
+tun-rs = { version = "2.8.16", default-features = false, features = ["async"], optional = true }
 time = { version = "0.3", optional = true }
 socket2 = { version = "0.6", optional = true }
 nix = { version = "0.31.3", features = ["net", "socket", "time", "uio"], optional = true }
@@ -82,7 +82,6 @@ allow_attributes_without_reason = "deny"
 [patch.crates-io]
 quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "ae0e0667df3d9134b1b9a51038305e2ecf38dec0" }
 octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "ae0e0667df3d9134b1b9a51038305e2ecf38dec0" }
-tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "724850d6c65253fcb9a36ff4b6b2090a9e8b3d6c" }
 datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "ae0e0667df3d9134b1b9a51038305e2ecf38dec0" }
 
 [profile.release]
