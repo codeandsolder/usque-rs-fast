@@ -6,6 +6,13 @@ on:
     tags: ["v*.*.*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      validation:
+        description: Validation path to exercise manually
+        type: choice
+        required: true
+        default: routine
+        options: [routine, cross-cache]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -18,6 +25,7 @@ env:
 jobs:
   current-linux:
     name: Current Rust 1.99.1 Linux validation
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.validation != 'cross-cache' }}
     permissions:
       contents: read
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
@@ -44,6 +52,50 @@ jobs:
         for features in register tun http-proxy https-proxy socks5-proxy http-proxy,https-proxy,socks5-proxy; do
           cargo +1.99.1 check --all-targets --no-default-features --features "$features"
         done
+
+  cross-cache-smoke:
+    # Explicit dispatch only: no additional routine PR runners, no release
+    # artifacts. Uses the actual release bridge against one representative
+    # cross container to verify client-side cache connectivity.
+    name: Cross-container sccache smoke (x86_64 musl)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation == 'cross-cache' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      CROSS_CONFIG: Cross.toml
+      CARGO_PROFILE_RELEASE_PANIC: abort
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.1"
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        with:
+          rust-toolchain: "1.99.1"
+          rustflags: "cross:x86_64-unknown-linux-musl:baseline"
+      - name: Install cross
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cross
+      - name: Build representative release target and check cache activity
+        shell: bash
+        run: |
+          bash .github/scripts/cross-build-with-sccache.sh x86_64-unknown-linux-musl
+          test -f target/x86_64-unknown-linux-musl/release/usque-rs
+          "$SCCACHE_BIN" --show-stats --stats-format json | python3 -c '
+          import json,sys
+          stats=json.load(sys.stdin)["stats"]
+          n=stats.get("compile_requests",0)
+          print(f"Cross-container sccache compile requests: {n}")
+          if n < 1: sys.exit("No compiler traffic reached the host sccache daemon")
+          '
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
 
   x86-codegen:
     name: x86 codegen / ${{ matrix.cpu }}
