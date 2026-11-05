@@ -79,12 +79,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: ${{ matrix.toolchain || '1.99.0' }}
+          toolchain: ${{ matrix.toolchain || '1.99.1' }}
 
-      - name: Cache Rust registry
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Setup mandatory shared sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
         with:
-          key: release-${{ matrix.target }}-${{ matrix.cpu_level || 'baseline' }}
+          rust-toolchain: "${{ matrix.toolchain || '1.99.1' }}"
+          # Scope the persisted cache by target/CPU. The setup input only
+          # affects the cache identity; it does not set compiler RUSTFLAGS.
+          rustflags: "cross:${{ matrix.target }}:${{ matrix.cpu_level || 'baseline' }}:${{ matrix.rustflags || '' }}"
 
       - name: Install cross
         uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
@@ -92,10 +95,31 @@ jobs:
           tool: cross
 
       - name: Build (release)
+        shell: bash
         env:
           CARGO_PROFILE_RELEASE_PANIC: ${{ matrix.panic_strategy || 'abort' }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags || '' }}
-        run: cross build --release --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # Cross runs rustc *inside* its target's container. Bind in the
+          # already-installed static MUSL sccache client and connect to the
+          # existing, host-backed cache daemon; never start a second daemon.
+          client="$(realpath -- "${SCCACHE_BIN:?canonical cache action did not initialize}")"
+          test -x "$client"
+          if [[ "$client" == *[[:space:]]* ]]; then
+            echo "sccache client path cannot be represented in CROSS_CONTAINER_OPTS: $client" >&2
+            exit 2
+          fi
+          export CROSS_CONTAINER_OPTS="--network=host --mount type=bind,src=$client,dst=/usr/local/bin/sccache,readonly"
+          export RUSTC_WRAPPER=/usr/local/bin/sccache
+          export SCCACHE_CLIENT_SIDE=1
+          export SCCACHE_START_SERVER=0
+          export SCCACHE_NO_AUTO_START_SERVER=1
+          cross build --release --target "${{ matrix.target }}"
+
+      - name: Finalize mandatory shared sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
 
       - name: Strip binary
         run: |
