@@ -5,6 +5,14 @@
 passthrough = [
     "CARGO_TERM_COLOR",
     "RUST_BACKTRACE",
+    "CXXFLAGS",
+    # The release workflow mounts the canonical client and injects the
+    # container-local wrapper and CMake paths through Docker options.
+    # Don't pass through host RUSTC_WRAPPER: cross first runs cargo metadata
+    # on the host, where the wrapper must remain host-executable.
+    "SCCACHE_CLIENT_SIDE",
+    "SCCACHE_START_SERVER",
+    "SCCACHE_NO_AUTO_START_SERVER",
 ]
 
 [build]
