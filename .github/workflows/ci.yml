@@ -8,129 +8,42 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Reject allow attributes
-        shell: bash
-        run: |
-          if git grep -n -E '(^|[^[:alnum:]_])allow[[:space:]]*\(' -- '*.rs'; then
-            echo 'allow(...) attributes are forbidden in Rust sources; use a narrow reasoned expect(...)' >&2
-            exit 1
-          fi
-
-      - name: Verify maintenance detector syntax
-        run: python3 -m py_compile .github/scripts/*.py
-
-      - name: Install Rust 1.99.1
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-26.04
-    env:
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go perl \
-            pkg-config clang libclang-dev nasm
-
-      - name: Install Rust 1.99.1
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-          components: clippy
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-  test:
-    if: github.event_name == 'pull_request'
-    name: Test
-    runs-on: ubuntu-26.04
-    env:
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go perl \
-            pkg-config clang libclang-dev nasm
-
-      - name: Install Rust 1.99.1
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-
-      - name: Run tests
-        run: cargo test --all-features
-
-      - name: Check default and independently selectable features
-        run: |
-          cargo check --all-targets
-          cargo check --all-targets --no-default-features
-          for features in \
-            register \
-            tun \
-            http-proxy \
-            https-proxy \
-            socks5-proxy \
-            http-proxy,https-proxy,socks5-proxy
-          do
-            cargo check --all-targets --no-default-features --features "$features"
-          done
-
-
-  test-shared-cache:
-    name: Test (shared sccache)
-    if: github.event_name != 'pull_request'
+  current-linux:
+    name: Current Rust 1.99.1 Linux validation
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@b2414c5358d1061e9b442656298506e98c9d13e7 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
     with:
+      runner: ubuntu-26.04
+      rust-toolchain: "1.99.1"
+      rust-components: "rustfmt clippy"
+      rustflags: "-C target-cpu=x86-64-v2"
       command: |
+        set -euo pipefail
+        # Preserve all existing source, format, Clippy, test and feature checks.
+        if git grep -n -E '(^|[^[:alnum:]_])allow[[:space:]]*\(' -- '*.rs'; then
+          echo 'allow(...) attributes are forbidden in Rust sources; use a narrow reasoned expect(...)' >&2
+          exit 1
+        fi
+        python3 -m py_compile .github/scripts/*.py
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go perl pkg-config clang libclang-dev nasm
-        cargo +1.99.0 test --all-features
-        cargo +1.99.0 check --all-targets
-        cargo +1.99.0 check --all-targets --no-default-features
+        cargo +1.99.1 fmt --all --check
+        cargo +1.99.1 clippy --all-targets --all-features -- -D warnings
+        cargo +1.99.1 test --all-features
+        cargo +1.99.1 check --all-targets
+        cargo +1.99.1 check --all-targets --no-default-features
         for features in register tun http-proxy https-proxy socks5-proxy http-proxy,https-proxy,socks5-proxy; do
-          cargo +1.99.0 check --all-targets --no-default-features --features "$features"
+          cargo +1.99.1 check --all-targets --no-default-features --features "$features"
         done
-      rust-toolchain: "1.99.0"
-      rustflags: "-C target-cpu=x86-64-v2"
-
 
   x86-codegen:
     name: x86 codegen / ${{ matrix.cpu }}
@@ -154,12 +67,16 @@ jobs:
         with:
           toolchain: 1.99.1
 
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
         with:
-          key: x86-codegen-${{ matrix.cpu }}
+          rust-toolchain: "1.99.1"
+          rustflags: "-C target-cpu=${{ matrix.cpu }}"
 
       - name: Check target CPU build
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
-        run: cargo check --all-targets --all-features --target x86_64-unknown-linux-gnu
+        run: cargo +1.99.1 check --all-targets --all-features --target x86_64-unknown-linux-gnu
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
