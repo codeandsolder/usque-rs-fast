@@ -1,7 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:best-practices"
+    "config:best-practices",
+    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
   ],
   "dependencyDashboard": true,
   "minimumReleaseAge": "3 days",
@@ -94,6 +95,19 @@
         "replacement"
       ],
       "minimumReleaseAge": null,
+      "automerge": false
+    },
+    {
+      "description": "Immediately track and manually review pinned shared CI and strict-policy updates, without normal age quarantine",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "/^codeandsolder\\/(?:ci-workflows|rust-skills2)(?:\\/|$)/"
+      ],
+      "minimumReleaseAge": null,
+      "groupName": "Shared CI trust roots",
+      "groupSlug": "shared-ci-trust-roots",
       "automerge": false
     }
   ],
