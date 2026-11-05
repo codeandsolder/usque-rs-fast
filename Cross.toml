@@ -9,6 +9,8 @@ passthrough = [
     # container and connects it to the existing host cache daemon. Client-side
     # mode executes rustc inside the container rather than on the host.
     "RUSTC_WRAPPER",
+    "CMAKE_C_COMPILER_LAUNCHER",
+    "CMAKE_CXX_COMPILER_LAUNCHER",
     "SCCACHE_CLIENT_SIDE",
     "SCCACHE_START_SERVER",
     "SCCACHE_NO_AUTO_START_SERVER",
