@@ -27,4 +27,12 @@ export CROSS_CONTAINER_OPTS="--network=host --mount type=bind,src=$client,dst=/u
 export SCCACHE_CLIENT_SIDE=1
 export SCCACHE_START_SERVER=0
 export SCCACHE_NO_AUTO_START_SERVER=1
+
+# The cross x86_64-musl image's old GCC crashes in expand_debug_locations
+# when compiling BoringSSL's vectorized Keccak. Disable GCC's optional
+# debug-variable tracking only; code generation and vectorization remain
+# fully optimized, and the other target compilers are untouched.
+if [[ "$target" == "x86_64-unknown-linux-musl" ]]; then
+    export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-fno-var-tracking-assignments"
+fi
 cross build --release --target "$target"
