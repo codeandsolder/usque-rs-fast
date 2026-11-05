@@ -112,6 +112,8 @@ jobs:
           fi
           export CROSS_CONTAINER_OPTS="--network=host --mount type=bind,src=$client,dst=/usr/local/bin/sccache,readonly"
           export RUSTC_WRAPPER=/usr/local/bin/sccache
+          export CMAKE_C_COMPILER_LAUNCHER=/usr/local/bin/sccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=/usr/local/bin/sccache
           export SCCACHE_CLIENT_SIDE=1
           export SCCACHE_START_SERVER=0
           export SCCACHE_NO_AUTO_START_SERVER=1
