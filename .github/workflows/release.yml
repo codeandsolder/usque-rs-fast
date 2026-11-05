@@ -117,10 +117,6 @@ jobs:
           export SCCACHE_NO_AUTO_START_SERVER=1
           cross build --release --target "${{ matrix.target }}"
 
-      - name: Finalize mandatory shared sccache
-        if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
-
       - name: Strip binary
         run: |
           sudo apt-get install -y --no-install-recommends llvm 2>/dev/null || true
@@ -161,3 +157,6 @@ jobs:
           # job only or GitHub appends the same generated body once per target.
           generate_release_notes: ${{ matrix.artifact_name == 'usque-rs-x86_64-linux-musl' }}
           fail_on_unmatched_files: true
+      - name: Finalize mandatory shared sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
