@@ -53,6 +53,46 @@ pub struct L4Client {
     dns_cache: Arc<dns::Cache>,
 }
 
+/// Provenance of the one address selected for a hostname L4 CONNECT.
+/// The DNS race is complete before a connection is attempted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionSource {
+    Literal,
+    Cache,
+    Queried {
+        resolver: IpAddr,
+        record_type: dns::RecordType,
+        ttl: Duration,
+    },
+}
+
+impl ResolutionSource {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Literal => "literal",
+            Self::Cache => "cache",
+            Self::Queried { .. } => "queried",
+        }
+    }
+
+    const fn query_details(self) -> (Option<IpAddr>, Option<dns::RecordType>, Option<u64>) {
+        match self {
+            Self::Queried {
+                resolver,
+                record_type,
+                ttl,
+            } => (Some(resolver), Some(record_type), Some(ttl.as_secs())),
+            Self::Literal | Self::Cache => (None, None, None),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedHost {
+    address: IpAddr,
+    source: ResolutionSource,
+}
+
 struct DriverConfig {
     config: Arc<config::Config>,
     endpoint: SocketAddr,
@@ -245,11 +285,48 @@ impl L4Client {
     /// Returns an error if tunneled DNS fails, no address is returned, or the
     /// resulting L4 CONNECT stream cannot be established.
     pub async fn dial_host(&self, host: &str, port: u16) -> io::Result<DuplexStream> {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return self.dial_addr(SocketAddr::new(ip, port)).await;
-        }
-        let address = self.resolve(host).await?;
-        self.dial_addr(SocketAddr::new(address, port)).await
+        let selected = if let Ok(address) = host.parse::<IpAddr>() {
+            ResolvedHost {
+                address,
+                source: ResolutionSource::Literal,
+            }
+        } else {
+            match self.resolve(host).await {
+                Ok(selected) => selected,
+                Err(error) => {
+                    log::debug!(
+                        target: "usque_rs::l4::route",
+                        "event=resolution_failed host={host:?} port={port} error_kind={:?}",
+                        error.kind()
+                    );
+                    return Err(error);
+                }
+            }
+        };
+
+        let peer = SocketAddr::new(selected.address, port);
+        let result = self.dial_addr(peer).await;
+        let (resolver, record_type, ttl_secs) = selected.source.query_details();
+        log::debug!(
+            target: "usque_rs::l4::route",
+            concat!(
+                "event=origin_dial host={host:?} port={port} ",
+                "selected_ip={} selected_peer={peer} source={} ",
+                "resolver={resolver:?} record_type={record_type:?} ",
+                "ttl_secs={ttl_secs:?} connected={} error_kind={:?}"
+            ),
+            selected.address,
+            selected.source.kind(),
+            result.is_ok(),
+            result.as_ref().err().map(io::Error::kind),
+            host = host,
+            port = port,
+            peer = peer,
+            resolver = resolver,
+            record_type = record_type,
+            ttl_secs = ttl_secs
+        );
+        result
     }
 
     async fn open(&self, authority: String) -> io::Result<DuplexStream> {
@@ -266,10 +343,13 @@ impl L4Client {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L4 session stopped"))?
     }
 
-    async fn resolve(&self, host: &str) -> io::Result<IpAddr> {
+    async fn resolve(&self, host: &str) -> io::Result<ResolvedHost> {
         let name = dns::canonical_ascii_name(host)?;
         if let Some(address) = self.dns_cache.get(&name)? {
-            return Ok(address);
+            return Ok(ResolvedHost {
+                address,
+                source: ResolutionSource::Cache,
+            });
         }
 
         let mut queries = tokio::task::JoinSet::new();
@@ -277,20 +357,33 @@ impl L4Client {
             for record_type in [dns::RecordType::A, dns::RecordType::Aaaa] {
                 let client = self.clone();
                 let name = name.clone();
-                queries.spawn(async move { client.query_dns(server, &name, record_type).await });
+                queries.spawn(async move {
+                    (
+                        server,
+                        record_type,
+                        client.query_dns(server, &name, record_type).await,
+                    )
+                });
             }
         }
 
         let mut last_error = None;
         while let Some(result) = queries.join_next().await {
             match result {
-                Ok(Ok(Some((address, ttl)))) => {
+                Ok((server, record_type, Ok(Some((address, ttl))))) => {
                     queries.abort_all();
                     self.dns_cache.insert(&name, address, ttl)?;
-                    return Ok(address);
+                    return Ok(ResolvedHost {
+                        address,
+                        source: ResolutionSource::Queried {
+                            resolver: server,
+                            record_type,
+                            ttl,
+                        },
+                    });
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => last_error = Some(error),
+                Ok((_, _, Ok(None))) => {}
+                Ok((_, _, Err(error))) => last_error = Some(error),
                 Err(error) => {
                     last_error = Some(io::Error::other(format!("DNS query task failed: {error}")));
                 }
@@ -1009,6 +1102,28 @@ mod tests {
         assert_eq!(
             authority_for(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443)),
             "[::1]:443"
+        );
+    }
+
+    #[test]
+    fn route_trace_provenance_preserves_upstream_winner_metadata() {
+        let resolver = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let source = ResolutionSource::Queried {
+            resolver,
+            record_type: dns::RecordType::Aaaa,
+            ttl: Duration::from_secs(57),
+        };
+        assert_eq!(source.kind(), "queried");
+        assert_eq!(
+            source.query_details(),
+            (Some(resolver), Some(dns::RecordType::Aaaa), Some(57))
+        );
+        assert_eq!(ResolutionSource::Cache.kind(), "cache");
+        assert_eq!(ResolutionSource::Cache.query_details(), (None, None, None));
+        assert_eq!(ResolutionSource::Literal.kind(), "literal");
+        assert_eq!(
+            ResolutionSource::Literal.query_details(),
+            (None, None, None)
         );
     }
 
