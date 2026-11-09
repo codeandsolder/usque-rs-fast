@@ -318,7 +318,13 @@ impl L4Client {
             selected.address,
             selected.source.kind(),
             result.is_ok(),
-            result.as_ref().err().map(io::Error::kind)
+            result.as_ref().err().map(io::Error::kind),
+            host = host,
+            port = port,
+            peer = peer,
+            resolver = resolver,
+            record_type = record_type,
+            ttl_secs = ttl_secs
         );
         result
     }
