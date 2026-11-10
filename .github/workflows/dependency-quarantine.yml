@@ -12,6 +12,6 @@ permissions:
 
 jobs:
   quarantine:
-    uses: codeandsolder/ci-workflows/.github/workflows/cargo-release-quarantine.yml@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
+    uses: codeandsolder/ci-workflows/.github/workflows/cargo-release-quarantine.yml@be66a1ada16209be5b75d39724ef7383892d92cc # main
     with:
       hours: 72
