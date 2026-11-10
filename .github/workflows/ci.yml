@@ -28,7 +28,7 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.validation != 'cross-cache' }}
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@be66a1ada16209be5b75d39724ef7383892d92cc # main
     with:
       runner: ubuntu-26.04
       rust-toolchain: "1.99.1"
@@ -73,7 +73,7 @@ jobs:
         with:
           toolchain: "1.99.1"
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@be66a1ada16209be5b75d39724ef7383892d92cc # main
         with:
           rust-toolchain: "1.99.1"
           rustflags: "cross:x86_64-unknown-linux-musl:baseline"
@@ -95,7 +95,7 @@ jobs:
           '
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@be66a1ada16209be5b75d39724ef7383892d92cc # main
 
   x86-codegen:
     name: x86 codegen / ${{ matrix.cpu }}
@@ -120,7 +120,7 @@ jobs:
           toolchain: 1.99.1
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@be66a1ada16209be5b75d39724ef7383892d92cc # main
         with:
           rust-toolchain: "1.99.1"
           rustflags: "-C target-cpu=${{ matrix.cpu }}"
@@ -131,4 +131,4 @@ jobs:
         run: cargo +1.99.1 check --all-targets --all-features --target x86_64-unknown-linux-gnu
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@be66a1ada16209be5b75d39724ef7383892d92cc # main
