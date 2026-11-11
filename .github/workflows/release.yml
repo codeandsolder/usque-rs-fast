@@ -82,7 +82,7 @@ jobs:
           toolchain: ${{ matrix.toolchain || '1.99.1' }}
 
       - name: Setup mandatory shared sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@be66a1ada16209be5b75d39724ef7383892d92cc # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
         with:
           rust-toolchain: "${{ matrix.toolchain || '1.99.1' }}"
           # Scope the persisted cache by target/CPU. The setup input only
@@ -143,4 +143,4 @@ jobs:
           fail_on_unmatched_files: true
       - name: Finalize mandatory shared sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@be66a1ada16209be5b75d39724ef7383892d92cc # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
