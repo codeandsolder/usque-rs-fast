@@ -75,6 +75,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "antidote"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "307f1158c6f649671b2c5b2939b7513de520500dfe92913a49d5d313e44a6ee7"
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -155,9 +161,9 @@ dependencies = [
 
 [[package]]
 name = "boring"
-version = "5.4.0"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7227623e47342428b893b9401d85cae09c4656aecaae524206652e8f6a6246c4"
+checksum = "a3b3f402e3438173549c546e23b7fdd94d6f699b6e96ee10140edabcfc43dcfa"
 dependencies = [
  "bitflags",
  "boring-sys",
@@ -168,9 +174,9 @@ dependencies = [
 
 [[package]]
 name = "boring-sys"
-version = "5.4.0"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4986392770df40d11d0d6294b0dd8399570f4a6e76d6953c7a34f7dd1defbd76"
+checksum = "666b6d090823b306ff043582051c10afd83ad4170cb5d677cb33f45c475d6feb"
 dependencies = [
  "bindgen",
  "cmake",
@@ -737,6 +743,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "linked-hash-map"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
+
+[[package]]
+name = "linked_hash_set"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "984fb35d06508d1e69fc91050cceba9c0b748f983e6739fa2c7a9237154c52c8"
+dependencies = [
+ "linked-hash-map",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1231,12 +1252,14 @@ dependencies = [
 
 [[package]]
 name = "tokio-boring"
-version = "5.4.0"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "220292ecb9416a27506c0301b48474737b18d3b718b1028bdca0bd19e2c7fd3d"
+checksum = "7b50fa736fc3c3a967fea0b99ca3e9af6cfcc0b67da2d390940d9b01bb98424b"
 dependencies = [
+ "antidote",
  "boring",
  "boring-sys",
+ "linked_hash_set",
  "tokio",
 ]
 
