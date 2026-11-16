@@ -214,7 +214,7 @@ async fn serve_connection(
     let protocol = match (username, password) {
         (Some(username), Some(password)) => {
             Socks5ServerProtocol::accept_password_auth(stream, move |user, pass| {
-                user == username && pass == password
+                user == username.as_bytes() && pass == password.as_bytes()
             })
             .await?
             .0
