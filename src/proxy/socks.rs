@@ -304,6 +304,9 @@ async fn serve_connection(
 ) -> Result<()> {
     let (protocol, command, target) =
         read_handshake(stream, credentials.as_deref(), handshake_timeout).await?;
+    // Established relays no longer need the credential allocation, even if
+    // they outlive the listener during a graceful shutdown.
+    drop(credentials);
     match command {
         Socks5Command::TcpConnect => serve_tcp_connect(protocol, target, l4).await,
         Socks5Command::UdpAssociate | Socks5Command::TcpBind => {
