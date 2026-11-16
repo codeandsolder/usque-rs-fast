@@ -58,6 +58,13 @@ impl SocksConfig {
     }
 }
 
+// Immutable credentials are shared by accepted tasks. A connection only
+// clones the Arc, not both plaintext strings.
+struct Credentials {
+    username: String,
+    password: String,
+}
+
 fn validate_open_bind(bind: SocketAddr) -> Result<()> {
     anyhow::ensure!(
         safe_no_auth_bind(bind.ip()),
@@ -236,6 +243,12 @@ async fn run_server(
         listener.local_addr()?
     );
     let permits = Arc::new(Semaphore::new(config.max_connections));
+    let handshake_timeout = config.handshake_timeout;
+    let credentials = match (config.username, config.password) {
+        (Some(username), Some(password)) => Some(Arc::new(Credentials { username, password })),
+        (None, None) => None,
+        _ => anyhow::bail!("SOCKS username and password must be configured together"),
+    };
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -245,12 +258,10 @@ async fn run_server(
                     continue;
                 };
                 let l4 = l4.clone();
-                let username = config.username.clone();
-                let password = config.password.clone();
-                let handshake_timeout = config.handshake_timeout;
+                let credentials = credentials.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = serve_connection(stream, l4, username, password, handshake_timeout).await {
+                    if let Err(error) = serve_connection(stream, l4, credentials, handshake_timeout).await {
                         log::debug!("SOCKS connection from {peer} failed: {error:#}");
                     }
                 });
@@ -288,12 +299,14 @@ pub async fn serve(config: SocksConfig, l4: Arc<L4Client>) -> Result<()> {
 async fn serve_connection(
     stream: TcpStream,
     l4: Arc<L4Client>,
-    username: Option<String>,
-    password: Option<String>,
+    credentials: Option<Arc<Credentials>>,
     handshake_timeout: Duration,
 ) -> Result<()> {
     let (protocol, command, target) =
-        read_handshake(stream, username, password, handshake_timeout).await?;
+        read_handshake(stream, credentials.as_deref(), handshake_timeout).await?;
+    // Established relays no longer need the credential allocation, even if
+    // they outlive the listener during a graceful shutdown.
+    drop(credentials);
     match command {
         Socks5Command::TcpConnect => serve_tcp_connect(protocol, target, l4).await,
         Socks5Command::UdpAssociate | Socks5Command::TcpBind => {
@@ -307,8 +320,7 @@ async fn serve_connection(
 
 async fn read_handshake<T>(
     stream: T,
-    username: Option<String>,
-    password: Option<String>,
+    credentials: Option<&Credentials>,
     handshake_timeout: Duration,
 ) -> Result<(
     Socks5ServerProtocol<T, CommandRead>,
@@ -319,15 +331,13 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send,
 {
     tokio::time::timeout(handshake_timeout, async move {
-        let protocol = match (username, password) {
-            (Some(username), Some(password)) => {
-                Socks5ServerProtocol::accept_password_auth(stream, move |user, pass| {
-                    user == username.as_bytes() && pass == password.as_bytes()
-                })
-                .await?
-            }
-            (None, None) => accept_open_auth(stream).await?,
-            _ => anyhow::bail!("SOCKS username and password must be configured together"),
+        let protocol = if let Some(credentials) = credentials {
+            Socks5ServerProtocol::accept_password_auth(stream, |user, pass| {
+                user == credentials.username.as_bytes() && pass == credentials.password.as_bytes()
+            })
+            .await?
+        } else {
+            accept_open_auth(stream).await?
         };
         Ok::<_, anyhow::Error>(protocol.read_command().await?)
     })
@@ -446,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_socks_handshake_expires() -> Result<()> {
         let (server, _client) = tokio::io::duplex(64);
-        let result = read_handshake(server, None, None, Duration::from_millis(5)).await;
+        let result = read_handshake(server, None, Duration::from_millis(5)).await;
         assert!(matches!(result, Err(ref error) if error.to_string().contains("timed out")));
         Ok(())
     }
@@ -454,9 +464,10 @@ mod tests {
     #[tokio::test]
     async fn handshake_timeout_covers_command_after_method_selection() -> Result<()> {
         let (server, mut client) = tokio::io::duplex(64);
-        let task = tokio::spawn(async move {
-            read_handshake(server, None, None, Duration::from_millis(20)).await
-        });
+        let task =
+            tokio::spawn(
+                async move { read_handshake(server, None, Duration::from_millis(20)).await },
+            );
 
         client.write_all(&[5, 1, 0]).await?;
         let mut method = [0; 2];
@@ -474,13 +485,11 @@ mod tests {
         for authorized in [true, false] {
             let (server, mut client) = tokio::io::duplex(128);
             let task = tokio::spawn(async move {
-                read_handshake(
-                    server,
-                    Some("alice".to_owned()),
-                    Some("correct".to_owned()),
-                    Duration::from_secs(1),
-                )
-                .await
+                let credentials = Credentials {
+                    username: "alice".to_owned(),
+                    password: "correct".to_owned(),
+                };
+                read_handshake(server, Some(&credentials), Duration::from_secs(1)).await
             });
             client.write_all(&[5, 1, 2]).await?;
             let mut reply = [0; 2];
@@ -511,6 +520,48 @@ mod tests {
                 assert!(task.await?.is_err());
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_share_one_credentials_allocation() -> Result<()> {
+        let credentials = Arc::new(Credentials {
+            username: "alice".to_owned(),
+            password: "correct".to_owned(),
+        });
+        let (mut client_a, server_a) = tokio::io::duplex(128);
+        let (mut client_b, server_b) = tokio::io::duplex(128);
+        let credentials_a = Arc::clone(&credentials);
+        let credentials_b = Arc::clone(&credentials);
+        assert!(Arc::ptr_eq(&credentials_a, &credentials_b));
+
+        let task_a = tokio::spawn(async move {
+            read_handshake(server_a, Some(&credentials_a), Duration::from_secs(1)).await
+        });
+        let task_b = tokio::spawn(async move {
+            read_handshake(server_b, Some(&credentials_b), Duration::from_secs(1)).await
+        });
+
+        for client in [&mut client_a, &mut client_b] {
+            client.write_all(&[5, 1, 2]).await?;
+            let mut reply = [0; 2];
+            client.read_exact(&mut reply).await?;
+            assert_eq!(reply, [5, 2]);
+            client.write_all(&[1, 5]).await?;
+            client.write_all(b"alice").await?;
+            client.write_all(&[7]).await?;
+            client.write_all(b"correct").await?;
+            client.read_exact(&mut reply).await?;
+            assert_eq!(reply, [1, 0]);
+            client.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80]).await?;
+        }
+        let (_protocol, command_a, target_a) = task_a.await??;
+        let (_protocol, command_b, target_b) = task_b.await??;
+        assert_eq!(command_a, Socks5Command::TcpConnect);
+        assert_eq!(command_b, Socks5Command::TcpConnect);
+        let expected = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+        assert_eq!(target_a, expected);
+        assert_eq!(target_b, expected);
         Ok(())
     }
 
