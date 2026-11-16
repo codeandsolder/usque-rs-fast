@@ -631,19 +631,16 @@ async fn cmd_proxy(registration: &RegistrationArgs, options: ProxyArgs) -> Resul
         let l4 = l4.clone();
         let username = username.clone();
         let password = password.clone();
-        listeners.spawn(async move {
-            http_proxy::serve_plain(
-                HttpConfig {
-                    bind,
-                    username,
-                    password,
-                    max_connections: options.http_max_connections,
-                    header_timeout: Duration::from_secs(options.http_header_timeout_secs),
-                },
-                l4,
-            )
-            .await
-        });
+        listeners.spawn(http_proxy::serve_plain(
+            HttpConfig {
+                bind,
+                username,
+                password,
+                max_connections: options.http_max_connections,
+                header_timeout: Duration::from_secs(options.http_header_timeout_secs),
+            },
+            l4,
+        ));
     }
 
     #[cfg(feature = "https-proxy")]
@@ -659,23 +656,20 @@ async fn cmd_proxy(registration: &RegistrationArgs, options: ProxyArgs) -> Resul
             .tls_key
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing HTTPS private key after validation"))?;
-        listeners.spawn(async move {
-            http_proxy::serve_tls(
-                HttpConfig {
-                    bind,
-                    username,
-                    password,
-                    max_connections: options.http_max_connections,
-                    header_timeout: Duration::from_secs(options.http_header_timeout_secs),
-                },
-                HttpsConfig {
-                    certificate: certificate.into(),
-                    private_key: private_key.into(),
-                },
-                l4,
-            )
-            .await
-        });
+        listeners.spawn(http_proxy::serve_tls(
+            HttpConfig {
+                bind,
+                username,
+                password,
+                max_connections: options.http_max_connections,
+                header_timeout: Duration::from_secs(options.http_header_timeout_secs),
+            },
+            HttpsConfig {
+                certificate: certificate.into(),
+                private_key: private_key.into(),
+            },
+            l4,
+        ));
     }
 
     let result = listeners
