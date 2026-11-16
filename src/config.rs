@@ -8,6 +8,7 @@ use std::path::Path;
 use std::{
     fs::{File, OpenOptions},
     io,
+    mem::DropGuard,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -18,31 +19,7 @@ use crate::account::AccountData;
 static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(not(windows))]
-struct TempConfigGuard {
-    path: PathBuf,
-    committed: bool,
-}
-
-#[cfg(not(windows))]
-impl TempConfigGuard {
-    fn commit(mut self, target: &Path) -> io::Result<()> {
-        fs::rename(&self.path, target)?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-impl Drop for TempConfigGuard {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn create_config_temp(parent: &Path) -> io::Result<(File, TempConfigGuard)> {
+fn create_config_temp(parent: &Path) -> io::Result<(File, PathBuf)> {
     for _ in 0..64 {
         let sequence = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(".usque-config-{}-{sequence}", std::process::id()));
@@ -56,13 +33,7 @@ fn create_config_temp(parent: &Path) -> io::Result<(File, TempConfigGuard)> {
 
         match options.open(&path) {
             Ok(file) => {
-                return Ok((
-                    file,
-                    TempConfigGuard {
-                        path,
-                        committed: false,
-                    },
-                ));
+                return Ok((file, path));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -145,9 +116,14 @@ impl Config {
 
         #[cfg(not(windows))]
         {
-            let (mut file, temp) = create_config_temp(parent).with_context(|| {
+            let (mut file, temp_path) = create_config_temp(parent).with_context(|| {
                 format!("failed to create temporary config in {}", parent.display())
             })?;
+            // Roll back the staging file on write/sync/rename failure or unwind.
+            // Rust 1.100 DropGuard replaces a bespoke Drop implementation.
+            let temp_path = DropGuard::new(temp_path, |path| {
+                let _ = fs::remove_file(path);
+            });
 
             file.write_all(json.as_bytes())
                 .with_context(|| format!("failed to write config for {}", path.display()))?;
@@ -155,9 +131,11 @@ impl Config {
                 .with_context(|| format!("failed to sync config for {}", path.display()))?;
             drop(file);
 
-            temp.commit(path).with_context(|| {
+            fs::rename(temp_path.as_path(), path).with_context(|| {
                 format!("failed to atomically replace config {}", path.display())
             })?;
+            // Only the successful rename commits the transaction.
+            let _ = DropGuard::dismiss(temp_path);
         }
 
         #[cfg(windows)]
@@ -392,6 +370,36 @@ mod tests {
         let loaded = Config::load(&path)?;
         assert_eq!(loaded.access_token, "second-token");
         assert!(!path.with_file_name("config.json.tmp").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rename_failure_removes_uncommitted_temporary_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("existing-directory");
+        fs::create_dir(&target)?;
+        let cfg = Config {
+            private_key: "secret-key".to_owned(),
+            endpoint_v4: "192.0.2.1".to_owned(),
+            endpoint_v6: "2001:db8::1".to_owned(),
+            endpoint_pub_key: "public-key".to_owned(),
+            license: String::new(),
+            id: "id".to_owned(),
+            access_token: "secret-token".to_owned(),
+            ipv4: "172.16.0.2".to_owned(),
+            ipv6: "2606:4700:110::2".to_owned(),
+        };
+
+        assert!(
+            cfg.save(&target).is_err(),
+            "replacing a directory must fail"
+        );
+        assert!(target.is_dir(), "original destination must remain intact");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        assert_eq!(leftovers, [std::ffi::OsString::from("existing-directory")]);
         Ok(())
     }
 

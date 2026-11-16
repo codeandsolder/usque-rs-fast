@@ -79,12 +79,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: ${{ matrix.toolchain || '1.99.1' }}
+          toolchain: ${{ matrix.toolchain || '1.100.0' }}
 
       - name: Setup mandatory shared sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
         with:
-          rust-toolchain: "${{ matrix.toolchain || '1.99.1' }}"
+          rust-toolchain: "${{ matrix.toolchain || '1.100.0' }}"
           # Scope the persisted cache by target/CPU. The setup input only
           # affects the cache identity; it does not set compiler RUSTFLAGS.
           rustflags: "cross:${{ matrix.target }}:${{ matrix.cpu_level || 'baseline' }}:${{ matrix.rustflags || '' }}"

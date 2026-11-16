@@ -125,7 +125,7 @@ IPv6 default route—see [`SETUP_NOTES.md`](SETUP_NOTES.md).
 
 ## Building
 
-Rust **1.99 or newer** is required.
+Rust **1.100 or newer** is required.
 
 The project builds BoringSSL through Rust dependencies, so a source build also needs the
 usual native build tools. CI installs the following on Ubuntu:
@@ -527,7 +527,7 @@ Current release targets are:
 | `usque-rs-mipsel-linux-musl` | little-endian MIPS/OpenWrt-class routers |
 
 The MIPS target uses nightly Rust with `build-std` because stable Rust no longer ships
-the required standard library target. The normal project toolchain remains Rust 1.99.
+the required standard library target. The normal project toolchain is Rust 1.100.
 
 x86 CPU tuning is explicit in the release workflow. Ordinary local builds are not
 silently compiled for the build machine.
