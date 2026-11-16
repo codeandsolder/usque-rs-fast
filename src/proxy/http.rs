@@ -14,7 +14,7 @@ use hyper::{Uri, client::conn::http1 as client_http1, header::CONNECTION};
 use hyper_util::rt::TokioIo;
 #[cfg(feature = "https-proxy")]
 use std::path::PathBuf;
-use std::{convert::Infallible, error::Error, net::SocketAddr, sync::Arc};
+use std::{error::Error, net::SocketAddr, sync::Arc};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
@@ -147,7 +147,7 @@ async fn serve_connection<I>(
     let service = service_fn(move |request| {
         let l4 = l4.clone();
         let expected_auth = expected_auth.clone();
-        async move { Ok::<_, Infallible>(handle(request, l4, expected_auth.as_deref()).await) }
+        async move { Ok::<_, !>(handle(request, l4, expected_auth.as_deref()).await) }
     });
 
     if let Err(error) = server_http1::Builder::new()
