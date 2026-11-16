@@ -115,7 +115,7 @@ impl SocksServer {
     /// Bind and start a SOCKS server over an existing L4 MASQUE client.
     ///
     /// # Errors
-    /// Returns an error if the initial listener cannot be bound or inspected.
+    /// Returns an error if policy/limits are invalid, or the listener cannot be bound or inspected.
     pub async fn bind(config: SocksConfig, l4: Arc<L4Client>) -> Result<Self> {
         config.validate(config.bind)?;
         let requires_auth = config.username.is_some();
@@ -151,8 +151,8 @@ impl SocksServer {
     /// a failed bind leaves the current listener untouched.
     ///
     /// # Errors
-    /// Returns an error if the replacement address cannot be bound, inspected,
-    /// or delivered to the running server task.
+    /// Returns an error if the replacement violates the no-auth bind policy,
+    /// cannot be bound or inspected, or cannot be delivered to the running task.
     pub async fn rebind(&self, bind: SocketAddr) -> Result<SocketAddr> {
         if !self.requires_auth {
             validate_open_bind(bind)?;
@@ -450,6 +450,69 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn handshake_timeout_covers_command_after_method_selection() -> Result<()> {
+        let (server, mut client) = tokio::io::duplex(64);
+        let task = tokio::spawn(async move {
+            read_handshake(server, None, None, Duration::from_millis(20)).await
+        });
+
+        client.write_all(&[5, 1, 0]).await?;
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await?;
+        assert_eq!(method, [5, 0]);
+        // Keep the socket open without sending a command; the *same* deadline
+        // must cover both method negotiation and request framing.
+        let result = task.await?;
+        assert!(matches!(result, Err(ref error) if error.to_string().contains("timed out")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn password_authentication_is_verified_before_command_parsing() -> Result<()> {
+        for authorized in [true, false] {
+            let (server, mut client) = tokio::io::duplex(128);
+            let task = tokio::spawn(async move {
+                read_handshake(
+                    server,
+                    Some("alice".to_owned()),
+                    Some("correct".to_owned()),
+                    Duration::from_secs(1),
+                )
+                .await
+            });
+            client.write_all(&[5, 1, 2]).await?;
+            let mut reply = [0; 2];
+            client.read_exact(&mut reply).await?;
+            assert_eq!(reply, [5, 2]);
+
+            client.write_all(&[1, 5]).await?;
+            client.write_all(b"alice").await?;
+            let password = if authorized {
+                b"correct".as_slice()
+            } else {
+                b"wrong".as_slice()
+            };
+            client.write_all(&[u8::try_from(password.len())?]).await?;
+            client.write_all(password).await?;
+            client.read_exact(&mut reply).await?;
+            assert_eq!(reply, [1, u8::from(!authorized)]);
+
+            if authorized {
+                client.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80]).await?;
+                let (_protocol, command, target) = task.await??;
+                assert_eq!(command, Socks5Command::TcpConnect);
+                assert_eq!(
+                    target,
+                    TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)))
+                );
+            } else {
+                assert!(task.await?.is_err());
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn listener_configuration_enforces_open_bind_and_valid_limits() {
         let config = SocksConfig {
@@ -484,7 +547,7 @@ mod tests {
                 .validate(SocketAddr::from(([0, 0, 0, 0], 1080)))
                 .is_ok()
         );
-        config.username = Some("".to_owned());
+        config.username = Some(String::new());
         assert!(config.validate(config.bind).is_err());
         config.username = Some("u".repeat(256));
         assert!(config.validate(config.bind).is_err());
