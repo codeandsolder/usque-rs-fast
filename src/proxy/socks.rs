@@ -280,7 +280,9 @@ async fn serve_tcp_connect(
 
 fn map_connect_error(error: &io::Error) -> ReplyError {
     match error.kind() {
-        io::ErrorKind::TimedOut => ReplyError::ConnectionTimeout,
+        // RFC 1928 has no generic connect-timeout status: TTL expired (0x06)
+        // describes an IP hop limit, not an application-level timeout.
+        io::ErrorKind::TimedOut => ReplyError::GeneralFailure,
         io::ErrorKind::ConnectionRefused => ReplyError::ConnectionRefused,
         io::ErrorKind::AddrNotAvailable | io::ErrorKind::NotFound => ReplyError::HostUnreachable,
         io::ErrorKind::NetworkUnreachable => ReplyError::NetworkUnreachable,
@@ -297,8 +299,12 @@ mod tests {
     fn maps_common_connect_errors_to_socks_replies() {
         assert!(matches!(
             map_connect_error(&io::Error::new(io::ErrorKind::TimedOut, "timeout")),
-            ReplyError::ConnectionTimeout
+            ReplyError::GeneralFailure
         ));
+        assert_eq!(
+            map_connect_error(&io::Error::new(io::ErrorKind::TimedOut, "timeout")).as_u8(),
+            0x01,
+        );
         assert!(matches!(
             map_connect_error(&io::Error::new(io::ErrorKind::ConnectionRefused, "refused")),
             ReplyError::ConnectionRefused
