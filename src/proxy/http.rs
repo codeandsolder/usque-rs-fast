@@ -173,9 +173,11 @@ pub async fn serve_tls_on(
                     serve_connection(stream, peer, l4, expected_auth, header_timeout, permit).await;
                 }
                 Ok(Err(error)) => {
-                    log::debug!("HTTPS proxy TLS handshake from {peer} failed: {error}")
+                    log::debug!("HTTPS proxy TLS handshake from {peer} failed: {error}");
                 }
-                Err(_) => log::debug!("HTTPS proxy TLS handshake from {peer} timed out"),
+                Err(_) => {
+                    log::debug!("HTTPS proxy TLS handshake from {peer} timed out");
+                }
             }
         });
     }
@@ -595,7 +597,8 @@ mod tests {
             max_connections: 4,
             header_timeout: Duration::from_secs(10),
         };
-        let token = expected_proxy_auth(&config)?.ok_or(anyhow::anyhow!("missing token"))?;
+        let token =
+            expected_proxy_auth(&config)?.ok_or_else(|| anyhow::anyhow!("missing token"))?;
         let per_connection = Arc::clone(&token);
         let per_request = Arc::clone(&per_connection);
         assert!(Arc::ptr_eq(&token, &per_request));
@@ -605,7 +608,6 @@ mod tests {
 
     #[tokio::test]
     async fn connection_permit_survives_upgraded_tunnel_until_relay_finishes() -> Result<()> {
-        use tokio::io::AsyncWriteExt;
         let permits = Arc::new(Semaphore::new(1));
         let permit = Arc::new(Arc::clone(&permits).try_acquire_owned()?);
         let (client, mut proxy_client) = tokio::io::duplex(64);
