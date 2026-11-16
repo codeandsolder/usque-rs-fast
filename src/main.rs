@@ -50,7 +50,7 @@ use usque_rs::proxy::http::HttpsConfig;
 #[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
 use usque_rs::proxy::http::{self as http_proxy, HttpConfig};
 #[cfg(feature = "socks5-proxy")]
-use usque_rs::proxy::socks::{self, SocksConfig};
+use usque_rs::proxy::socks::{self, SocksConfig, safe_no_auth_bind};
 #[cfg(any(
     feature = "tun",
     feature = "http-proxy",
@@ -156,11 +156,21 @@ struct ProxyArgs {
     #[arg(long, value_name = "ADDR")]
     socks5: Vec<SocketAddr>,
 
-    /// Expose a private open SOCKS5/SOCKS5h listener; no credentials are required and presented credentials are ignored.
+    /// Expose a private open SOCKS5/SOCKS5h listener; negotiate only no-authentication.
     /// Only loopback, private/LAN, CGNAT, link-local, benchmark-lab, and IPv6 ULA addresses are accepted.
     #[cfg(feature = "socks5-proxy")]
     #[arg(long, value_name = "ADDR")]
     socks5_no_auth: Vec<SocketAddr>,
+
+    /// Maximum number of simultaneous SOCKS5 connections per listener.
+    #[cfg(feature = "socks5-proxy")]
+    #[arg(long, default_value_t = 512)]
+    socks5_max_connections: usize,
+
+    /// Timeout in seconds for SOCKS5 handshake and request parsing.
+    #[cfg(feature = "socks5-proxy")]
+    #[arg(long, default_value_t = 10)]
+    socks5_handshake_timeout_secs: u64,
 
     /// Expose a plaintext HTTP proxy listener on this address.
     #[cfg(feature = "http-proxy")]
@@ -482,6 +492,15 @@ fn validate_proxy_args(options: &ProxyArgs) -> Result<()> {
                 "--socks5 requires proxy authentication; use --socks5-no-auth for an explicit private open listener"
             );
         }
+        anyhow::ensure!(
+            (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&options.socks5_max_connections),
+            "SOCKS connection limit must be between 1 and {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        anyhow::ensure!(
+            options.socks5_handshake_timeout_secs > 0,
+            "SOCKS handshake timeout must be nonzero"
+        );
         for bind in &options.socks5_no_auth {
             anyhow::ensure!(
                 safe_no_auth_bind(bind.ip()),
@@ -533,6 +552,8 @@ async fn cmd_proxy(registration: &RegistrationArgs, options: ProxyArgs) -> Resul
                     bind,
                     username,
                     password,
+                    max_connections: options.socks5_max_connections,
+                    handshake_timeout: Duration::from_secs(options.socks5_handshake_timeout_secs),
                 },
                 l4,
             )
@@ -549,6 +570,8 @@ async fn cmd_proxy(registration: &RegistrationArgs, options: ProxyArgs) -> Resul
                     bind,
                     username: None,
                     password: None,
+                    max_connections: options.socks5_max_connections,
+                    handshake_timeout: Duration::from_secs(options.socks5_handshake_timeout_secs),
                 },
                 l4,
             )
@@ -614,28 +637,6 @@ async fn cmd_proxy(registration: &RegistrationArgs, options: ProxyArgs) -> Resul
         Ok(Ok(())) => anyhow::bail!("proxy listener exited unexpectedly"),
         Ok(Err(error)) => Err(error),
         Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(feature = "socks5-proxy")]
-fn safe_no_auth_bind(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ip) => {
-            let [a, b, ..] = ip.octets();
-            a == 127
-                || a == 10
-                || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && b == 168)
-                || (a == 100 && (64..=127).contains(&b))
-                || (a == 169 && b == 254)
-                || (a == 198 && (b == 18 || b == 19))
-        }
-        std::net::IpAddr::V6(ip) => {
-            let octets = ip.octets();
-            ip.is_loopback()
-                || (octets[0] & 0xfe) == 0xfc
-                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
-        }
     }
 }
 
@@ -718,6 +719,43 @@ mod tests {
         ])?;
         assert_eq!(options.socks5, ["[2001:db8::1]:1080".parse()?]);
         assert!(validate_proxy_args(&options).is_ok());
+        Ok(())
+    }
+
+    #[cfg(feature = "socks5-proxy")]
+    #[test]
+    fn socks5_limits_are_configurable_and_nonzero() -> Result<()> {
+        let options = proxy_options(&[
+            "usque-rs",
+            "proxy",
+            "--socks5-no-auth",
+            "127.0.0.1:1080",
+            "--socks5-max-connections",
+            "64",
+            "--socks5-handshake-timeout-secs",
+            "3",
+        ])?;
+        assert_eq!(options.socks5_max_connections, 64);
+        assert_eq!(options.socks5_handshake_timeout_secs, 3);
+        validate_proxy_args(&options)?;
+
+        for (name, value) in [
+            ("--socks5-max-connections", "0"),
+            ("--socks5-handshake-timeout-secs", "0"),
+        ] {
+            let options = proxy_options(&[
+                "usque-rs",
+                "proxy",
+                "--socks5-no-auth",
+                "127.0.0.1:1080",
+                name,
+                value,
+            ])?;
+            assert!(
+                validate_proxy_args(&options).is_err(),
+                "{name} must reject zero"
+            );
+        }
         Ok(())
     }
 

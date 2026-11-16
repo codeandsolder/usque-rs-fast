@@ -3,24 +3,90 @@ use anyhow::Result;
 use fast_socks5::{
     ReplyError, Socks5Command,
     server::{
-        Socks5ServerProtocol, StandardAuthentication, StandardAuthenticationStarted,
+        Socks5ServerProtocol,
         states::{Authenticated, CommandRead},
     },
     util::target_addr::TargetAddr,
 };
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot, watch},
+    sync::{Semaphore, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
-#[derive(Clone, Debug)]
+// Includes plaintext authentication credentials; do not derive Debug.
+#[derive(Clone)]
 pub struct SocksConfig {
     pub bind: SocketAddr,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Maximum number of concurrently accepted connections.
+    pub max_connections: usize,
+    /// Deadline for completing authentication and parsing the initial request.
+    pub handshake_timeout: Duration,
+}
+
+impl SocksConfig {
+    fn validate(&self, bind: SocketAddr) -> Result<()> {
+        anyhow::ensure!(
+            (1..=Semaphore::MAX_PERMITS).contains(&self.max_connections),
+            "SOCKS connection limit must be between 1 and {}",
+            Semaphore::MAX_PERMITS
+        );
+        anyhow::ensure!(
+            !self.handshake_timeout.is_zero(),
+            "SOCKS handshake timeout must be nonzero"
+        );
+        match (&self.username, &self.password) {
+            (None, None) => validate_open_bind(bind),
+            (Some(username), Some(password)) => {
+                anyhow::ensure!(
+                    (1..=255).contains(&username.len()) && (1..=255).contains(&password.len()),
+                    "SOCKS RFC 1929 credentials must contain 1–255 bytes each"
+                );
+                Ok(())
+            }
+            _ => anyhow::bail!("SOCKS username and password must be configured together"),
+        }
+    }
+}
+
+fn validate_open_bind(bind: SocketAddr) -> Result<()> {
+    anyhow::ensure!(
+        safe_no_auth_bind(bind.ip()),
+        "unauthenticated SOCKS listener cannot bind to {bind}"
+    );
+    Ok(())
+}
+
+/// Whether an address is permitted for an explicitly unauthenticated SOCKS listener.
+#[must_use]
+pub fn safe_no_auth_bind(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, ..] = ip.octets();
+            a == 127
+                || a == 10
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 198 && (b == 18 || b == 19))
+        }
+        IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            ip.is_loopback()
+                || (octets[0] & 0xfe) == 0xfc
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
 }
 
 enum ServerCommand {
@@ -42,6 +108,7 @@ enum ServerCommand {
 pub struct SocksServer {
     commands: mpsc::Sender<ServerCommand>,
     local_addr: watch::Receiver<SocketAddr>,
+    requires_auth: bool,
     task: Option<JoinHandle<Result<()>>>,
 }
 
@@ -49,8 +116,10 @@ impl SocksServer {
     /// Bind and start a SOCKS server over an existing L4 MASQUE client.
     ///
     /// # Errors
-    /// Returns an error if the initial listener cannot be bound or inspected.
+    /// Returns an error if policy/limits are invalid, or the listener cannot be bound or inspected.
     pub async fn bind(config: SocksConfig, l4: Arc<L4Client>) -> Result<Self> {
+        config.validate(config.bind)?;
+        let requires_auth = config.username.is_some();
         let listener = TcpListener::bind(config.bind).await?;
         let local_addr = listener.local_addr()?;
         let (command_tx, command_rx) = mpsc::channel(4);
@@ -59,6 +128,7 @@ impl SocksServer {
         Ok(Self {
             commands: command_tx,
             local_addr: address_rx,
+            requires_auth,
             task: Some(task),
         })
     }
@@ -82,9 +152,12 @@ impl SocksServer {
     /// a failed bind leaves the current listener untouched.
     ///
     /// # Errors
-    /// Returns an error if the replacement address cannot be bound, inspected,
-    /// or delivered to the running server task.
+    /// Returns an error if the replacement violates the no-auth bind policy,
+    /// cannot be bound or inspected, or cannot be delivered to the running task.
     pub async fn rebind(&self, bind: SocketAddr) -> Result<SocketAddr> {
+        if !self.requires_auth {
+            validate_open_bind(bind)?;
+        }
         if bind == self.local_addr() {
             return Ok(bind);
         }
@@ -162,15 +235,22 @@ async fn run_server(
         "direct-L4 SOCKS5/SOCKS5h proxy listening on {}",
         listener.local_addr()?
     );
+    let permits = Arc::new(Semaphore::new(config.max_connections));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    log::debug!("SOCKS connection rejected at concurrency limit");
+                    continue;
+                };
                 let l4 = l4.clone();
                 let username = config.username.clone();
                 let password = config.password.clone();
+                let handshake_timeout = config.handshake_timeout;
                 tokio::spawn(async move {
-                    if let Err(error) = serve_connection(stream, l4, username, password).await {
+                    let _permit = permit;
+                    if let Err(error) = serve_connection(stream, l4, username, password, handshake_timeout).await {
                         log::debug!("SOCKS connection from {peer} failed: {error:#}");
                     }
                 });
@@ -210,20 +290,10 @@ async fn serve_connection(
     l4: Arc<L4Client>,
     username: Option<String>,
     password: Option<String>,
+    handshake_timeout: Duration,
 ) -> Result<()> {
-    let protocol = match (username, password) {
-        (Some(username), Some(password)) => {
-            Socks5ServerProtocol::accept_password_auth(stream, move |user, pass| {
-                user == username.as_bytes() && pass == password.as_bytes()
-            })
-            .await?
-            .0
-        }
-        (None, None) => accept_open_auth(stream).await?,
-        _ => anyhow::bail!("SOCKS username and password must be configured together"),
-    };
-
-    let (protocol, command, target) = protocol.read_command().await?;
+    let (protocol, command, target) =
+        read_handshake(stream, username, password, handshake_timeout).await?;
     match command {
         Socks5Command::TcpConnect => serve_tcp_connect(protocol, target, l4).await,
         Socks5Command::UdpAssociate | Socks5Command::TcpBind => {
@@ -235,23 +305,41 @@ async fn serve_connection(
     }
 }
 
+async fn read_handshake<T>(
+    stream: T,
+    username: Option<String>,
+    password: Option<String>,
+    handshake_timeout: Duration,
+) -> Result<(
+    Socks5ServerProtocol<T, CommandRead>,
+    Socks5Command,
+    TargetAddr,
+)>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    tokio::time::timeout(handshake_timeout, async move {
+        let protocol = match (username, password) {
+            (Some(username), Some(password)) => {
+                Socks5ServerProtocol::accept_password_auth(stream, move |user, pass| {
+                    user == username.as_bytes() && pass == password.as_bytes()
+                })
+                .await?
+            }
+            (None, None) => accept_open_auth(stream).await?,
+            _ => anyhow::bail!("SOCKS username and password must be configured together"),
+        };
+        Ok::<_, anyhow::Error>(protocol.read_command().await?)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out"))?
+}
+
 async fn accept_open_auth<T>(stream: T) -> Result<Socks5ServerProtocol<T, Authenticated>>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let auth = Socks5ServerProtocol::start(stream)
-        .negotiate_auth(StandardAuthentication::allow_no_auth(true))
-        .await?;
-
-    Ok(match auth {
-        StandardAuthenticationStarted::NoAuthentication(auth) => {
-            Socks5ServerProtocol::finish_auth(auth)
-        }
-        StandardAuthenticationStarted::PasswordAuthentication(auth) => {
-            let (_username, _password, auth) = auth.read_username_password().await?;
-            Socks5ServerProtocol::finish_auth(auth.accept().await?)
-        }
-    })
+    Ok(Socks5ServerProtocol::accept_no_auth(stream).await?)
 }
 
 async fn serve_tcp_connect(
@@ -330,21 +418,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_listener_accepts_arbitrary_password_auth() -> Result<()> {
+    async fn open_listener_does_not_accept_password_auth() -> Result<()> {
         let (server, mut client) = tokio::io::duplex(64);
         let task = tokio::spawn(async move { accept_open_auth(server).await });
 
         client.write_all(&[5, 1, 2]).await?;
         let mut method = [0; 2];
         client.read_exact(&mut method).await?;
-        assert_eq!(method, [5, 2]);
+        assert_eq!(method, [5, 0xff]);
+        assert!(task.await?.is_err());
+        Ok(())
+    }
 
-        client.write_all(&[1, 1, b'u', 1, b'p']).await?;
-        let mut auth = [0; 2];
-        client.read_exact(&mut auth).await?;
-        assert_eq!(auth, [1, 0]);
+    #[tokio::test]
+    async fn open_listener_prefers_no_auth_even_if_password_is_offered() -> Result<()> {
+        let (server, mut client) = tokio::io::duplex(64);
+        let task = tokio::spawn(async move { accept_open_auth(server).await });
 
+        client.write_all(&[5, 2, 2, 0]).await?;
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await?;
+        assert_eq!(method, [5, 0]);
         task.await??;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn incomplete_socks_handshake_expires() -> Result<()> {
+        let (server, _client) = tokio::io::duplex(64);
+        let result = read_handshake(server, None, None, Duration::from_millis(5)).await;
+        assert!(matches!(result, Err(ref error) if error.to_string().contains("timed out")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_covers_command_after_method_selection() -> Result<()> {
+        let (server, mut client) = tokio::io::duplex(64);
+        let task = tokio::spawn(async move {
+            read_handshake(server, None, None, Duration::from_millis(20)).await
+        });
+
+        client.write_all(&[5, 1, 0]).await?;
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await?;
+        assert_eq!(method, [5, 0]);
+        // Keep the socket open without sending a command; the *same* deadline
+        // must cover both method negotiation and request framing.
+        let result = task.await?;
+        assert!(matches!(result, Err(ref error) if error.to_string().contains("timed out")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn password_authentication_is_verified_before_command_parsing() -> Result<()> {
+        for authorized in [true, false] {
+            let (server, mut client) = tokio::io::duplex(128);
+            let task = tokio::spawn(async move {
+                read_handshake(
+                    server,
+                    Some("alice".to_owned()),
+                    Some("correct".to_owned()),
+                    Duration::from_secs(1),
+                )
+                .await
+            });
+            client.write_all(&[5, 1, 2]).await?;
+            let mut reply = [0; 2];
+            client.read_exact(&mut reply).await?;
+            assert_eq!(reply, [5, 2]);
+
+            client.write_all(&[1, 5]).await?;
+            client.write_all(b"alice").await?;
+            let password = if authorized {
+                b"correct".as_slice()
+            } else {
+                b"wrong".as_slice()
+            };
+            client.write_all(&[u8::try_from(password.len())?]).await?;
+            client.write_all(password).await?;
+            client.read_exact(&mut reply).await?;
+            assert_eq!(reply, [1, u8::from(!authorized)]);
+
+            if authorized {
+                client.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80]).await?;
+                let (_protocol, command, target) = task.await??;
+                assert_eq!(command, Socks5Command::TcpConnect);
+                assert_eq!(
+                    target,
+                    TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)))
+                );
+            } else {
+                assert!(task.await?.is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn listener_configuration_enforces_open_bind_and_valid_limits() {
+        let config = SocksConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 1080)),
+            username: None,
+            password: None,
+            max_connections: 10,
+            handshake_timeout: Duration::from_secs(10),
+        };
+        assert!(config.validate(config.bind).is_ok());
+        assert!(
+            config
+                .validate(SocketAddr::from(([0, 0, 0, 0], 1080)))
+                .is_err()
+        );
+        assert!(
+            config
+                .validate(SocketAddr::from(([8, 8, 8, 8], 1080)))
+                .is_err()
+        );
+        let mut config = config;
+        config.max_connections = 0;
+        assert!(config.validate(config.bind).is_err());
+        config.max_connections = 10;
+        config.handshake_timeout = Duration::ZERO;
+        assert!(config.validate(config.bind).is_err());
+        config.handshake_timeout = Duration::from_secs(10);
+        config.username = Some("u".to_owned());
+        config.password = Some("p".to_owned());
+        assert!(
+            config
+                .validate(SocketAddr::from(([0, 0, 0, 0], 1080)))
+                .is_ok()
+        );
+        config.username = Some(String::new());
+        assert!(config.validate(config.bind).is_err());
+        config.username = Some("u".repeat(256));
+        assert!(config.validate(config.bind).is_err());
     }
 }

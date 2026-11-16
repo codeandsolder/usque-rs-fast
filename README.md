@@ -341,9 +341,27 @@ as IDNA/punycode; raw non-ASCII names are rejected.
 
 Wildcard, globally routable, multicast, and documentation-only addresses are rejected.
 
-For compatibility, an open listener accepts either RFC1928 no-auth negotiation or an
-RFC1929 username/password exchange; if credentials are presented to this explicitly
-open listener, they are accepted and ignored.
+An open listener negotiates **only RFC 1928 no-authentication**. It never requests
+or accepts password authentication, even if the client also offers it. The same
+private-address restriction is enforced by the listener API on initial bind and
+subsequent rebinds.
+
+Each SOCKS listener limits simultaneous accepted connections (default **512**).
+An incoming connection above the limit is closed rather than creating another
+task. Authentication and parsing the initial request must finish within
+**10 seconds** by default; established relay connections are not subject to the
+handshake deadline. Configure these per-listener defaults for all SOCKS listeners:
+
+```sh
+usque-rs proxy --socks5-no-auth 127.0.0.1:1080 \
+  --socks5-max-connections 1024 \
+  --socks5-handshake-timeout-secs 15
+```
+
+Both settings must be positive. Authenticated listeners require a username and
+password of 1–255 bytes each, as prescribed by RFC 1929. Connection limits apply
+to accepted relays until they close, including after the listener itself shuts
+down.
 
 ### HTTP and HTTPS proxy listeners
 
