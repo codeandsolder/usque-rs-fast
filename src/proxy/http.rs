@@ -1,4 +1,4 @@
-use crate::l4::L4Client;
+use crate::{l4::L4Client, proxy::safe_no_auth_bind};
 use anyhow::Result;
 use base64::Engine;
 use bytes::Bytes;
@@ -11,21 +11,54 @@ use hyper::{
     service::service_fn,
 };
 use hyper::{Uri, client::conn::http1 as client_http1, header::CONNECTION};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 #[cfg(feature = "https-proxy")]
 use std::path::PathBuf;
-use std::{error::Error, net::SocketAddr, sync::Arc};
+use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
-#[derive(Clone, Debug)]
+// Credentials must never appear in automatically formatted Debug output.
+#[derive(Clone)]
 pub struct HttpConfig {
     pub bind: SocketAddr,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Maximum simultaneous accepted connections, including upgraded CONNECT tunnels.
+    pub max_connections: usize,
+    /// Deadline for parsing each HTTP request header and for the TLS handshake.
+    pub header_timeout: Duration,
+}
+
+impl HttpConfig {
+    fn validate(&self, bind: SocketAddr) -> Result<()> {
+        anyhow::ensure!(
+            (1..=Semaphore::MAX_PERMITS).contains(&self.max_connections),
+            "HTTP connection limit must be between 1 and {}",
+            Semaphore::MAX_PERMITS
+        );
+        anyhow::ensure!(
+            !self.header_timeout.is_zero(),
+            "HTTP header timeout must be nonzero"
+        );
+        match (&self.username, &self.password) {
+            (None, None) => {
+                anyhow::ensure!(
+                    safe_no_auth_bind(bind.ip()),
+                    "unauthenticated HTTP(S) listener cannot bind to {bind}"
+                );
+            }
+            (Some(_), Some(_)) => {}
+            _ => anyhow::bail!("HTTP proxy username and password must be configured together"),
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "https-proxy")]
@@ -42,6 +75,7 @@ pub struct HttpsConfig {
 /// Returns an error when authentication configuration is incomplete or the listener
 /// cannot be bound or accepted.
 pub async fn serve_plain(config: HttpConfig, l4: Arc<L4Client>) -> Result<()> {
+    config.validate(config.bind)?;
     let listener = TcpListener::bind(config.bind).await?;
     serve_plain_on(listener, config, l4).await
 }
@@ -60,16 +94,23 @@ pub async fn serve_plain_on(
     config: HttpConfig,
     l4: Arc<L4Client>,
 ) -> Result<()> {
-    let expected_auth = expected_proxy_auth(&config)?;
     let local_addr = listener.local_addr()?;
+    config.validate(local_addr)?;
+    let expected_auth = expected_proxy_auth(&config)?;
+    let permits = Arc::new(Semaphore::new(config.max_connections));
+    let header_timeout = config.header_timeout;
     log::info!("HTTP proxy listening on {local_addr}");
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let l4 = l4.clone();
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            log::debug!("HTTP proxy rejected a connection at the concurrency limit");
+            continue;
+        };
+        let l4 = Arc::clone(&l4);
         let expected_auth = expected_auth.clone();
         tokio::spawn(async move {
-            serve_connection(stream, peer, l4, expected_auth).await;
+            serve_connection(stream, peer, l4, expected_auth, header_timeout, permit).await;
         });
     }
 }
@@ -81,6 +122,7 @@ pub async fn serve_plain_on(
 /// Returns an error when TLS material cannot be loaded, authentication configuration
 /// is incomplete, or the listener cannot be bound or accepted.
 pub async fn serve_tls(config: HttpConfig, tls: HttpsConfig, l4: Arc<L4Client>) -> Result<()> {
+    config.validate(config.bind)?;
     let listener = TcpListener::bind(config.bind).await?;
     serve_tls_on(listener, config, tls, l4).await
 }
@@ -107,30 +149,46 @@ pub async fn serve_tls_on(
         select_next_proto(b"\x08http/1.1", client).ok_or(AlpnError::NOACK)
     });
     let acceptor = Arc::new(builder.build());
-    let expected_auth = expected_proxy_auth(&config)?;
     let local_addr = listener.local_addr()?;
+    config.validate(local_addr)?;
+    let expected_auth = expected_proxy_auth(&config)?;
+    let permits = Arc::new(Semaphore::new(config.max_connections));
+    let header_timeout = config.header_timeout;
     log::info!("HTTPS proxy listening on {local_addr}");
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let l4 = l4.clone();
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            log::debug!("HTTPS proxy rejected a connection at the concurrency limit");
+            continue;
+        };
+        let acceptor = Arc::clone(&acceptor);
+        let l4 = Arc::clone(&l4);
         let expected_auth = expected_auth.clone();
         tokio::spawn(async move {
-            match tokio_boring::accept(&acceptor, stream).await {
-                Ok(stream) => serve_connection(stream, peer, l4, expected_auth).await,
-                Err(error) => log::debug!("HTTPS proxy TLS handshake from {peer} failed: {error}"),
+            match tokio::time::timeout(header_timeout, tokio_boring::accept(&acceptor, stream))
+                .await
+            {
+                Ok(Ok(stream)) => {
+                    serve_connection(stream, peer, l4, expected_auth, header_timeout, permit).await;
+                }
+                Ok(Err(error)) => {
+                    log::debug!("HTTPS proxy TLS handshake from {peer} failed: {error}");
+                }
+                Err(_) => {
+                    log::debug!("HTTPS proxy TLS handshake from {peer} timed out");
+                }
             }
         });
     }
 }
 
-fn expected_proxy_auth(config: &HttpConfig) -> Result<Option<String>> {
+fn expected_proxy_auth(config: &HttpConfig) -> Result<Option<Arc<str>>> {
     match (&config.username, &config.password) {
-        (Some(username), Some(password)) => Ok(Some(format!(
+        (Some(username), Some(password)) => Ok(Some(Arc::from(format!(
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
-        ))),
+        )))),
         (None, None) => Ok(None),
         _ => anyhow::bail!("HTTP proxy username and password must be configured together"),
     }
@@ -140,19 +198,31 @@ async fn serve_connection<I>(
     stream: I,
     peer: SocketAddr,
     l4: Arc<L4Client>,
-    expected_auth: Option<String>,
+    expected_auth: Option<Arc<str>>,
+    header_timeout: Duration,
+    permit: OwnedSemaphorePermit,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Hyper drops its connection driver after an HTTP CONNECT upgrade, but the
+    // upgrade task continues relaying. Share the permit with that relay so it
+    // remains counted until both halves have finished.
+    let permit = Arc::new(permit);
     let service = service_fn(move |request| {
-        let l4 = l4.clone();
+        let l4 = Arc::clone(&l4);
         let expected_auth = expected_auth.clone();
-        async move { Ok::<_, !>(handle(request, l4, expected_auth.as_deref()).await) }
+        let permit = Arc::clone(&permit);
+        async move { Ok::<_, !>(handle(request, l4, expected_auth.as_deref(), permit).await) }
     });
 
-    if let Err(error) = server_http1::Builder::new()
+    let mut builder = server_http1::Builder::new();
+    builder
         .preserve_header_case(true)
         .title_case_headers(false)
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_timeout);
+
+    if let Err(error) = builder
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades()
         .await
@@ -165,6 +235,7 @@ async fn handle(
     request: Request<Incoming>,
     l4: Arc<L4Client>,
     expected_auth: Option<&str>,
+    permit: Arc<OwnedSemaphorePermit>,
 ) -> Response<ProxyBody> {
     if let Some(expected) = expected_auth {
         let provided = request
@@ -183,7 +254,7 @@ async fn handle(
     }
 
     if request.method() == Method::CONNECT {
-        return handle_connect(request, l4).await;
+        return handle_connect(request, l4, permit).await;
     }
 
     handle_forward(request, l4).await
@@ -254,7 +325,11 @@ async fn handle_forward(mut request: Request<Incoming>, l4: Arc<L4Client>) -> Re
     )
 }
 
-async fn handle_connect(request: Request<Incoming>, l4: Arc<L4Client>) -> Response<ProxyBody> {
+async fn handle_connect(
+    request: Request<Incoming>,
+    l4: Arc<L4Client>,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Response<ProxyBody> {
     let (host, port) = match request_target(&request, 443) {
         Ok(target) => target,
         Err(message) => return text_response(StatusCode::BAD_REQUEST, message),
@@ -270,6 +345,7 @@ async fn handle_connect(request: Request<Incoming>, l4: Arc<L4Client>) -> Respon
 
     let upgraded = hyper::upgrade::on(request);
     tokio::spawn(async move {
+        let _permit = permit;
         match upgraded.await {
             Ok(stream) => {
                 let mut client = TokioIo::new(stream);
@@ -467,6 +543,110 @@ mod tests {
             headers.get("x-end-to-end"),
             Some(&HeaderValue::from_static("keep"))
         );
+    }
+
+    #[test]
+    fn open_http_listener_rejects_public_addresses_and_invalid_limits() -> Result<()> {
+        let mut config = HttpConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            username: None,
+            password: None,
+            max_connections: 8,
+            header_timeout: Duration::from_secs(5),
+        };
+        for address in [
+            SocketAddr::from(([127, 0, 0, 1], 8080)),
+            SocketAddr::from(([192, 168, 1, 2], 8080)),
+            SocketAddr::from(([100, 64, 0, 1], 8080)),
+            "[fd00::1]:8080".parse()?,
+        ] {
+            assert!(config.validate(address).is_ok(), "{address}");
+        }
+        for address in [
+            SocketAddr::from(([0, 0, 0, 0], 8080)),
+            SocketAddr::from(([8, 8, 8, 8], 8080)),
+            SocketAddr::from(([192, 0, 2, 2], 8080)),
+            "[::]:8080".parse()?,
+            "[2001:db8::1]:8080".parse()?,
+        ] {
+            assert!(config.validate(address).is_err(), "{address}");
+        }
+        config.max_connections = 0;
+        assert!(config.validate(config.bind).is_err());
+        config.max_connections = 8;
+        config.header_timeout = Duration::ZERO;
+        assert!(config.validate(config.bind).is_err());
+        config.header_timeout = Duration::from_secs(5);
+        config.username = Some("user".to_owned());
+        assert!(config.validate(config.bind).is_err());
+        config.password = Some("password".to_owned());
+        assert!(
+            config
+                .validate(SocketAddr::from(([0, 0, 0, 0], 8080)))
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn basic_proxy_authorization_token_is_shared_without_string_copy() -> Result<()> {
+        let config = HttpConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            username: Some("alice".to_owned()),
+            password: Some("secret".to_owned()),
+            max_connections: 4,
+            header_timeout: Duration::from_secs(10),
+        };
+        let token =
+            expected_proxy_auth(&config)?.ok_or_else(|| anyhow::anyhow!("missing token"))?;
+        let per_connection = Arc::clone(&token);
+        let per_request = Arc::clone(&per_connection);
+        assert!(Arc::ptr_eq(&token, &per_request));
+        assert_eq!(token.as_ref(), "Basic YWxpY2U6c2VjcmV0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_permit_survives_upgraded_tunnel_until_relay_finishes() -> Result<()> {
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(Arc::clone(&permits).try_acquire_owned()?);
+        let (client, mut proxy_client) = tokio::io::duplex(64);
+        let (upstream, mut proxy_upstream) = tokio::io::duplex(64);
+        let relay_permit = Arc::clone(&permit);
+        let relay = tokio::spawn(async move {
+            let _permit = relay_permit;
+            tokio::io::copy_bidirectional(&mut proxy_client, &mut proxy_upstream).await
+        });
+        // The Hyper connection driver may already have returned after upgrade.
+        drop(permit);
+        assert!(Arc::clone(&permits).try_acquire_owned().is_err());
+
+        drop(client);
+        drop(upstream);
+        relay.await??;
+        assert!(Arc::clone(&permits).try_acquire_owned().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_http_headers_expire_under_tokio_timer() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tokio::io::duplex(256);
+        let service = service_fn(|_| async { Ok::<_, !>(Response::new(Empty::<Bytes>::new())) });
+        let task = tokio::spawn(async move {
+            let mut builder = server_http1::Builder::new();
+            builder
+                .timer(TokioTimer::new())
+                .header_read_timeout(Duration::from_millis(20));
+            builder
+                .serve_connection(TokioIo::new(server), service)
+                .await
+        });
+        client.write_all(b"GET / HTTP/1.1\r\nHost: ").await?;
+        // The client deliberately keeps the stream open with incomplete headers.
+        let result = tokio::time::timeout(Duration::from_secs(1), task).await??;
+        assert!(result.is_err(), "Hyper must reject the incomplete header");
+        Ok(())
     }
 
     #[test]

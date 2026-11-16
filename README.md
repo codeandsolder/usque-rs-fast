@@ -401,7 +401,24 @@ HTTP forwarding necessarily parses and rewrites the proxy-form request and strip
 hop-by-hop headers.
 
 If `--username`/`--password` or `--auth-file` is supplied, HTTP(S) listeners require
-matching HTTP Basic proxy authentication.
+matching HTTP Basic proxy authentication. **Unauthenticated HTTP and HTTPS listeners
+are restricted to private/local addresses**, the same policy as open SOCKS5
+listeners. Authenticated listeners can bind publicly; when confidentiality is
+required, use the TLS-wrapped HTTPS proxy rather than plaintext Basic auth.
+
+Each HTTP or HTTPS listener allows at most **512 concurrent accepted connections**
+by default, including upgraded CONNECT tunnels. Excess connections are closed.
+HTTP request headers must complete within **10 seconds** by default, and HTTPS
+listeners impose the same deadline on the TLS handshake. Both are configurable:
+
+```sh
+usque-rs proxy --http 127.0.0.1:8000 \
+  --http-max-connections 1024 \
+  --http-header-timeout-secs 15
+```
+
+These limits apply separately to each HTTP and HTTPS listener. Established
+forwarding requests and CONNECT relays are not subject to the header deadline.
 
 **Unlike `--socks5-no-auth`, HTTP/HTTPS listeners do not currently restrict the bind
 address when authentication is absent. Do not expose an unauthenticated HTTP proxy on

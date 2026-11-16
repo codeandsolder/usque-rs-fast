@@ -49,8 +49,14 @@ use usque_rs::l4::{L4Client, L4Config};
 use usque_rs::proxy::http::HttpsConfig;
 #[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
 use usque_rs::proxy::http::{self as http_proxy, HttpConfig};
+#[cfg(any(
+    feature = "http-proxy",
+    feature = "https-proxy",
+    feature = "socks5-proxy"
+))]
+use usque_rs::proxy::safe_no_auth_bind;
 #[cfg(feature = "socks5-proxy")]
-use usque_rs::proxy::socks::{self, SocksConfig, safe_no_auth_bind};
+use usque_rs::proxy::socks::{self, SocksConfig};
 #[cfg(any(
     feature = "tun",
     feature = "http-proxy",
@@ -181,6 +187,16 @@ struct ProxyArgs {
     #[cfg(feature = "https-proxy")]
     #[arg(long, value_name = "ADDR")]
     https: Option<SocketAddr>,
+
+    /// Maximum number of simultaneous HTTP or HTTPS proxy connections per listener.
+    #[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
+    #[arg(long, default_value_t = 512)]
+    http_max_connections: usize,
+
+    /// Deadline in seconds for reading HTTP request headers and the initial TLS handshake.
+    #[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
+    #[arg(long, default_value_t = 10)]
+    http_header_timeout_secs: u64,
 
     /// Certificate chain for the HTTPS proxy listener.
     #[cfg(feature = "https-proxy")]
@@ -510,6 +526,37 @@ fn validate_proxy_args(options: &ProxyArgs) -> Result<()> {
         }
     }
 
+    #[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
+    {
+        anyhow::ensure!(
+            (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&options.http_max_connections),
+            "HTTP connection limit must be between 1 and {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        anyhow::ensure!(
+            options.http_header_timeout_secs > 0,
+            "HTTP request-header timeout must be nonzero"
+        );
+        let has_auth = options.auth_file.is_some()
+            || (options.username.is_some() && options.password.is_some());
+        if !has_auth {
+            #[cfg(feature = "http-proxy")]
+            if let Some(bind) = options.http {
+                anyhow::ensure!(
+                    safe_no_auth_bind(bind.ip()),
+                    "unauthenticated HTTP listener cannot bind to {bind}"
+                );
+            }
+            #[cfg(feature = "https-proxy")]
+            if let Some(bind) = options.https {
+                anyhow::ensure!(
+                    safe_no_auth_bind(bind.ip()),
+                    "unauthenticated HTTPS listener cannot bind to {bind}"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "https-proxy")]
     match (
         options.https,
@@ -584,17 +631,16 @@ async fn cmd_proxy(registration: &RegistrationArgs, options: ProxyArgs) -> Resul
         let l4 = l4.clone();
         let username = username.clone();
         let password = password.clone();
-        listeners.spawn(async move {
-            http_proxy::serve_plain(
-                HttpConfig {
-                    bind,
-                    username,
-                    password,
-                },
-                l4,
-            )
-            .await
-        });
+        listeners.spawn(http_proxy::serve_plain(
+            HttpConfig {
+                bind,
+                username,
+                password,
+                max_connections: options.http_max_connections,
+                header_timeout: Duration::from_secs(options.http_header_timeout_secs),
+            },
+            l4,
+        ));
     }
 
     #[cfg(feature = "https-proxy")]
@@ -610,21 +656,20 @@ async fn cmd_proxy(registration: &RegistrationArgs, options: ProxyArgs) -> Resul
             .tls_key
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing HTTPS private key after validation"))?;
-        listeners.spawn(async move {
-            http_proxy::serve_tls(
-                HttpConfig {
-                    bind,
-                    username,
-                    password,
-                },
-                HttpsConfig {
-                    certificate: certificate.into(),
-                    private_key: private_key.into(),
-                },
-                l4,
-            )
-            .await
-        });
+        listeners.spawn(http_proxy::serve_tls(
+            HttpConfig {
+                bind,
+                username,
+                password,
+                max_connections: options.http_max_connections,
+                header_timeout: Duration::from_secs(options.http_header_timeout_secs),
+            },
+            HttpsConfig {
+                certificate: certificate.into(),
+                private_key: private_key.into(),
+            },
+            l4,
+        ));
     }
 
     let result = listeners
@@ -803,6 +848,74 @@ mod tests {
                 "should reject {address}"
             );
         }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "http-proxy", feature = "https-proxy"))]
+    #[test]
+    fn http_listener_limits_must_be_positive() -> Result<()> {
+        #[cfg(feature = "http-proxy")]
+        let listener_flags = &["--http", "127.0.0.1:8000"][..];
+        #[cfg(all(not(feature = "http-proxy"), feature = "https-proxy"))]
+        let listener_flags = &[
+            "--https",
+            "127.0.0.1:8443",
+            "--tls-cert",
+            "cert.pem",
+            "--tls-key",
+            "key.pem",
+        ][..];
+
+        for (flag, value) in [
+            ("--http-max-connections", "0"),
+            ("--http-header-timeout-secs", "0"),
+        ] {
+            let mut args = vec!["usque-rs", "proxy"];
+            args.extend_from_slice(listener_flags);
+            args.extend_from_slice(&[flag, value]);
+            let options = proxy_options(&args)?;
+            assert!(validate_proxy_args(&options).is_err(), "{flag}");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "http-proxy")]
+    #[test]
+    fn open_http_proxy_cli_rejects_public_bind() -> Result<()> {
+        let options = proxy_options(&["usque-rs", "proxy", "--http", "0.0.0.0:8000"])?;
+        assert!(validate_proxy_args(&options).is_err());
+        let options = proxy_options(&[
+            "usque-rs",
+            "proxy",
+            "--http",
+            "0.0.0.0:8000",
+            "--username",
+            "alice",
+            "--password",
+            "secret",
+        ])?;
+        assert!(validate_proxy_args(&options).is_ok());
+        Ok(())
+    }
+
+    #[cfg(feature = "https-proxy")]
+    #[test]
+    fn open_https_proxy_cli_rejects_public_bind() -> Result<()> {
+        let mut flags = vec![
+            "usque-rs",
+            "proxy",
+            "--https",
+            "0.0.0.0:8443",
+            "--tls-cert",
+            "cert.pem",
+            "--tls-key",
+            "key.pem",
+        ];
+        let options = proxy_options(&flags)?;
+        assert!(validate_proxy_args(&options).is_err());
+        flags.extend_from_slice(&["--username", "alice", "--password", "secret"]);
+        let options = proxy_options(&flags)?;
+        assert!(validate_proxy_args(&options).is_ok());
         Ok(())
     }
 
