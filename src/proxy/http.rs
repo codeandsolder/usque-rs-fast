@@ -642,7 +642,8 @@ mod tests {
         });
         client.write_all(b"GET / HTTP/1.1\r\nHost: ").await?;
         // The client deliberately keeps the stream open with incomplete headers.
-        tokio::time::timeout(Duration::from_secs(1), task).await??;
+        let result = tokio::time::timeout(Duration::from_secs(1), task).await??;
+        assert!(result.is_err(), "Hyper must reject the incomplete header");
         Ok(())
     }
 
