@@ -225,8 +225,8 @@ async fn serve_connection(
 
     let (protocol, command, target) = protocol.read_command().await?;
     match command {
-        Socks5Command::TCPConnect => serve_tcp_connect(protocol, target, l4).await,
-        Socks5Command::UDPAssociate | Socks5Command::TCPBind => {
+        Socks5Command::TcpConnect => serve_tcp_connect(protocol, target, l4).await,
+        Socks5Command::UdpAssociate | Socks5Command::TcpBind => {
             protocol
                 .reply_error(&ReplyError::CommandNotSupported)
                 .await?;
@@ -279,8 +279,10 @@ async fn serve_tcp_connect(
 }
 
 fn map_connect_error(error: &io::Error) -> ReplyError {
+    // RFC 1928 has no generic connect-timeout status: TTL expired (0x06)
+    // describes an IP hop limit, not an application-level timeout.
+    // TimedOut intentionally follows the generic failure fallback.
     match error.kind() {
-        io::ErrorKind::TimedOut => ReplyError::ConnectionTimeout,
         io::ErrorKind::ConnectionRefused => ReplyError::ConnectionRefused,
         io::ErrorKind::AddrNotAvailable | io::ErrorKind::NotFound => ReplyError::HostUnreachable,
         io::ErrorKind::NetworkUnreachable => ReplyError::NetworkUnreachable,
@@ -297,8 +299,12 @@ mod tests {
     fn maps_common_connect_errors_to_socks_replies() {
         assert!(matches!(
             map_connect_error(&io::Error::new(io::ErrorKind::TimedOut, "timeout")),
-            ReplyError::ConnectionTimeout
+            ReplyError::GeneralFailure
         ));
+        assert_eq!(
+            map_connect_error(&io::Error::new(io::ErrorKind::TimedOut, "timeout")).as_u8(),
+            0x01,
+        );
         assert!(matches!(
             map_connect_error(&io::Error::new(io::ErrorKind::ConnectionRefused, "refused")),
             ReplyError::ConnectionRefused
