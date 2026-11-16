@@ -21,7 +21,8 @@ use tokio::{
     task::JoinHandle,
 };
 
-#[derive(Clone, Debug)]
+// Includes plaintext authentication credentials; do not derive Debug.
+#[derive(Clone)]
 pub struct SocksConfig {
     pub bind: SocketAddr,
     pub username: Option<String>,
