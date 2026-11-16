@@ -225,8 +225,8 @@ async fn serve_connection(
 
     let (protocol, command, target) = protocol.read_command().await?;
     match command {
-        Socks5Command::TCPConnect => serve_tcp_connect(protocol, target, l4).await,
-        Socks5Command::UDPAssociate | Socks5Command::TCPBind => {
+        Socks5Command::TcpConnect => serve_tcp_connect(protocol, target, l4).await,
+        Socks5Command::UdpAssociate | Socks5Command::TcpBind => {
             protocol
                 .reply_error(&ReplyError::CommandNotSupported)
                 .await?;
