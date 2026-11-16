@@ -279,10 +279,10 @@ async fn serve_tcp_connect(
 }
 
 fn map_connect_error(error: &io::Error) -> ReplyError {
+    // RFC 1928 has no generic connect-timeout status: TTL expired (0x06)
+    // describes an IP hop limit, not an application-level timeout.
+    // TimedOut intentionally follows the generic failure fallback.
     match error.kind() {
-        // RFC 1928 has no generic connect-timeout status: TTL expired (0x06)
-        // describes an IP hop limit, not an application-level timeout.
-        io::ErrorKind::TimedOut => ReplyError::GeneralFailure,
         io::ErrorKind::ConnectionRefused => ReplyError::ConnectionRefused,
         io::ErrorKind::AddrNotAvailable | io::ErrorKind::NotFound => ReplyError::HostUnreachable,
         io::ErrorKind::NetworkUnreachable => ReplyError::NetworkUnreachable,
