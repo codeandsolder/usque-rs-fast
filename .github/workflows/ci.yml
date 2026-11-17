@@ -60,9 +60,9 @@ jobs:
         done
 
   cross-cache-smoke:
-    # Explicit dispatch only: no additional routine PR runners, no release
-    # artifacts. Uses the actual release bridge against one representative
-    # cross container to verify client-side cache connectivity.
+    # Explicit dispatch only: no additional routine PR runners. Build a
+    # deployable full-proxy static artifact via the existing release bridge
+    # while verifying mandatory cross-container sccache connectivity.
     name: Cross-container sccache smoke (x86_64 musl)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation == 'cross-cache' }}
     runs-on: ubuntu-26.04
@@ -72,6 +72,7 @@ jobs:
     env:
       CROSS_CONFIG: Cross.toml
       CARGO_PROFILE_RELEASE_PANIC: abort
+      USQUE_BUILD_FEATURES: http-proxy,https-proxy
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -99,6 +100,23 @@ jobs:
           print(f"Cross-container sccache compile requests: {n}")
           if n < 1: sys.exit("No compiler traffic reached the host sccache daemon")
           '
+      - name: Prepare verified deployable artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p deployment-artifact
+          install -m 0755 target/x86_64-unknown-linux-musl/release/usque-rs deployment-artifact/usque-rs
+          printf '%s\n' "$GITHUB_SHA" > deployment-artifact/SOURCE_COMMIT
+          printf '%s\n' "socks5-proxy,http-proxy,https-proxy" > deployment-artifact/BUILD_FEATURES
+          (cd deployment-artifact && sha256sum usque-rs > SHA256SUMS)
+          cat deployment-artifact/SOURCE_COMMIT deployment-artifact/BUILD_FEATURES deployment-artifact/SHA256SUMS
+      - name: Upload manual release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: usque-rs-x86_64-musl-proxies-${{ github.sha }}
+          path: deployment-artifact/
+          if-no-files-found: error
+          retention-days: 7
       - name: Finalize mandatory sccache
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
