@@ -116,6 +116,29 @@ async fn socks_request(client: &mut TcpStream, command: u8, host: &str, port: u1
 
 #[cfg(feature = "socks5-proxy")]
 #[tokio::test]
+async fn socks5_ipv4_target_relays_over_real_socket() -> Result<()> {
+    let (origin, origin_task) = echo_origin().await?;
+    let server = super::socks::SocksServer::bind(socks_config(None, None), test_l4()?).await?;
+    let mut client = TcpStream::connect(server.local_addr()).await?;
+    ensure!(socks_auth(&mut client, None).await?);
+    let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+    request.extend_from_slice(&origin.port().to_be_bytes());
+    client.write_all(&request).await?;
+    let mut response = [0_u8; 10];
+    timeout(DEADLINE, client.read_exact(&mut response)).await??;
+    ensure!(response[..4] == [5, 0, 0, 1], "unexpected SOCKS response");
+    client.write_all(b"ipv4-echo").await?;
+    let mut echoed = [0_u8; 9];
+    timeout(DEADLINE, client.read_exact(&mut echoed)).await??;
+    ensure!(&echoed == b"ipv4-echo");
+    server.shutdown().await?;
+    drop(client);
+    timeout(DEADLINE, origin_task).await???;
+    Ok(())
+}
+
+#[cfg(feature = "socks5-proxy")]
+#[tokio::test]
 async fn socks5h_no_auth_relay_through_real_socket() -> Result<()> {
     let (origin, origin_task) = echo_origin().await?;
     let server = super::socks::SocksServer::bind(socks_config(None, None), test_l4()?).await?;
@@ -151,6 +174,11 @@ async fn socks5_authenticated_rebind_and_unsupported_commands() -> Result<()> {
     ensure!(socks_auth(&mut unsupported, Some(("alice", "secret"))).await?);
     ensure!(socks_request(&mut unsupported, 3, "origin.test", origin.port()).await? == 7);
     drop(unsupported);
+
+    let mut bind = TcpStream::connect(server.local_addr()).await?;
+    ensure!(socks_auth(&mut bind, Some(("alice", "secret"))).await?);
+    ensure!(socks_request(&mut bind, 2, "origin.test", origin.port()).await? == 7);
+    drop(bind);
 
     let previous = server.local_addr();
     let new_addr = server.rebind("127.0.0.1:0".parse()?).await?;
@@ -275,8 +303,14 @@ async fn http_auth_rejection_and_header_deadline_over_tcp() -> Result<()> {
 
     let mut stalled = TcpStream::connect(addr).await?;
     stalled.write_all(b"GET / HTTP/1.1\r\nHost: ").await?;
-    let response = read_headers(&mut stalled).await?;
-    ensure!(response.starts_with("HTTP/1.1 408"), "{response}");
+    // Hyper may close the malformed request directly rather than emit 408;
+    // either way the incomplete header must not hold a connection forever.
+    let mut response = Vec::new();
+    timeout(DEADLINE, stalled.read_to_end(&mut response)).await??;
+    ensure!(
+        response.is_empty() || response.starts_with(b"HTTP/1.1 408"),
+        "unexpected header-timeout reply: {response:?}"
+    );
     task.abort();
     Ok(())
 }
@@ -300,6 +334,35 @@ async fn http_connect_upgrade_relays_after_successful_response() -> Result<()> {
     timeout(DEADLINE, client.read_exact(&mut echoed)).await??;
     ensure!(&echoed == b"CONNECT-echo");
     drop(client);
+    timeout(DEADLINE, origin_task).await???;
+    task.abort();
+    Ok(())
+}
+
+#[cfg(feature = "http-proxy")]
+#[tokio::test]
+async fn http_connect_tunnel_occupies_real_listener_capacity() -> Result<()> {
+    let (origin, origin_task) = echo_origin().await?;
+    let mut config = http_config(None, None)?;
+    config.max_connections = 1;
+    let (addr, task) = http_server(config).await?;
+    let mut first = TcpStream::connect(addr).await?;
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        origin.port()
+    );
+    first.write_all(request.as_bytes()).await?;
+    let response = read_headers(&mut first).await?;
+    ensure!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let mut excess = TcpStream::connect(addr).await?;
+    let mut byte = [0_u8];
+    ensure!(timeout(DEADLINE, excess.read(&mut byte)).await?? == 0);
+    first.write_all(b"still-counted").await?;
+    let mut echoed = [0_u8; 13];
+    timeout(DEADLINE, first.read_exact(&mut echoed)).await??;
+    ensure!(&echoed == b"still-counted");
+    drop(first);
     timeout(DEADLINE, origin_task).await???;
     task.abort();
     Ok(())
@@ -353,6 +416,12 @@ async fn https_proxy_tls_connect_and_relay_over_real_socket() -> Result<()> {
     ensure!(&echoed == b"tls-echo");
     drop(client);
     timeout(DEADLINE, origin_task).await???;
+
+    // A plain client that never sends ClientHello must not monopolize an
+    // HTTPS slot forever. The timeout happens before Hyper sees any HTTP.
+    let mut stalled = TcpStream::connect(addr).await?;
+    let mut byte = [0_u8];
+    ensure!(timeout(DEADLINE, stalled.read(&mut byte)).await?? == 0);
     server.abort();
     Ok(())
 }
