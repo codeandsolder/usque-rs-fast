@@ -401,7 +401,12 @@ HTTP forwarding necessarily parses and rewrites the proxy-form request and strip
 hop-by-hop headers.
 
 If `--username`/`--password` or `--auth-file` is supplied, HTTP(S) listeners require
-matching HTTP Basic proxy authentication. **Unauthenticated HTTP and HTTPS listeners
+matching HTTP Basic proxy authentication. The Basic scheme is matched
+case-insensitively, with one or more spaces before the case-sensitive token.
+Basic usernames cannot contain a colon or control characters; passwords cannot
+contain control characters. Authentication-file credentials preserve spaces
+inside and at the ends of usernames and passwords, removing only final line
+terminators. **Unauthenticated HTTP and HTTPS listeners
 are restricted to private/local addresses**, the same policy as open SOCKS5
 listeners. Authenticated listeners can bind publicly; when confidentiality is
 required, use the TLS-wrapped HTTPS proxy rather than plaintext Basic auth.
