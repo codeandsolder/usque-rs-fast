@@ -426,8 +426,13 @@ fn request_target<B>(
     parse_authority(host, default_port)
 }
 
-fn parse_target_port(port: &str) -> Result<u16, &'static str> {
-    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+fn parse_target_port(port: &str, default_port: Option<u16>) -> Result<u16, &'static str> {
+    // URI port is *DIGIT, so an explicitly empty port may use the scheme
+    // default for ordinary HTTP. CONNECT never has an implicit port.
+    if port.is_empty() {
+        return default_port.ok_or("CONNECT target requires an explicit port");
+    }
+    if !port.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("invalid proxy target port");
     }
     let parsed = port
@@ -455,7 +460,10 @@ fn parse_authority(
         let port = if rest.is_empty() {
             default_port.ok_or("CONNECT target requires an explicit port")?
         } else {
-            parse_target_port(rest.strip_prefix(':').ok_or("invalid IPv6 authority")?)?
+            parse_target_port(
+                rest.strip_prefix(':').ok_or("invalid IPv6 authority")?,
+                default_port,
+            )?
         };
         return Ok((address.to_string(), port));
     }
@@ -468,7 +476,7 @@ fn parse_authority(
         if host.is_empty() || host.contains(':') {
             return Err("invalid or unbracketed IPv6 proxy target");
         }
-        return Ok((host.to_owned(), parse_target_port(port)?));
+        return Ok((host.to_owned(), parse_target_port(port, default_port)?));
     }
 
     if authority.is_empty() {
@@ -861,6 +869,16 @@ mod tests {
         }
         assert!(parse_authority("example.com", None).is_err());
         assert!(parse_authority("[::1]", None).is_err());
+        assert!(parse_authority("example.com:", None).is_err());
+        assert!(parse_authority("[::1]:", None).is_err());
+        assert_eq!(
+            parse_authority("example.com:", Some(80)),
+            Ok(("example.com".to_owned(), 80))
+        );
+        assert_eq!(
+            parse_authority("[::1]:", Some(80)),
+            Ok(("::1".to_owned(), 80))
+        );
         assert!(parse_authority("example.com:443", None).is_ok());
         assert_eq!(
             parse_authority("127.0.0.1:443", None),
