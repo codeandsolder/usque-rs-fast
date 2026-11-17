@@ -6,7 +6,7 @@ use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::Incoming,
-    header::{HOST, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
+    header::{HOST, HeaderMap, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
     server::conn::http1 as server_http1,
     service::service_fn,
 };
@@ -54,7 +54,17 @@ impl HttpConfig {
                     "unauthenticated HTTP(S) listener cannot bind to {bind}"
                 );
             }
-            (Some(_), Some(_)) => {}
+            (Some(username), Some(password)) => {
+                anyhow::ensure!(
+                    !username.contains(':'),
+                    "HTTP Basic username cannot contain ':'"
+                );
+                anyhow::ensure!(
+                    !username.chars().any(char::is_control)
+                        && !password.chars().any(char::is_control),
+                    "HTTP Basic credentials cannot contain control characters"
+                );
+            }
             _ => anyhow::bail!("HTTP proxy username and password must be configured together"),
         }
         Ok(())
@@ -96,7 +106,7 @@ pub async fn serve_plain_on(
 ) -> Result<()> {
     let local_addr = listener.local_addr()?;
     config.validate(local_addr)?;
-    let expected_auth = expected_proxy_auth(&config)?;
+    let expected_auth = expected_basic_token(&config)?;
     let permits = Arc::new(Semaphore::new(config.max_connections));
     let header_timeout = config.header_timeout;
     log::info!("HTTP proxy listening on {local_addr}");
@@ -151,7 +161,7 @@ pub async fn serve_tls_on(
     let acceptor = Arc::new(builder.build());
     let local_addr = listener.local_addr()?;
     config.validate(local_addr)?;
-    let expected_auth = expected_proxy_auth(&config)?;
+    let expected_auth = expected_basic_token(&config)?;
     let permits = Arc::new(Semaphore::new(config.max_connections));
     let header_timeout = config.header_timeout;
     log::info!("HTTPS proxy listening on {local_addr}");
@@ -183,15 +193,35 @@ pub async fn serve_tls_on(
     }
 }
 
-fn expected_proxy_auth(config: &HttpConfig) -> Result<Option<Arc<str>>> {
+fn expected_basic_token(config: &HttpConfig) -> Result<Option<Arc<str>>> {
     match (&config.username, &config.password) {
-        (Some(username), Some(password)) => Ok(Some(Arc::from(format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
-        )))),
+        (Some(username), Some(password)) => Ok(Some(Arc::from(
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}")),
+        ))),
         (None, None) => Ok(None),
         _ => anyhow::bail!("HTTP proxy username and password must be configured together"),
     }
+}
+
+/// RFC 9110: auth-scheme is ASCII case-insensitive, separated from
+/// the case-sensitive token68 by one or more SP characters.
+fn matches_basic_proxy_auth(headers: &HeaderMap, expected_token: &str) -> bool {
+    let mut values = headers.get_all(PROXY_AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    // Ignore HTTP optional whitespace around the entire field value.
+    let value = value.trim_matches([' ', '\t']);
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("Basic") && token.trim_start_matches(' ') == expected_token
 }
 
 async fn serve_connection<I>(
@@ -237,20 +267,16 @@ async fn handle(
     expected_auth: Option<&str>,
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Response<ProxyBody> {
-    if let Some(expected) = expected_auth {
-        let provided = request
-            .headers()
-            .get(PROXY_AUTHORIZATION)
-            .and_then(|value| value.to_str().ok());
-        if provided != Some(expected) {
-            let mut response =
-                response_with_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED, empty_body());
-            response.headers_mut().insert(
-                PROXY_AUTHENTICATE,
-                HeaderValue::from_static("Basic realm=\"usque-rs\""),
-            );
-            return response;
-        }
+    if let Some(expected) = expected_auth
+        && !matches_basic_proxy_auth(request.headers(), expected)
+    {
+        let mut response =
+            response_with_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED, empty_body());
+        response.headers_mut().insert(
+            PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"usque-rs\""),
+        );
+        return response;
     }
 
     if request.method() == Method::CONNECT {
@@ -598,12 +624,91 @@ mod tests {
             header_timeout: Duration::from_secs(10),
         };
         let token =
-            expected_proxy_auth(&config)?.ok_or_else(|| anyhow::anyhow!("missing token"))?;
+            expected_basic_token(&config)?.ok_or_else(|| anyhow::anyhow!("missing token"))?;
         let per_connection = Arc::clone(&token);
         let per_request = Arc::clone(&per_connection);
         assert!(Arc::ptr_eq(&token, &per_request));
-        assert_eq!(token.as_ref(), "Basic YWxpY2U6c2VjcmV0");
+        assert_eq!(token.as_ref(), "YWxpY2U6c2VjcmV0");
         Ok(())
+    }
+
+    #[test]
+    fn http_basic_scheme_is_case_insensitive_and_allows_multiple_spaces() {
+        let expected = "YWxpY2U6c2VjcmV0";
+        for value in [
+            "Basic YWxpY2U6c2VjcmV0",
+            "basic YWxpY2U6c2VjcmV0",
+            "BASIC YWxpY2U6c2VjcmV0",
+            "bAsIc    YWxpY2U6c2VjcmV0",
+            "  basic YWxpY2U6c2VjcmV0   ",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(PROXY_AUTHORIZATION, HeaderValue::from_static(value));
+            assert!(matches_basic_proxy_auth(&headers, expected), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn http_basic_auth_rejects_wrong_tokens_schemes_and_duplicate_fields() {
+        let expected = "YWxpY2U6c2VjcmV0";
+        let mut headers = HeaderMap::new();
+        assert!(!matches_basic_proxy_auth(&headers, expected));
+        for value in [
+            "Bearer YWxpY2U6c2VjcmV0",
+            "Basic",
+            "Basic ",
+            "Basic  ",
+            "Basic\tYWxpY2U6c2VjcmV0",
+            "Basic YWxpY2U6c2VjcmV0 extra",
+            "Basic YWxpY2U6c2VjcmV0, Basic YWxpY2U6c2VjcmV0",
+            "Basic YWxpY2U6c2VjcmV1",
+            "Basic YWxpY2U6c2Vjcmv0",
+            "Basics YWxpY2U6c2VjcmV0",
+            "BasicY WxpY2U6c2VjcmV0",
+        ] {
+            headers.insert(PROXY_AUTHORIZATION, HeaderValue::from_static(value));
+            assert!(!matches_basic_proxy_auth(&headers, expected), "{value:?}");
+        }
+        headers.insert(
+            PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Basic YWxpY2U6c2VjcmV0"),
+        );
+        headers.append(
+            PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Basic YWxpY2U6c2VjcmV0"),
+        );
+        assert!(!matches_basic_proxy_auth(&headers, expected));
+    }
+
+    #[test]
+    fn configured_basic_credentials_reject_nonrepresentable_usernames() {
+        let mut config = HttpConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            username: Some("alice".to_owned()),
+            password: Some("secret".to_owned()),
+            max_connections: 8,
+            header_timeout: Duration::from_secs(5),
+        };
+        assert!(config.validate(config.bind).is_ok());
+        for username in ["alice:admin", "alice\radmin", "alice\tadmin"] {
+            config.username = Some(username.to_owned());
+            assert!(config.validate(config.bind).is_err(), "{username:?}");
+        }
+        config.username = Some("alice".to_owned());
+        for password in ["secret\nnext", "secret\u{007f}"] {
+            config.password = Some(password.to_owned());
+            assert!(config.validate(config.bind).is_err(), "{password:?}");
+        }
+        config.password = Some("a:valid:password".to_owned());
+        assert!(config.validate(config.bind).is_ok());
+        // RFC 7617 permits empty username and/or password fields.
+        config.username = Some(String::new());
+        assert!(config.validate(config.bind).is_ok());
+        config.password = Some(String::new());
+        assert!(config.validate(config.bind).is_ok());
+        let token = expected_basic_token(&config)
+            .and_then(|token| token.ok_or_else(|| anyhow::anyhow!("expected Basic token")));
+        assert!(matches!(token, Ok(ref value) if value.as_ref() == "Og=="));
     }
 
     #[tokio::test]
