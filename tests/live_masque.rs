@@ -83,7 +83,34 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
         .parse()
         .context("observer must be a literal SocketAddr")?;
     ensure!(observer.port() != 0, "observer must have a nonzero port");
+    // The owned observer may deliberately allow WARP egress but reject
+    // unproxied hosts. An optional direct probe helps distinguish sources
+    // without mistakenly failing the WARP acceptance when it is restricted.
+    let direct_ip = match timeout(DEADLINE, async {
+        let mut direct = TcpStream::connect(observer).await?;
+        direct
+            .write_all(b"GET /ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n")
+            .await?;
+        observer_reply(&mut direct).await
+    })
+    .await
+    {
+        Ok(Ok(ip)) => {
+            eprintln!("direct observer baseline exit: {ip}");
+            Some(ip)
+        }
+        Ok(Err(error)) => {
+            eprintln!("direct observer probe unavailable: {error:#}");
+            None
+        }
+        Err(_) => {
+            eprintln!("direct observer probe timed out (continuing via WARP)");
+            None
+        }
+    };
+
     let config = Config::load(config_path)?;
+    eprintln!("starting real MASQUE session for {source_ip}");
     let l4 = timeout(
         DEADLINE,
         L4Client::connect(
@@ -97,6 +124,7 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
     )
     .await
     .context("timed out connecting real WARP MASQUE session")??;
+    eprintln!("real MASQUE transport session established");
 
     #[cfg(feature = "socks5-proxy")]
     {
@@ -135,11 +163,18 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
             response[..2] == [5, 0],
             "SOCKS5 CONNECT failed: {response:?}"
         );
+        eprintln!("SOCKS5 CONNECT accepted over real MASQUE transport");
         client
             .write_all(b"GET /ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n")
             .await?;
-        let exit_ip = observer_reply(&mut client).await?;
+        let exit_ip = observer_reply(&mut client)
+            .await
+            .context("SOCKS5 observer response over real MASQUE stalled")?;
         eprintln!("real MASQUE SOCKS5 observer exit: {exit_ip}");
+        ensure!(
+            exit_ip != direct_ip,
+            "SOCKS5 request did not exit through WARP"
+        );
         server.shutdown().await?;
     }
 
@@ -163,8 +198,15 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
             "GET http://{observer}/ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n"
         );
         client.write_all(request.as_bytes()).await?;
-        let exit_ip = observer_reply(&mut client).await?;
+        eprintln!("HTTP forward request sent over real MASQUE transport");
+        let exit_ip = observer_reply(&mut client)
+            .await
+            .context("HTTP proxy observer response over real MASQUE stalled")?;
         eprintln!("real MASQUE HTTP observer exit: {exit_ip}");
+        ensure!(
+            exit_ip != direct_ip,
+            "HTTP request did not exit through WARP"
+        );
         task.abort();
     }
 
