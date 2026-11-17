@@ -570,6 +570,13 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 
+# Real SOCKS5, HTTP forwarding, CONNECT and HTTPS proxy socket tests;
+# offline, using a local loopback-only L4 driver (no WARP account required).
+cargo test --all-features proxy::integration_tests
+cargo test --no-default-features --features socks5-proxy proxy::integration_tests
+cargo test --no-default-features --features http-proxy proxy::integration_tests
+cargo test --no-default-features --features https-proxy proxy::integration_tests
+
 cargo check --all-targets
 cargo check --all-targets --no-default-features
 cargo check --all-targets --no-default-features --features register
@@ -580,6 +587,12 @@ cargo check --all-targets --no-default-features --features socks5-proxy
 cargo check --all-targets --no-default-features \
   --features http-proxy,https-proxy,socks5-proxy
 ```
+
+The loopback integration suite runs automatically in the normal CI test step
+and again for independently selected proxy features. It tests actual local TCP
+and TLS listeners and relay traffic, replacing only the upstream MASQUE connection
+with a test-only L4 loopback bridge. The old external-network smoke script was
+retired; its CLI commands no longer existed.
 
 The crate denies unsafe code in the main lint configuration and applies strict
 correctness/style/performance/pedantic/nursery Clippy policy.
