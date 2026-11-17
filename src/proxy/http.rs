@@ -14,7 +14,12 @@ use hyper::{Uri, client::conn::http1 as client_http1, header::CONNECTION};
 use hyper_util::rt::{TokioIo, TokioTimer};
 #[cfg(feature = "https-proxy")]
 use std::path::PathBuf;
-use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    net::{Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::{
     net::TcpListener,
@@ -287,7 +292,7 @@ async fn handle(
 }
 
 async fn handle_forward(mut request: Request<Incoming>, l4: Arc<L4Client>) -> Response<ProxyBody> {
-    let (host, port) = match request_target(&request, 80) {
+    let (host, port) = match request_target(&request, Some(80)) {
         Ok(target) => target,
         Err(message) => return text_response(StatusCode::BAD_REQUEST, message),
     };
@@ -356,7 +361,7 @@ async fn handle_connect(
     l4: Arc<L4Client>,
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Response<ProxyBody> {
-    let (host, port) = match request_target(&request, 443) {
+    let (host, port) = match request_target(&request, None) {
         Ok(target) => target,
         Err(message) => return text_response(StatusCode::BAD_REQUEST, message),
     };
@@ -386,55 +391,98 @@ async fn handle_connect(
     response_with_status(StatusCode::OK, empty_body())
 }
 
-fn request_target(
-    request: &Request<Incoming>,
-    default_port: u16,
+/// CONNECT uses authority-form and requires an explicit port (RFC 9110 §9.3.6).
+/// Forward requests accept URI authority or origin-form with the Host header.
+fn request_target<B>(
+    request: &Request<B>,
+    default_port: Option<u16>,
 ) -> Result<(String, u16), &'static str> {
+    if default_port.is_none() {
+        if request.uri().scheme().is_some() || request.uri().path_and_query().is_some() {
+            return Err("CONNECT requires an authority-form request target");
+        }
+        let authority = request
+            .uri()
+            .authority()
+            .ok_or("CONNECT request is missing an authority")?;
+        return parse_authority(authority.as_str(), None);
+    }
+
     if let Some(authority) = request.uri().authority() {
+        if request.uri().scheme().is_none() {
+            return Err("non-CONNECT requests cannot use authority-form");
+        }
         return parse_authority(authority.as_str(), default_port);
     }
 
-    let host = request
-        .headers()
-        .get(HOST)
+    let mut values = request.headers().get_all(HOST).iter();
+    let host = values
+        .next()
         .and_then(|value| value.to_str().ok())
         .ok_or("proxy request is missing a valid Host header")?;
+    if values.next().is_some() {
+        return Err("proxy request contains duplicate Host headers");
+    }
     parse_authority(host, default_port)
 }
 
-fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), &'static str> {
+fn parse_target_port(port: &str) -> Result<u16, &'static str> {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("invalid proxy target port");
+    }
+    let parsed = port
+        .parse::<u16>()
+        .map_err(|_| "invalid proxy target port")?;
+    if parsed == 0 {
+        return Err("proxy target port must be nonzero");
+    }
+    Ok(parsed)
+}
+
+fn parse_authority(
+    authority: &str,
+    default_port: Option<u16>,
+) -> Result<(String, u16), &'static str> {
     if let Ok(address) = authority.parse::<SocketAddr>() {
+        if address.port() == 0 {
+            return Err("proxy target port must be nonzero");
+        }
         return Ok((address.ip().to_string(), address.port()));
     }
 
+    // Brackets are exclusively for IP literals. This transport supports IPv6,
+    // not IPvFuture, so validate rather than treating [hostname] as DNS.
     if let Some(stripped) = authority.strip_prefix('[') {
-        let end = stripped
-            .find(']')
+        let (literal, rest) = stripped
+            .split_once(']')
             .ok_or("invalid bracketed IPv6 authority")?;
-        let host = &stripped[..end];
-        let rest = &stripped[end + 1..];
+        let address: Ipv6Addr = literal
+            .parse()
+            .map_err(|_| "invalid bracketed IPv6 address")?;
         let port = if rest.is_empty() {
-            default_port
+            default_port.ok_or("CONNECT target requires an explicit port")?
         } else {
-            rest.strip_prefix(':')
-                .ok_or("invalid IPv6 authority")?
-                .parse()
-                .map_err(|_| "invalid proxy target port")?
+            parse_target_port(rest.strip_prefix(':').ok_or("invalid IPv6 authority")?)?
         };
-        return Ok((host.to_string(), port));
+        return Ok((address.to_string(), port));
     }
 
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => {
-            let port = port.parse().map_err(|_| "invalid proxy target port")?;
-            if host.is_empty() {
-                return Err("empty proxy target host");
-            }
-            Ok((host.to_string(), port))
-        }
-        _ if !authority.is_empty() => Ok((authority.to_string(), default_port)),
-        _ => Err("empty proxy target authority"),
+    if authority.contains(['[', ']', '@']) {
+        return Err("invalid proxy target authority");
     }
+
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') {
+            return Err("invalid or unbracketed IPv6 proxy target");
+        }
+        return Ok((host.to_owned(), parse_target_port(port)?));
+    }
+
+    if authority.is_empty() {
+        return Err("empty proxy target authority");
+    }
+    let port = default_port.ok_or("CONNECT target requires an explicit port")?;
+    Ok((authority.to_owned(), port))
 }
 
 fn rewrite_for_origin<B>(request: &mut Request<B>) -> Result<(), &'static str> {
@@ -755,17 +803,113 @@ mod tests {
     }
 
     #[test]
+    fn connect_requires_authority_form_and_explicit_port() -> Result<()> {
+        let valid = Request::builder()
+            .method(Method::CONNECT)
+            .uri("example.com:443")
+            .body(())?;
+        assert_eq!(
+            request_target(&valid, None).map_err(anyhow::Error::msg)?,
+            ("example.com".to_owned(), 443)
+        );
+        let ipv6 = Request::builder()
+            .method(Method::CONNECT)
+            .uri("[2001:db8::1]:8443")
+            .body(())?;
+        assert_eq!(
+            request_target(&ipv6, None).map_err(anyhow::Error::msg)?,
+            ("2001:db8::1".to_owned(), 8443)
+        );
+        for target in [
+            "http://example.com:443/",
+            "/target",
+            "example.com",
+            "[2001:db8::1]",
+        ] {
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(target)
+                .header(HOST, "example.com:443")
+                .body(())?;
+            assert!(request_target(&request, None).is_err(), "{target:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_authority_forms_and_ports() {
+        for authority in [
+            "[not-ipv6]:8080",
+            "[]:8080",
+            "[127.0.0.1]:8080",
+            "[::1]:bad",
+            "[::1]suffix:80",
+            "[::1",
+            "example.com:0",
+            "127.0.0.1:0",
+            "[::1]:0",
+            "example.com:+80",
+            "example.com:80extra",
+            "example.com:-1",
+            "example.com:65536",
+            "2001:db8::1",
+            "user@example.com:443",
+            "example.com]foo:80",
+            ":80",
+            "",
+        ] {
+            assert!(
+                parse_authority(authority, Some(80)).is_err(),
+                "{authority:?}"
+            );
+        }
+        assert!(parse_authority("example.com", None).is_err());
+        assert!(parse_authority("[::1]", None).is_err());
+        assert!(parse_authority("example.com:443", None).is_ok());
+        assert!(parse_authority("[::1]:443", None).is_ok());
+    }
+
+    #[test]
+    fn forward_target_uses_absolute_uri_or_unique_host_header() -> Result<()> {
+        let absolute = Request::builder()
+            .uri("http://example.com:8888/path")
+            .header(HOST, "another.example:9999")
+            .body(())?;
+        assert_eq!(
+            request_target(&absolute, Some(80)).map_err(anyhow::Error::msg)?,
+            ("example.com".to_owned(), 8888)
+        );
+        let origin = Request::builder()
+            .uri("/path")
+            .header(HOST, "example.com")
+            .body(())?;
+        assert_eq!(
+            request_target(&origin, Some(80)).map_err(anyhow::Error::msg)?,
+            ("example.com".to_owned(), 80)
+        );
+        let mut duplicate = Request::builder().uri("/path").body(())?;
+        duplicate
+            .headers_mut()
+            .append(HOST, HeaderValue::from_static("one.example"));
+        duplicate
+            .headers_mut()
+            .append(HOST, HeaderValue::from_static("two.example"));
+        assert!(request_target(&duplicate, Some(80)).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn parses_domain_and_ipv6_authorities() -> Result<()> {
         assert_eq!(
-            parse_authority("example.com:8443", 443).map_err(anyhow::Error::msg)?,
+            parse_authority("example.com:8443", Some(443)).map_err(anyhow::Error::msg)?,
             ("example.com".to_string(), 8443)
         );
         assert_eq!(
-            parse_authority("example.com", 443).map_err(anyhow::Error::msg)?,
+            parse_authority("example.com", Some(443)).map_err(anyhow::Error::msg)?,
             ("example.com".to_string(), 443)
         );
         assert_eq!(
-            parse_authority("[2001:db8::1]:8080", 443).map_err(anyhow::Error::msg)?,
+            parse_authority("[2001:db8::1]:8080", Some(443)).map_err(anyhow::Error::msg)?,
             ("2001:db8::1".to_string(), 8080)
         );
         Ok(())
