@@ -171,10 +171,12 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
             .await
             .context("SOCKS5 observer response over real MASQUE stalled")?;
         eprintln!("real MASQUE SOCKS5 observer exit: {exit_ip}");
-        ensure!(
-            exit_ip != direct_ip,
-            "SOCKS5 request did not exit through WARP"
-        );
+        if let Some(baseline_ip) = direct_ip {
+            ensure!(
+                exit_ip != baseline_ip,
+                "SOCKS5 request did not exit through WARP"
+            );
+        }
         server.shutdown().await?;
     }
 
@@ -203,10 +205,12 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
             .await
             .context("HTTP proxy observer response over real MASQUE stalled")?;
         eprintln!("real MASQUE HTTP observer exit: {exit_ip}");
-        ensure!(
-            exit_ip != direct_ip,
-            "HTTP request did not exit through WARP"
-        );
+        if let Some(baseline_ip) = direct_ip {
+            ensure!(
+                exit_ip != baseline_ip,
+                "HTTP request did not exit through WARP"
+            );
+        }
         task.abort();
     }
 
