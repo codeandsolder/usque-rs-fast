@@ -30,17 +30,45 @@ use usque_rs::{
 
 const DEADLINE: Duration = Duration::from_secs(40);
 
-async fn http_reply<T: AsyncRead + Unpin>(stream: &mut T) -> Result<Vec<u8>> {
-    let mut result = Vec::new();
-    timeout(DEADLINE, stream.read_to_end(&mut result))
-        .await
-        .context("timed out awaiting real WARP observer response")??;
-    ensure!(
-        result.starts_with(b"HTTP/1.1 200") || result.starts_with(b"HTTP/1.0 200"),
-        "observer did not return HTTP 200: {:?}",
-        String::from_utf8_lossy(&result[..result.len().min(100)])
-    );
-    Ok(result)
+/// Read the owned observer's complete Content-Length framed response.
+/// This avoids waiting for connection EOF on HTTP/1.1 proxy keep-alive.
+async fn observer_reply<T: AsyncRead + Unpin>(stream: &mut T) -> Result<IpAddr> {
+    timeout(DEADLINE, async {
+        let mut raw_headers = Vec::with_capacity(256);
+        while !raw_headers.ends_with(b"\r\n\r\n") {
+            ensure!(raw_headers.len() < 8192, "observer headers too large");
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await?;
+            raw_headers.push(byte[0]);
+        }
+        let headers = String::from_utf8(raw_headers)?;
+        ensure!(
+            headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200"),
+            "unexpected observer response: {headers:?}"
+        );
+        let length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .context("owned observer must send a Content-Length header")?
+            .1
+            .trim()
+            .parse::<usize>()?;
+        ensure!(
+            (7..=256).contains(&length),
+            "unexpected observer body length"
+        );
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await?;
+        let exit_ip: IpAddr = String::from_utf8(body)?.trim().parse()?;
+        ensure!(
+            !exit_ip.is_loopback() && !exit_ip.is_unspecified(),
+            "invalid observed WARP exit"
+        );
+        Ok::<_, anyhow::Error>(exit_ip)
+    })
+    .await
+    .context("real WARP observer did not finish its response")?
 }
 
 #[tokio::test]
@@ -110,8 +138,8 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
         client
             .write_all(b"GET /ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n")
             .await?;
-        let reply = http_reply(&mut client).await?;
-        ensure!(reply.len() > 30, "empty observer response over SOCKS5");
+        let observed = observer_reply(&mut client).await?;
+        eprintln!("real MASQUE SOCKS5 observer exit: {observed}");
         server.shutdown().await?;
     }
 
@@ -135,11 +163,8 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
             "GET http://{observer}/ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n"
         );
         client.write_all(request.as_bytes()).await?;
-        let reply = http_reply(&mut client).await?;
-        ensure!(
-            reply.len() > 30,
-            "empty observer response over HTTP forward proxy"
-        );
+        let observed = observer_reply(&mut client).await?;
+        eprintln!("real MASQUE HTTP observer exit: {observed}");
         task.abort();
     }
 
