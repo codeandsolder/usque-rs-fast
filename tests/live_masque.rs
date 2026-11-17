@@ -9,7 +9,12 @@
 #![cfg(any(feature = "socks5-proxy", feature = "http-proxy"))]
 
 use anyhow::{Context, Result, ensure};
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 #[cfg(feature = "http-proxy")]
 use tokio::net::TcpListener;
 use tokio::{
@@ -45,7 +50,7 @@ async fn http_reply<T: AsyncRead + Unpin>(stream: &mut T) -> Result<Vec<u8>> {
 #[ignore = "requires a real enrolled WARP identity, routable source IP and operator-controlled observer"]
 async fn real_masque_socks_and_http_egress() -> Result<()> {
     let config_path = env::var_os("USQUE_LIVE_CONFIG").context("set USQUE_LIVE_CONFIG")?;
-    let source_ip = env::var("USQUE_LIVE_SOURCE_IP")
+    let source_ip: IpAddr = env::var("USQUE_LIVE_SOURCE_IP")
         .context("set USQUE_LIVE_SOURCE_IP")?
         .parse()?;
     let observer: SocketAddr = env::var("USQUE_LIVE_OBSERVER_ADDR")
