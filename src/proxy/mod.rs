@@ -27,3 +27,6 @@ pub fn safe_no_auth_bind(ip: IpAddr) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod integration_tests;

@@ -47,6 +47,12 @@ jobs:
         cargo +1.100.0 fmt --all --check
         cargo +1.100.0 clippy --all-targets --all-features -- -D warnings
         cargo +1.100.0 test --all-features
+        # Run genuine loopback SOCKS/HTTP/TLS wire tests even when features
+        # are compiled independently. No registration or external network.
+        for features in socks5-proxy http-proxy https-proxy http-proxy,https-proxy; do
+          cargo +1.100.0 test --locked --lib --no-default-features \
+            --features "$features" proxy::integration_tests
+        done
         cargo +1.100.0 check --all-targets
         cargo +1.100.0 check --all-targets --no-default-features
         for features in register tun http-proxy https-proxy socks5-proxy http-proxy,https-proxy,socks5-proxy; do
