@@ -72,22 +72,11 @@ async fn observer_reply<T: AsyncRead + Unpin>(stream: &mut T) -> Result<IpAddr> 
     .context("real WARP observer did not finish its response")?
 }
 
-#[tokio::test]
-#[ignore = "requires a real enrolled WARP identity, routable source IP and operator-controlled observer"]
-async fn real_masque_socks_and_http_egress() -> Result<()> {
-    let config_path = env::var_os("USQUE_LIVE_CONFIG").context("set USQUE_LIVE_CONFIG")?;
-    let source_ip: IpAddr = env::var("USQUE_LIVE_SOURCE_IP")
-        .context("set USQUE_LIVE_SOURCE_IP")?
-        .parse()?;
-    let observer: SocketAddr = env::var("USQUE_LIVE_OBSERVER_ADDR")
-        .context("set USQUE_LIVE_OBSERVER_ADDR")?
-        .parse()
-        .context("observer must be a literal SocketAddr")?;
-    ensure!(observer.port() != 0, "observer must have a nonzero port");
+async fn direct_observer_baseline(observer: SocketAddr) -> Option<IpAddr> {
     // The owned observer may deliberately allow WARP egress but reject
     // unproxied hosts. An optional direct probe helps distinguish sources
     // without mistakenly failing the WARP acceptance when it is restricted.
-    let direct_ip = match timeout(DIRECT_PROBE_DEADLINE, async {
+    match timeout(DIRECT_PROBE_DEADLINE, async {
         let mut direct = TcpStream::connect(observer).await?;
         direct
             .write_all(b"GET /ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n")
@@ -108,7 +97,119 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
             eprintln!("direct observer probe timed out (continuing via WARP)");
             None
         }
-    };
+    }
+}
+
+#[cfg(feature = "socks5-proxy")]
+async fn verify_socks5_egress(
+    l4: Arc<L4Client>,
+    observer: SocketAddr,
+    direct_ip: Option<IpAddr>,
+) -> Result<()> {
+    let server = SocksServer::bind(
+        SocksConfig {
+            bind: "127.0.0.1:0".parse()?,
+            username: None,
+            password: None,
+            max_connections: 4,
+            handshake_timeout: Duration::from_secs(10),
+        },
+        Arc::clone(&l4),
+    )
+    .await?;
+    let mut client = TcpStream::connect(server.local_addr()).await?;
+    client.write_all(&[5, 1, 0]).await?;
+    let mut greeting = [0_u8; 2];
+    timeout(DEADLINE, client.read_exact(&mut greeting)).await??;
+    ensure!(greeting == [5, 0], "SOCKS5 no-auth greeting refused");
+    let mut command = vec![5, 1, 0];
+    match observer.ip() {
+        std::net::IpAddr::V4(ip) => {
+            command.push(1);
+            command.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            command.push(4);
+            command.extend_from_slice(&ip.octets());
+        }
+    }
+    command.extend_from_slice(&observer.port().to_be_bytes());
+    client.write_all(&command).await?;
+    let mut response = [0_u8; 10];
+    timeout(DEADLINE, client.read_exact(&mut response)).await??;
+    ensure!(
+        response[..2] == [5, 0],
+        "SOCKS5 CONNECT failed: {response:?}"
+    );
+    eprintln!("SOCKS5 CONNECT accepted over real MASQUE transport");
+    client
+        .write_all(b"GET /ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n")
+        .await?;
+    let exit_ip = observer_reply(&mut client)
+        .await
+        .context("SOCKS5 observer response over real MASQUE stalled")?;
+    eprintln!("real MASQUE SOCKS5 observer exit: {exit_ip}");
+    if let Some(baseline_ip) = direct_ip {
+        ensure!(
+            exit_ip != baseline_ip,
+            "SOCKS5 request did not exit through WARP"
+        );
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(feature = "http-proxy")]
+async fn verify_http_egress(
+    l4: Arc<L4Client>,
+    observer: SocketAddr,
+    direct_ip: Option<IpAddr>,
+) -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let local = listener.local_addr()?;
+    let task = tokio::spawn(http::serve_plain_on(
+        listener,
+        HttpConfig {
+            bind: local,
+            username: None,
+            password: None,
+            max_connections: 4,
+            header_timeout: Duration::from_secs(10),
+        },
+        Arc::clone(&l4),
+    ));
+    let mut client = TcpStream::connect(local).await?;
+    let request =
+        format!("GET http://{observer}/ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n");
+    client.write_all(request.as_bytes()).await?;
+    eprintln!("HTTP forward request sent over real MASQUE transport");
+    let exit_ip = observer_reply(&mut client)
+        .await
+        .context("HTTP proxy observer response over real MASQUE stalled")?;
+    eprintln!("real MASQUE HTTP observer exit: {exit_ip}");
+    if let Some(baseline_ip) = direct_ip {
+        ensure!(
+            exit_ip != baseline_ip,
+            "HTTP request did not exit through WARP"
+        );
+    }
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real enrolled WARP identity, routable source IP and operator-controlled observer"]
+async fn real_masque_socks_and_http_egress() -> Result<()> {
+    let config_path = env::var_os("USQUE_LIVE_CONFIG").context("set USQUE_LIVE_CONFIG")?;
+    let source_ip: IpAddr = env::var("USQUE_LIVE_SOURCE_IP")
+        .context("set USQUE_LIVE_SOURCE_IP")?
+        .parse()?;
+    let observer: SocketAddr = env::var("USQUE_LIVE_OBSERVER_ADDR")
+        .context("set USQUE_LIVE_OBSERVER_ADDR")?
+        .parse()
+        .context("observer must be a literal SocketAddr")?;
+    ensure!(observer.port() != 0, "observer must have a nonzero port");
+    let direct_ip = direct_observer_baseline(observer).await;
 
     let config = Config::load(config_path)?;
     eprintln!("starting real MASQUE session for {source_ip}");
@@ -128,92 +229,10 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
     eprintln!("real MASQUE transport session established");
 
     #[cfg(feature = "socks5-proxy")]
-    {
-        let server = SocksServer::bind(
-            SocksConfig {
-                bind: "127.0.0.1:0".parse()?,
-                username: None,
-                password: None,
-                max_connections: 4,
-                handshake_timeout: Duration::from_secs(10),
-            },
-            Arc::clone(&l4),
-        )
-        .await?;
-        let mut client = TcpStream::connect(server.local_addr()).await?;
-        client.write_all(&[5, 1, 0]).await?;
-        let mut greeting = [0_u8; 2];
-        timeout(DEADLINE, client.read_exact(&mut greeting)).await??;
-        ensure!(greeting == [5, 0], "SOCKS5 no-auth greeting refused");
-        let mut command = vec![5, 1, 0];
-        match observer.ip() {
-            std::net::IpAddr::V4(ip) => {
-                command.push(1);
-                command.extend_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => {
-                command.push(4);
-                command.extend_from_slice(&ip.octets());
-            }
-        }
-        command.extend_from_slice(&observer.port().to_be_bytes());
-        client.write_all(&command).await?;
-        let mut response = [0_u8; 10];
-        timeout(DEADLINE, client.read_exact(&mut response)).await??;
-        ensure!(
-            response[..2] == [5, 0],
-            "SOCKS5 CONNECT failed: {response:?}"
-        );
-        eprintln!("SOCKS5 CONNECT accepted over real MASQUE transport");
-        client
-            .write_all(b"GET /ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n")
-            .await?;
-        let exit_ip = observer_reply(&mut client)
-            .await
-            .context("SOCKS5 observer response over real MASQUE stalled")?;
-        eprintln!("real MASQUE SOCKS5 observer exit: {exit_ip}");
-        if let Some(baseline_ip) = direct_ip {
-            ensure!(
-                exit_ip != baseline_ip,
-                "SOCKS5 request did not exit through WARP"
-            );
-        }
-        server.shutdown().await?;
-    }
+    verify_socks5_egress(Arc::clone(&l4), observer, direct_ip).await?;
 
     #[cfg(feature = "http-proxy")]
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let local = listener.local_addr()?;
-        let task = tokio::spawn(http::serve_plain_on(
-            listener,
-            HttpConfig {
-                bind: local,
-                username: None,
-                password: None,
-                max_connections: 4,
-                header_timeout: Duration::from_secs(10),
-            },
-            Arc::clone(&l4),
-        ));
-        let mut client = TcpStream::connect(local).await?;
-        let request = format!(
-            "GET http://{observer}/ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n"
-        );
-        client.write_all(request.as_bytes()).await?;
-        eprintln!("HTTP forward request sent over real MASQUE transport");
-        let exit_ip = observer_reply(&mut client)
-            .await
-            .context("HTTP proxy observer response over real MASQUE stalled")?;
-        eprintln!("real MASQUE HTTP observer exit: {exit_ip}");
-        if let Some(baseline_ip) = direct_ip {
-            ensure!(
-                exit_ip != baseline_ip,
-                "HTTP request did not exit through WARP"
-            );
-        }
-        task.abort();
-    }
+    verify_http_egress(Arc::clone(&l4), observer, direct_ip).await?;
 
     Ok(())
 }
