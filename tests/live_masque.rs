@@ -198,8 +198,13 @@ async fn verify_http_egress(
 }
 
 #[tokio::test]
-#[ignore = "requires a real enrolled WARP identity, routable source IP and operator-controlled observer"]
+#[ignore = "requires an enrolled WARP identity, assigned source IP and controlled observer"]
 async fn real_masque_socks_and_http_egress() -> Result<()> {
+    if env::var_os("RUST_LOG").is_some() {
+        // Keep normal ignored-test output concise; opt in to L4/HTTP debug
+        // logs when diagnosing an actual external-network failure.
+        let _ = env_logger::try_init();
+    }
     let config_path = env::var_os("USQUE_LIVE_CONFIG").context("set USQUE_LIVE_CONFIG")?;
     let source_ip: IpAddr = env::var("USQUE_LIVE_SOURCE_IP")
         .context("set USQUE_LIVE_SOURCE_IP")?
