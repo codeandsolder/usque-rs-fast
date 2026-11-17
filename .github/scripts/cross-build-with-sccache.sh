@@ -35,4 +35,10 @@ export SCCACHE_NO_AUTO_START_SERVER=1
 if [[ "$target" == "x86_64-unknown-linux-musl" ]]; then
     export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-fno-var-tracking-assignments"
 fi
-cross build --release --target "$target"
+# An explicit feature set is useful when staging a full proxy release.
+# Default release behavior remains unchanged when unset.
+build_args=(--release --locked --target "$target")
+if [[ -n "${USQUE_BUILD_FEATURES:-}" ]]; then
+    build_args+=(--features "$USQUE_BUILD_FEATURES")
+fi
+cross build "${build_args[@]}"
