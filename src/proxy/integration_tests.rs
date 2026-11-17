@@ -425,3 +425,267 @@ async fn https_proxy_tls_connect_and_relay_over_real_socket() -> Result<()> {
     server.abort();
     Ok(())
 }
+
+#[cfg(feature = "socks5-proxy")]
+#[tokio::test]
+async fn socks5_half_close_drains_response_after_request_eof() -> Result<()> {
+    let origin = TcpListener::bind(LOOPBACK).await?;
+    let origin_addr = origin.local_addr()?;
+    let origin_task = tokio::spawn(async move {
+        let (mut peer, _) = timeout(DEADLINE, origin.accept()).await??;
+        let mut request = Vec::new();
+        timeout(DEADLINE, peer.read_to_end(&mut request)).await??;
+        ensure!(request == b"request-before-eof", "lost SOCKS relay request");
+        peer.write_all(b"response-after-eof").await?;
+        peer.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let server = super::socks::SocksServer::bind(socks_config(None, None), test_l4()?).await?;
+    let mut client = TcpStream::connect(server.local_addr()).await?;
+    ensure!(socks_auth(&mut client, None).await?);
+    ensure!(socks_request(&mut client, 1, "origin.test", origin_addr.port()).await? == 0);
+    client.write_all(b"request-before-eof").await?;
+    client.shutdown().await?;
+    let mut response = Vec::new();
+    timeout(DEADLINE, client.read_to_end(&mut response)).await??;
+    ensure!(
+        response == b"response-after-eof",
+        "lost response after half-close"
+    );
+    timeout(DEADLINE, origin_task).await???;
+    server.shutdown().await
+}
+
+#[cfg(feature = "socks5-proxy")]
+#[tokio::test]
+async fn socks5_concurrent_tunnels_transfer_distinct_payloads() -> Result<()> {
+    const CONNECTIONS: usize = 12;
+    const PAYLOAD_BYTES: usize = 16384;
+    let origin = TcpListener::bind(LOOPBACK).await?;
+    let origin_addr = origin.local_addr()?;
+    let origin_task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        for _ in 0..CONNECTIONS {
+            let (mut peer, _) = timeout(DEADLINE, origin.accept()).await??;
+            connections.spawn(async move {
+                let (mut reader, mut writer) = peer.split();
+                timeout(DEADLINE, tokio::io::copy(&mut reader, &mut writer)).await??;
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        while let Some(result) = connections.join_next().await {
+            result??;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let mut config = socks_config(None, None);
+    config.max_connections = CONNECTIONS + 2;
+    let server = super::socks::SocksServer::bind(config, test_l4()?).await?;
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..CONNECTIONS {
+        let proxy = server.local_addr();
+        tasks.spawn(async move {
+            let mut client = TcpStream::connect(proxy).await?;
+            ensure!(socks_auth(&mut client, None).await?);
+            ensure!(socks_request(&mut client, 1, "origin.test", origin_addr.port()).await? == 0);
+            let byte = u8::try_from(index)?;
+            let payload = vec![byte; PAYLOAD_BYTES];
+            client.write_all(&payload).await?;
+            let mut echoed = vec![0_u8; PAYLOAD_BYTES];
+            timeout(DEADLINE, client.read_exact(&mut echoed)).await??;
+            ensure!(
+                echoed == payload,
+                "cross-talk or data corruption in tunnel {index}"
+            );
+            Ok::<_, anyhow::Error>(())
+        });
+    }
+    timeout(DEADLINE * 3, async {
+        while let Some(result) = tasks.join_next().await {
+            result??;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    server.shutdown().await?;
+    timeout(DEADLINE, origin_task).await???;
+    Ok(())
+}
+
+#[cfg(feature = "socks5-proxy")]
+#[tokio::test]
+async fn socks5_ipv6_listener_and_target_round_trip() -> Result<()> {
+    use std::io::ErrorKind;
+    let origin = match TcpListener::bind("[::1]:0").await {
+        Ok(listener) => listener,
+        // IPv6 loopback can be unavailable in constrained network namespaces.
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::AddrNotAvailable | ErrorKind::Unsupported
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let origin_addr = origin.local_addr()?;
+    let origin_task = tokio::spawn(async move {
+        let (mut peer, _) = timeout(DEADLINE, origin.accept()).await??;
+        let (mut reader, mut writer) = peer.split();
+        timeout(DEADLINE, tokio::io::copy(&mut reader, &mut writer)).await??;
+        Ok::<_, anyhow::Error>(())
+    });
+    let mut config = socks_config(None, None);
+    config.bind = "[::1]:0".parse()?;
+    let server = super::socks::SocksServer::bind(config, test_l4()?).await?;
+    let mut client = TcpStream::connect(server.local_addr()).await?;
+    ensure!(socks_auth(&mut client, None).await?);
+    let mut frame = vec![5, 1, 0, 4];
+    frame.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+    frame.extend_from_slice(&origin_addr.port().to_be_bytes());
+    client.write_all(&frame).await?;
+    let mut response = [0_u8; 10];
+    timeout(DEADLINE, client.read_exact(&mut response)).await??;
+    ensure!(response[..2] == [5, 0], "SOCKS5 IPv6 CONNECT rejected");
+    client.write_all(b"ipv6-via-masque").await?;
+    let mut received = [0_u8; 15];
+    timeout(DEADLINE, client.read_exact(&mut received)).await??;
+    ensure!(&received == b"ipv6-via-masque");
+    drop(client);
+    server.shutdown().await?;
+    timeout(DEADLINE, origin_task).await???;
+    Ok(())
+}
+
+#[cfg(feature = "http-proxy")]
+#[tokio::test]
+async fn http_keepalive_reuses_client_connection_for_multiple_requests() -> Result<()> {
+    let origin = TcpListener::bind(LOOPBACK).await?;
+    let origin_addr = origin.local_addr()?;
+    let origin_task = tokio::spawn(async move {
+        for index in 0..3 {
+            let (mut upstream, _) = timeout(DEADLINE, origin.accept()).await??;
+            let request = read_headers(&mut upstream).await?;
+            ensure!(
+                request.starts_with(&format!("GET /resource/{index} HTTP/1.1\r\n")),
+                "wrong upstream request {index}: {request}"
+            );
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{:04}",
+                index
+            );
+            upstream.write_all(reply.as_bytes()).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (addr, task) = http_server(http_config(None, None)?).await?;
+    let mut client = TcpStream::connect(addr).await?;
+    for index in 0..3 {
+        let request = format!(
+            "GET http://127.0.0.1:{}/resource/{index} HTTP/1.1\r\nHost: wrong.invalid\r\n\r\n",
+            origin_addr.port()
+        );
+        client.write_all(request.as_bytes()).await?;
+        let headers = read_headers(&mut client).await?;
+        ensure!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+        let mut body = [0_u8; 4];
+        timeout(DEADLINE, client.read_exact(&mut body)).await??;
+        ensure!(body == format!("{index:04}").as_bytes());
+    }
+    drop(client);
+    timeout(DEADLINE, origin_task).await???;
+    task.abort();
+    Ok(())
+}
+
+#[cfg(feature = "http-proxy")]
+#[tokio::test]
+async fn http_chunked_post_and_chunked_response_stream_without_corruption() -> Result<()> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::{Request, Response, server::conn::http1 as server_http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+
+    const CHUNKS: usize = 16;
+    const CHUNK_BYTES: usize = 4096;
+    let origin = TcpListener::bind(LOOPBACK).await?;
+    let origin_addr = origin.local_addr()?;
+    let origin_task = tokio::spawn(async move {
+        let (peer, _) = timeout(DEADLINE, origin.accept()).await??;
+        let service = service_fn(|request: Request<hyper::body::Incoming>| async move {
+            let result = async {
+                ensure!(request.method() == hyper::Method::POST);
+                ensure!(request.uri().path() == "/stream");
+                let payload = request.into_body().collect().await?.to_bytes();
+                ensure!(
+                    payload.len() == CHUNKS * CHUNK_BYTES,
+                    "request body truncated"
+                );
+                for (index, chunk) in payload.chunks_exact(CHUNK_BYTES).enumerate() {
+                    let expected = u8::try_from(index)?;
+                    ensure!(
+                        chunk.iter().all(|byte| *byte == expected),
+                        "chunk contents changed"
+                    );
+                }
+                Ok::<_, anyhow::Error>(Response::new(Full::new(Bytes::from_static(
+                    b"chunked-stream-ok",
+                ))))
+            }
+            .await;
+            // An explicit 500 preserves a descriptive failure in the origin
+            // task's output instead of silently terminating the TCP socket.
+            Ok::<_, std::convert::Infallible>(match result {
+                Ok(response) => response,
+                Err(error) => {
+                    let mut response = Response::new(Full::new(Bytes::from(error.to_string())));
+                    *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                    response
+                }
+            })
+        });
+        timeout(
+            DEADLINE,
+            server_http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(peer), service),
+        )
+        .await??;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (addr, task) = http_server(http_config(None, None)?).await?;
+    let mut client = TcpStream::connect(addr).await?;
+    let header = format!(
+        "POST http://127.0.0.1:{}/stream HTTP/1.1\r\nHost: ignored.invalid\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        origin_addr.port()
+    );
+    client.write_all(header.as_bytes()).await?;
+    for index in 0..CHUNKS {
+        client
+            .write_all(format!("{CHUNK_BYTES:x}\r\n").as_bytes())
+            .await?;
+        client
+            .write_all(&vec![u8::try_from(index)?; CHUNK_BYTES])
+            .await?;
+        client.write_all(b"\r\n").await?;
+        tokio::task::yield_now().await;
+    }
+    client.write_all(b"0\r\n\r\n").await?;
+    let headers = read_headers(&mut client).await?;
+    ensure!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    let mut received = Vec::new();
+    timeout(DEADLINE, client.read_to_end(&mut received)).await??;
+    ensure!(
+        received == b"chunked-stream-ok" || received.ends_with(b"chunked-stream-ok\r\n0\r\n\r\n"),
+        "unexpected response body: {received:?}"
+    );
+    drop(client);
+    timeout(DEADLINE, origin_task).await???;
+    task.abort();
+    Ok(())
+}
