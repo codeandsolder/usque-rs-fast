@@ -609,8 +609,12 @@ cargo +1.100.0 test --locked --no-default-features \
 The source IP and observer in this example are placeholders, not live
 endpoints. The test neither enrolls identities nor writes to the registration
 store; it only loads the specified private JSON and opens an L4 session. Use an
-observer you control because a test verifies the returned HTTP status, not a
-particular third-party website's content.
+observer you control because the test expects an IP address response body, not
+an arbitrary website. A short direct observer probe is diagnostic only:
+the observer may intentionally reject non-WARP requests. SOCKS5 and HTTP
+forwarding through the real MASQUE session must both succeed independently.
+The configured source IP must be assigned to the running host and match the
+chosen WARP endpoint address family.
 
 The crate denies unsafe code in the main lint configuration and applies strict
 correctness/style/performance/pedantic/nursery Clippy policy.

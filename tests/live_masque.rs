@@ -29,6 +29,7 @@ use usque_rs::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(40);
+const DIRECT_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Read the owned observer's complete Content-Length framed response.
 /// This avoids waiting for connection EOF on HTTP/1.1 proxy keep-alive.
@@ -86,7 +87,7 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
     // The owned observer may deliberately allow WARP egress but reject
     // unproxied hosts. An optional direct probe helps distinguish sources
     // without mistakenly failing the WARP acceptance when it is restricted.
-    let direct_ip = match timeout(DEADLINE, async {
+    let direct_ip = match timeout(DIRECT_PROBE_DEADLINE, async {
         let mut direct = TcpStream::connect(observer).await?;
         direct
             .write_all(b"GET /ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n")
