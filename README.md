@@ -590,6 +590,28 @@ and TLS listeners and relay traffic, replacing only the upstream MASQUE connecti
 with a test-only L4 loopback bridge. The old external-network smoke script was
 retired; its CLI commands no longer existed.
 
+Real WARP/MASQUE transport acceptance is deliberately **opt-in**: it requires
+a genuine enrolled identity and a reachable observer, and never runs during
+ordinary CI. A separate ignored integration test opens a real QUIC/H3 session,
+routes traffic through real SOCKS5 and HTTP proxy listeners, and verifies an
+HTTP 200 response from the observer. Run this only on a machine with valid WARP
+egress (prefer a private copy of a registration rather than a live pool store):
+
+```sh
+USQUE_LIVE_CONFIG=/private/test-registration.json \
+USQUE_LIVE_SOURCE_IP=2001:db8::1234 \
+USQUE_LIVE_OBSERVER_ADDR=192.0.2.1:8080 \
+cargo +1.100.0 test --locked --no-default-features \
+  --features socks5-proxy,http-proxy --test live_masque \
+  -- --ignored --exact real_masque_socks_and_http_egress
+```
+
+The source IP and observer in this example are placeholders, not live
+endpoints. The test neither enrolls identities nor writes to the registration
+store; it only loads the specified private JSON and opens an L4 session. Use an
+observer you control because a test verifies the returned HTTP status, not a
+particular third-party website's content.
+
 The crate denies unsafe code in the main lint configuration and applies strict
 correctness/style/performance/pedantic/nursery Clippy policy.
 
