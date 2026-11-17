@@ -425,10 +425,6 @@ usque-rs proxy --http 127.0.0.1:8000 \
 These limits apply separately to each HTTP and HTTPS listener. Established
 forwarding requests and CONNECT relays are not subject to the header deadline.
 
-**Unlike `--socks5-no-auth`, HTTP/HTTPS listeners do not currently restrict the bind
-address when authentication is absent. Do not expose an unauthenticated HTTP proxy on
-an untrusted interface.**
-
 ## Native TUN architecture
 
 The native path remains a CONNECT-IP dataplane:

@@ -33,6 +33,18 @@
       "platformAutomerge": true,
       "automerge": true,
       "automergeType": "pr"
+    },
+    {
+      "description": "quiche/octets/datagram-socket are maintained from one SHA-pinned quiche-fast git fork; registry-version cargo update cannot resolve a git ref named after the crate release",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDepNames": [
+        "quiche",
+        "octets",
+        "datagram-socket"
+      ],
+      "enabled": false
     }
   ],
   "forkProcessing": "enabled"
