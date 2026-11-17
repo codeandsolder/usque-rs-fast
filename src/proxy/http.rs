@@ -443,13 +443,6 @@ fn parse_authority(
     authority: &str,
     default_port: Option<u16>,
 ) -> Result<(String, u16), &'static str> {
-    if let Ok(address) = authority.parse::<SocketAddr>() {
-        if address.port() == 0 {
-            return Err("proxy target port must be nonzero");
-        }
-        return Ok((address.ip().to_string(), address.port()));
-    }
-
     // Brackets are exclusively for IP literals. This transport supports IPv6,
     // not IPvFuture, so validate rather than treating [hostname] as DNS.
     if let Some(stripped) = authority.strip_prefix('[') {
@@ -847,7 +840,10 @@ mod tests {
             "[::1",
             "example.com:0",
             "127.0.0.1:0",
+            "127.0.0.1:+80",
+            "127.0.0.1:-1",
             "[::1]:0",
+            "[::1]:+80",
             "example.com:+80",
             "example.com:80extra",
             "example.com:-1",
@@ -866,6 +862,10 @@ mod tests {
         assert!(parse_authority("example.com", None).is_err());
         assert!(parse_authority("[::1]", None).is_err());
         assert!(parse_authority("example.com:443", None).is_ok());
+        assert_eq!(
+            parse_authority("127.0.0.1:443", None),
+            Ok(("127.0.0.1".to_owned(), 443))
+        );
         assert!(parse_authority("[::1]:443", None).is_ok());
     }
 
