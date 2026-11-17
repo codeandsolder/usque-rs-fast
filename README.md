@@ -613,6 +613,8 @@ observer you control because the test expects an IP address response body, not
 an arbitrary website. A short direct observer probe is diagnostic only:
 the observer may intentionally reject non-WARP requests. SOCKS5 and HTTP
 forwarding through the real MASQUE session must both succeed independently.
+Set `USQUE_LIVE_ITERATIONS=10` to repeat both frontends over one shared QUIC/H3
+session, exercising sequential CONNECT stream reuse; the default is one pass.
 The configured source IP must be assigned to the running host and match the
 chosen WARP endpoint address family.
 

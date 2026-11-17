@@ -9,6 +9,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     env,
     net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
@@ -214,6 +215,11 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
         .parse()
         .context("observer must be a literal SocketAddr")?;
     ensure!(observer.port() != 0, "observer must have a nonzero port");
+    let iterations = match env::var("USQUE_LIVE_ITERATIONS") {
+        Ok(value) => value.parse::<NonZeroUsize>()?.get(),
+        Err(env::VarError::NotPresent) => 1,
+        Err(error) => return Err(error.into()),
+    };
     let direct_ip = direct_observer_baseline(observer).await;
 
     let config = Config::load(config_path)?;
@@ -233,11 +239,15 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
     .context("timed out connecting real WARP MASQUE session")??;
     eprintln!("real MASQUE transport session established");
 
-    #[cfg(feature = "socks5-proxy")]
-    verify_socks5_egress(Arc::clone(&l4), observer, direct_ip).await?;
+    for iteration in 0..iterations {
+        eprintln!("real MASQUE pass {}/{iterations}", iteration + 1);
 
-    #[cfg(feature = "http-proxy")]
-    verify_http_egress(Arc::clone(&l4), observer, direct_ip).await?;
+        #[cfg(feature = "socks5-proxy")]
+        verify_socks5_egress(Arc::clone(&l4), observer, direct_ip).await?;
+
+        #[cfg(feature = "http-proxy")]
+        verify_http_egress(Arc::clone(&l4), observer, direct_ip).await?;
+    }
 
     Ok(())
 }
