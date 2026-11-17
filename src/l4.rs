@@ -209,6 +209,69 @@ struct Session {
     streams: HashMap<u64, StreamState>,
 }
 
+#[cfg(test)]
+impl L4Client {
+    /// Exercise real proxy sockets and the real L4 dial API without an outer
+    /// Cloudflare connection. Only test loopback targets can be reached.
+    pub(crate) fn loopback_test_client(hosts: &[(&str, IpAddr)]) -> io::Result<Arc<Self>> {
+        let (command_tx, mut commands) = mpsc::channel(COMMAND_QUEUE);
+        let cache = Arc::new(dns::Cache::new(DEFAULT_DNS_CACHE_ENTRIES));
+        for &(name, address) in hosts {
+            cache.insert(
+                &dns::canonical_ascii_name(name)?,
+                address,
+                Duration::from_secs(600),
+            )?;
+        }
+        let client = Arc::new(Self {
+            command_tx,
+            dns_servers: Arc::new(Vec::new()),
+            dns_cache: cache,
+        });
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let Command::Open { authority, reply } = command {
+                    tokio::spawn(async move {
+                        let address = authority
+                            .parse::<SocketAddr>()
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+                            .and_then(|address| {
+                                if address.ip().is_loopback() {
+                                    Ok(address)
+                                } else {
+                                    Err(io::Error::new(
+                                        io::ErrorKind::PermissionDenied,
+                                        "loopback test driver forbids external destinations",
+                                    ))
+                                }
+                            });
+                        let remote = match address {
+                            Ok(address) => tokio::net::TcpStream::connect(address).await,
+                            Err(error) => Err(error),
+                        };
+                        match remote {
+                            Ok(mut remote) => {
+                                let (client, mut bridge) = tokio::io::duplex(STREAM_BRIDGE_BYTES);
+                                if reply.send(Ok(client)).is_ok() {
+                                    tokio::spawn(async move {
+                                        let _ignored =
+                                            tokio::io::copy_bidirectional(&mut bridge, &mut remote)
+                                                .await;
+                                    });
+                                }
+                            }
+                            Err(error) => {
+                                let _ignored = reply.send(Err(error));
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        Ok(client)
+    }
+}
+
 impl L4Client {
     /// Establish the shared outer HTTP/3 connection used by direct L4 proxy streams.
     ///
