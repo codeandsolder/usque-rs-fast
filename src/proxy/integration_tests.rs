@@ -69,7 +69,7 @@ fn socks_config(username: Option<&str>, password: Option<&str>) -> super::socks:
         username: username.map(str::to_owned),
         password: password.map(str::to_owned),
         max_connections: 2,
-        handshake_timeout: Duration::from_millis(250),
+        handshake_timeout: Duration::from_secs(3),
     }
 }
 
@@ -201,7 +201,7 @@ fn http_config(username: Option<&str>, password: Option<&str>) -> Result<HttpCon
         username: username.map(str::to_owned),
         password: password.map(str::to_owned),
         max_connections: 2,
-        header_timeout: Duration::from_millis(200),
+        header_timeout: Duration::from_secs(3),
     })
 }
 
@@ -260,7 +260,9 @@ async fn http_forward_real_socket_strips_hop_by_hop_headers() -> Result<()> {
 #[cfg(feature = "http-proxy")]
 #[tokio::test]
 async fn http_auth_rejection_and_header_deadline_over_tcp() -> Result<()> {
-    let (addr, task) = http_server(http_config(Some("alice"), Some("secret"))?).await?;
+    let mut config = http_config(Some("alice"), Some("secret"))?;
+    config.header_timeout = Duration::from_millis(150);
+    let (addr, task) = http_server(config).await?;
     let mut wrong = TcpStream::connect(addr).await?;
     wrong.write_all(b"GET http://127.0.0.1:1/ HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: Bearer invalid\r\n\r\n").await?;
     let response = read_headers(&mut wrong).await?;
