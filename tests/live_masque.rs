@@ -138,8 +138,8 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
         client
             .write_all(b"GET /ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n")
             .await?;
-        let observed = observer_reply(&mut client).await?;
-        eprintln!("real MASQUE SOCKS5 observer exit: {observed}");
+        let exit_ip = observer_reply(&mut client).await?;
+        eprintln!("real MASQUE SOCKS5 observer exit: {exit_ip}");
         server.shutdown().await?;
     }
 
@@ -163,8 +163,8 @@ async fn real_masque_socks_and_http_egress() -> Result<()> {
             "GET http://{observer}/ip HTTP/1.1\r\nHost: observer\r\nConnection: close\r\n\r\n"
         );
         client.write_all(request.as_bytes()).await?;
-        let observed = observer_reply(&mut client).await?;
-        eprintln!("real MASQUE HTTP observer exit: {observed}");
+        let exit_ip = observer_reply(&mut client).await?;
+        eprintln!("real MASQUE HTTP observer exit: {exit_ip}");
         task.abort();
     }
 
