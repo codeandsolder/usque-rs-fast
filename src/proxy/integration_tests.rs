@@ -574,8 +574,7 @@ async fn http_keepalive_reuses_client_connection_for_multiple_requests() -> Resu
                 "wrong upstream request {index}: {request}"
             );
             let reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{:04}",
-                index
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{index:04}"
             );
             upstream.write_all(reply.as_bytes()).await?;
         }
@@ -625,7 +624,7 @@ async fn http_chunked_post_and_chunked_response_stream_without_corruption() -> R
                     payload.len() == CHUNKS * CHUNK_BYTES,
                     "request body truncated"
                 );
-                for (index, chunk) in payload.chunks_exact(CHUNK_BYTES).enumerate() {
+                for (index, chunk) in payload.as_chunks::<CHUNK_BYTES>().0.iter().enumerate() {
                     let expected = u8::try_from(index)?;
                     ensure!(
                         chunk.iter().all(|byte| *byte == expected),
