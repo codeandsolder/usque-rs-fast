@@ -56,10 +56,6 @@ impl HttpConfig {
             }
             (Some(username), Some(password)) => {
                 anyhow::ensure!(
-                    !username.is_empty() && !password.is_empty(),
-                    "HTTP Basic username and password must be nonempty"
-                );
-                anyhow::ensure!(
                     !username.contains(':'),
                     "HTTP Basic username cannot contain ':'"
                 );
@@ -271,16 +267,16 @@ async fn handle(
     expected_auth: Option<&str>,
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Response<ProxyBody> {
-    if let Some(expected) = expected_auth {
-        if !matches_basic_proxy_auth(request.headers(), expected) {
-            let mut response =
-                response_with_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED, empty_body());
-            response.headers_mut().insert(
-                PROXY_AUTHENTICATE,
-                HeaderValue::from_static("Basic realm=\"usque-rs\""),
-            );
-            return response;
-        }
+    if let Some(expected) = expected_auth
+        && !matches_basic_proxy_auth(request.headers(), expected)
+    {
+        let mut response =
+            response_with_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED, empty_body());
+        response.headers_mut().insert(
+            PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"usque-rs\""),
+        );
+        return response;
     }
 
     if request.method() == Method::CONNECT {
@@ -694,17 +690,25 @@ mod tests {
             header_timeout: Duration::from_secs(5),
         };
         assert!(config.validate(config.bind).is_ok());
-        for username in ["", "alice:admin", "alice\radmin", "alice\tadmin"] {
+        for username in ["alice:admin", "alice\radmin", "alice\tadmin"] {
             config.username = Some(username.to_owned());
             assert!(config.validate(config.bind).is_err(), "{username:?}");
         }
         config.username = Some("alice".to_owned());
-        for password in ["", "secret\nnext", "secret\u{007f}"] {
+        for password in ["secret\nnext", "secret\u{007f}"] {
             config.password = Some(password.to_owned());
             assert!(config.validate(config.bind).is_err(), "{password:?}");
         }
         config.password = Some("a:valid:password".to_owned());
         assert!(config.validate(config.bind).is_ok());
+        // RFC 7617 permits empty username and/or password fields.
+        config.username = Some(String::new());
+        assert!(config.validate(config.bind).is_ok());
+        config.password = Some(String::new());
+        assert!(config.validate(config.bind).is_ok());
+        let token = expected_basic_token(&config)
+            .and_then(|token| token.ok_or_else(|| anyhow::anyhow!("expected Basic token")));
+        assert!(matches!(token, Ok(ref value) if value.as_ref() == "Og=="));
     }
 
     #[tokio::test]

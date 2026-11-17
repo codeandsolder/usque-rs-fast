@@ -702,10 +702,6 @@ fn resolve_proxy_auth(options: &ProxyArgs) -> Result<(Option<String>, Option<Str
         .trim_end_matches(['\r', '\n'])
         .split_once(':')
         .context("proxy auth file must contain username:password")?;
-    anyhow::ensure!(
-        !username.is_empty() && !password.is_empty(),
-        "proxy auth file username/password must be non-empty"
-    );
     Ok((Some(username.to_owned()), Some(password.to_owned())))
 }
 
@@ -971,6 +967,14 @@ mod tests {
         let (username, password) = resolve_proxy_auth(&options)?;
         assert_eq!(username.as_deref(), Some(" alice"));
         assert_eq!(password.as_deref(), Some(" secret password  "));
+        std::fs::write(&path, ":empty-username-is-valid\n")?;
+        let (username, password) = resolve_proxy_auth(&options)?;
+        assert_eq!(username.as_deref(), Some(""));
+        assert_eq!(password.as_deref(), Some("empty-username-is-valid"));
+        std::fs::write(&path, "empty-password-is-valid:")?;
+        let (username, password) = resolve_proxy_auth(&options)?;
+        assert_eq!(username.as_deref(), Some("empty-password-is-valid"));
+        assert_eq!(password.as_deref(), Some(""));
         Ok(())
     }
 
