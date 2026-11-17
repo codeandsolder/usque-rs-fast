@@ -1,10 +1,7 @@
 //! Real, opt-in MASQUE acceptance test against an operator-controlled HTTP observer.
 //!
-//! Intentionally ignored by default: CI's offline socket suite remains entirely
-//! deterministic. Set USQUE_LIVE_CONFIG, USQUE_LIVE_SOURCE_IP and
-//! USQUE_LIVE_OBSERVER_ADDR, then run:
-//! cargo +1.100.0 test --locked --no-default-features --features socks5-proxy,http-proxy
-//!   --test live_masque -- --ignored --exact real_masque_socks_and_http_egress
+//! This test is ignored by default to keep routine CI deterministic and offline.
+//! Refer to the README live acceptance section for its configuration and command.
 
 #![cfg(any(feature = "socks5-proxy", feature = "http-proxy"))]
 
