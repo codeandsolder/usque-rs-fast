@@ -418,7 +418,7 @@ dependencies = [
 [[package]]
 name = "fast-socks5"
 version = "2.0.0"
-source = "git+https://github.com/codeandsolder/fast-socks5-fast?rev=6873f3066e6970ab3e1cdc982d592ab74d167fa5#6873f3066e6970ab3e1cdc982d592ab74d167fa5"
+source = "git+https://github.com/codeandsolder/fast-socks5-fast?rev=583d2b26bcb156b87cd1b6bb475acb4e84a1390a#583d2b26bcb156b87cd1b6bb475acb4e84a1390a"
 dependencies = [
  "log",
  "thiserror",
