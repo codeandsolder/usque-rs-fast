@@ -25,32 +25,16 @@ jobs:
           set -euo pipefail
 
           curl -fsSL https://static.rust-lang.org/dist/channel-rust-stable.toml -o /tmp/rust-stable.toml
-          read -r VERSION RELEASE_DATE ELIGIBLE < <(python3 - <<'PY'
-          import datetime as dt
+          read -r VERSION RELEASE_DATE < <(python3 - <<'PY'
           import tomllib
           with open("/tmp/rust-stable.toml", "rb") as f:
               data = tomllib.load(f)
-          version = data["pkg"]["rust"]["version"].split()[0]
-          release_date = dt.date.fromisoformat(data["date"])
-          # The manifest has date precision only. Waiting until UTC midnight
-          # four dates later guarantees at least 72 hours even if publication
-          # happened at the very end of the release date.
-          eligible_at = dt.datetime.combine(
-              release_date + dt.timedelta(days=4),
-              dt.time.min,
-              tzinfo=dt.timezone.utc,
-          )
-          eligible = dt.datetime.now(dt.timezone.utc) >= eligible_at
-          print(version, release_date.isoformat(), "yes" if eligible else "no")
+          print(data["pkg"]["rust"]["version"].split()[0], data["date"])
           PY
           )
 
           test -n "$VERSION"
           echo "Current stable Rust: $VERSION (release date $RELEASE_DATE)"
-          if [[ "$ELIGIBLE" != "yes" ]]; then
-            echo "Rust $VERSION is still inside the 72-hour release quarantine"
-            exit 0
-          fi
 
           gh label create "automation:rust-release" --repo "$REPO" --color "8250df" --description "Queued automatically when stable Rust changes" --force
 
@@ -99,9 +83,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           gh label create "automation:upstream" --repo "$REPO" --color "0e8a16" --description "Upstream fork changes queued automatically" --force
-          gh label create "automation:quarantine" --repo "$REPO" --color "6e7781" --description "Candidate observed but not yet old enough to act on" --force
 
-      - name: Detect and mechanically quarantine upstream drift
+      - name: Queue upstream drift for review immediately
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -153,56 +136,24 @@ jobs:
             exit 0
           fi
 
-          state="$(gh issue list --repo "$REPO" --state open --label "automation:quarantine" --limit 100 --search "$marker $fpmarker in:body" --json number,createdAt --jq '.[0] // empty')"
-
-          if [[ -z "$state" ]]; then
-            gh issue list --repo "$REPO" --state open --limit 100 --search "$marker in:body" --json number --jq '.[].number' |
-            while read -r number; do
-              [[ -n "$number" ]] && gh issue close "$number" --repo "$REPO" --reason completed --comment "Candidate changed before the 72-hour quarantine expired."
-            done
-
-            {
-              echo "<!-- $marker -->"
-              echo "<!-- $fpmarker -->"
-              echo
-              echo "This exact upstream candidate is in the 72-hour mechanical quarantine."
-              echo "A changed upstream patch set restarts the timer."
-              echo
-              cat /tmp/upstream-details.txt
-              echo
-              echo "This is detector state, not maintenance work."
-            } >/tmp/upstream-quarantine.md
-
-            gh issue create --repo "$REPO" --title "quarantine: upstream" --label "automation:quarantine" --body-file /tmp/upstream-quarantine.md
-            echo "First sighting; upstream candidate quarantined."
-            exit 0
-          fi
-
-          created="$(jq -r '.createdAt' <<<"$state")"
-          eligible="$(python3 - "$created" <<'PY'
-          import datetime as dt, sys
-          created=dt.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00"))
-          print("yes" if dt.datetime.now(dt.timezone.utc)-created >= dt.timedelta(hours=72) else "no")
-          PY
-          )"
-
-          if [[ "$eligible" != "yes" ]]; then
-            echo "Upstream candidate is still inside the 72-hour quarantine."
-            exit 0
-          fi
+          # Retire prior mechanically quarantined candidates and queue the
+          # current upstream fingerprint immediately, without an age delay.
+          gh issue list --repo "$REPO" --state open --label "automation:quarantine" --limit 100 --search "$marker in:body" --json number --jq '.[].number' |
+          while read -r number; do
+            [[ -n "$number" ]] && gh issue close "$number" --repo "$REPO" --reason completed --comment "Release-age quarantine retired; current upstream drift is queued for review."
+          done
 
           {
             echo "<!-- $marker -->"
             echo "<!-- $fpmarker -->"
             echo "<!-- automation-queue:upstream -->"
             echo
-            echo "This exact upstream patch set remained unchanged for at least 72 hours:"
+            echo "Current upstream patch-equivalent changes available for immediate review:"
             echo
             cat /tmp/upstream-details.txt
             echo
             echo "Review and port relevant changes; skip changes that conflict with intentional fork behavior and explain omissions."
             echo "Preserve the fork's 1 KiB buffers and x86-64-v2/v3/znver1/znver2 release targets unless an upstream change specifically justifies altering them."
-            echo "Do not include newer upstream commits that have not passed their own detector quarantine."
           } >/tmp/upstream-actionable.md
 
           actionable="$(gh issue list --repo "$REPO" --state open --label "automation:upstream" --limit 100 --search "$marker in:body" --json number --jq '.[0].number // empty')"

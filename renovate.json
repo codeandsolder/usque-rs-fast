@@ -24,17 +24,6 @@
       "enabled": false
     },
     {
-      "description": "Cargo lockfile maintenance ages a fixed snapshot before merge",
-      "matchUpdateTypes": [
-        "lockFileMaintenance"
-      ],
-      "minimumReleaseAge": null,
-      "rebaseWhen": "never",
-      "platformAutomerge": true,
-      "automerge": true,
-      "automergeType": "pr"
-    },
-    {
       "description": "quiche/octets/datagram-socket are maintained from one SHA-pinned quiche-fast git fork; registry-version cargo update cannot resolve a git ref named after the crate release",
       "matchManagers": [
         "cargo"
