@@ -6,7 +6,7 @@ pub mod socks;
 use std::net::IpAddr;
 
 /// Whether an address is permitted for an explicitly unauthenticated proxy listener.
-#[must_use]
+#[must_use = "the returned decision must be checked before allowing an unauthenticated bind"]
 pub fn safe_no_auth_bind(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {

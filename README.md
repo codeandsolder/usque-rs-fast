@@ -608,7 +608,7 @@ egress (prefer a private copy of a registration rather than a live pool store):
 USQUE_LIVE_CONFIG=/private/test-registration.json \
 USQUE_LIVE_SOURCE_IP=2001:db8::1234 \
 USQUE_LIVE_OBSERVER_ADDR=192.0.2.1:8080 \
-cargo +1.100.0 test --locked --no-default-features \
+cargo test --locked --no-default-features \
   --features socks5-proxy,http-proxy --test live_masque \
   -- --ignored --exact real_masque_socks_and_http_egress
 ```

@@ -66,25 +66,28 @@ jobs:
           # mipsel = little-endian (MIPS24Kc etc.); big-endian mips and
           # mips64el are excluded: BoringSSL doesn't support those processors
           # (at least I couldn't get it working).
-          # rust-std was removed from stable for MIPS; nightly + build-std used.
+          # MIPS rust-std is built from the native pinned nightly's sources.
           - target: mipsel-unknown-linux-musl
             artifact_name: usque-rs-mipsel-linux-musl
-            toolchain: nightly
             # build-std only compiles std, not panic_abort; keep unwind for this target
             panic_strategy: unwind
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain$ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: ${{ matrix.toolchain || '1.100.0' }}
+          toolchain: "${{ steps.compiler.outputs.channel }}"
+          components: "${{ matrix.target == 'mipsel-unknown-linux-musl' && 'rust-src' || '' }}"
 
       - name: Setup mandatory shared sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@50c4dbb544f008f87ba479324b43a1bd807672bd # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: "${{ matrix.toolchain || '1.100.0' }}"
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
           # Scope the persisted cache by target/CPU. The setup input only
           # affects the cache identity; it does not set compiler RUSTFLAGS.
           rustflags: "cross:${{ matrix.target }}:${{ matrix.cpu_level || 'baseline' }}:${{ matrix.rustflags || '' }}"
@@ -143,4 +146,4 @@ jobs:
           fail_on_unmatched_files: true
       - name: Finalize mandatory shared sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@50c4dbb544f008f87ba479324b43a1bd807672bd # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main

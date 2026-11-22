@@ -113,13 +113,13 @@ impl SocksServer {
     }
 
     /// Return the address currently used for new SOCKS connections.
-    #[must_use]
+    #[must_use = "the returned address identifies the bound proxy socket"]
     pub fn local_addr(&self) -> SocketAddr {
         *self.local_addr.borrow()
     }
 
     /// Return whether the listener task is still running.
-    #[must_use]
+    #[must_use = "the returned status indicates whether the proxy task is still running"]
     pub fn is_running(&self) -> bool {
         self.task.as_ref().is_some_and(|task| !task.is_finished())
     }

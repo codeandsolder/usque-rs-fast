@@ -24,14 +24,13 @@ env:
 
 jobs:
   current-linux:
-    name: Current Rust 1.100.0 Linux validation
+    name: Native nightly Linux validation
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.validation != 'cross-cache' }}
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@50c4dbb544f008f87ba479324b43a1bd807672bd # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
       runner: ubuntu-26.04
-      rust-toolchain: "1.100.0"
       rust-components: "rustfmt clippy"
       rustflags: "-C target-cpu=x86-64-v2"
       command: |
@@ -43,19 +42,17 @@ jobs:
         fi
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go perl pkg-config clang libclang-dev nasm
-        cargo +1.100.0 fmt --all --check
-        cargo +1.100.0 clippy --all-targets --all-features -- -D warnings
-        cargo +1.100.0 test --all-features
+        cargo test --all-features
         # Run genuine loopback SOCKS/HTTP/TLS wire tests even when features
         # are compiled independently. No registration or external network.
         for features in socks5-proxy http-proxy https-proxy http-proxy,https-proxy; do
-          cargo +1.100.0 test --locked --lib --no-default-features \
+          cargo test --locked --lib --no-default-features \
             --features "$features" proxy::integration_tests
         done
-        cargo +1.100.0 check --all-targets
-        cargo +1.100.0 check --all-targets --no-default-features
+        cargo check --all-targets
+        cargo check --all-targets --no-default-features
         for features in register tun http-proxy https-proxy socks5-proxy http-proxy,https-proxy,socks5-proxy; do
-          cargo +1.100.0 check --all-targets --no-default-features --features "$features"
+          cargo check --all-targets --no-default-features --features "$features"
         done
 
   cross-cache-smoke:
@@ -74,14 +71,17 @@ jobs:
       USQUE_BUILD_FEATURES: http-proxy,https-proxy
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: "1.100.0"
+          toolchain: "${{ steps.compiler.outputs.channel }}"
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@50c4dbb544f008f87ba479324b43a1bd807672bd # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: "1.100.0"
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
           rustflags: "cross:x86_64-unknown-linux-musl:baseline"
       - name: Install cross
         uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
@@ -123,7 +123,7 @@ jobs:
           retention-days: 7
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@50c4dbb544f008f87ba479324b43a1bd807672bd # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
 
   x86-codegen:
     name: x86 codegen / ${{ matrix.cpu }}
@@ -142,21 +142,24 @@ jobs:
             cmake ninja-build golang-go perl \
             pkg-config clang libclang-dev nasm
 
-      - name: Install Rust 1.100.0
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: 1.100.0
+          toolchain: "${{ steps.compiler.outputs.channel }}"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@50c4dbb544f008f87ba479324b43a1bd807672bd # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: "1.100.0"
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
           rustflags: "-C target-cpu=${{ matrix.cpu }}"
 
       - name: Check target CPU build
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
-        run: cargo +1.100.0 check --all-targets --all-features --target x86_64-unknown-linux-gnu
+        run: cargo check --all-targets --all-features --target x86_64-unknown-linux-gnu
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@50c4dbb544f008f87ba479324b43a1bd807672bd # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main

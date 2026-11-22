@@ -22,7 +22,7 @@ pub struct RegistrationStore {
 }
 
 impl RegistrationStore {
-    #[must_use]
+    #[must_use = "the returned registration store owns the configured registration path"]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }

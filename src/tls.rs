@@ -182,7 +182,7 @@ pub fn build_l4_quic_config(
 }
 
 /// Verify a peer's DER certificate against the pinned SPKI public key.
-#[must_use]
+#[must_use = "the returned verification decision must be checked before accepting the peer"]
 pub fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bool {
     let Ok(cert) = X509::from_der(peer_cert_der) else {
         log::warn!("failed to parse peer certificate for key pinning");
