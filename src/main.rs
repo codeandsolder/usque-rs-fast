@@ -155,28 +155,23 @@ struct NativeTunOptions {
 #[derive(Args)]
 struct TunWriteArgs {
     /// Target packet count for TUN output batching (1 disables retention).
-    #[arg(long, default_value_t = tunnel::TunWriteConfig::DEFAULT_PACKET_TARGET)]
-    tun_write_packets: usize,
+    #[arg(long = "tun-write-packets", default_value_t = tunnel::TunWriteConfig::DEFAULT_PACKET_TARGET)]
+    packets: usize,
     /// Maximum TUN write batching delay, in microseconds (1..=1000).
-    #[arg(long, default_value_t = tunnel::TunWriteConfig::DEFAULT_MAX_DELAY_US)]
-    tun_write_max_us: u64,
+    #[arg(long = "tun-write-max-us", default_value_t = tunnel::TunWriteConfig::DEFAULT_MAX_DELAY_US)]
+    max_us: u64,
     /// Adaptive batching activation window in microseconds (default: half the delay).
-    #[arg(long)]
-    tun_write_activation_us: Option<u64>,
+    #[arg(long = "tun-write-activation-us")]
+    activation_us: Option<u64>,
     /// Enable adaptive activation and deactivation of the configured batch size.
-    #[arg(long)]
-    tun_write_adaptive: bool,
+    #[arg(long = "tun-write-adaptive")]
+    adaptive: bool,
 }
 
 #[cfg(feature = "tun")]
 impl TunWriteArgs {
     fn into_config(self) -> Result<tunnel::TunWriteConfig> {
-        tunnel::TunWriteConfig::new(
-            self.tun_write_packets,
-            self.tun_write_max_us,
-            self.tun_write_activation_us,
-            self.tun_write_adaptive,
-        )
+        tunnel::TunWriteConfig::new(self.packets, self.max_us, self.activation_us, self.adaptive)
     }
 }
 
