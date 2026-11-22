@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use boring::{
+use btls::{
     asn1::Asn1Time,
     bn::BigNum,
     ec::EcKey,
@@ -117,7 +117,7 @@ fn build_ssl_context(tls_material: &TlsMaterial) -> Result<SslContextBuilder> {
 
 fn base_quic_config(tls_material: &TlsMaterial) -> Result<quiche::Config> {
     let ssl = build_ssl_context(tls_material)?;
-    let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)
+    let mut config = quiche::Config::with_btls_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)
         .map_err(|error| anyhow::anyhow!("quiche config: {error}"))?;
     config.verify_peer(false);
     config
@@ -202,7 +202,7 @@ pub fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boring::{ec::EcGroup, nid::Nid};
+    use btls::{ec::EcGroup, nid::Nid};
 
     #[test]
     fn accepts_legacy_sec1_private_key() -> Result<()> {

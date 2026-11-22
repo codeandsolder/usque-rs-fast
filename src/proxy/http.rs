@@ -154,7 +154,7 @@ pub async fn serve_tls_on(
     tls: HttpsConfig,
     l4: Arc<L4Client>,
 ) -> Result<()> {
-    use boring::ssl::{AlpnError, SslAcceptor, SslFiletype, SslMethod, select_next_proto};
+    use btls::ssl::{AlpnError, SslAcceptor, SslFiletype, SslMethod, select_next_proto};
 
     let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())?;
     builder.set_certificate_chain_file(&tls.certificate)?;
@@ -181,8 +181,13 @@ pub async fn serve_tls_on(
         let l4 = Arc::clone(&l4);
         let expected_auth = expected_auth.clone();
         tokio::spawn(async move {
-            match tokio::time::timeout(header_timeout, tokio_boring::accept(&acceptor, stream))
-                .await
+            match tokio::time::timeout(header_timeout, async {
+                let ssl = btls::ssl::Ssl::new(acceptor.context())?;
+                let mut stream = tokio_btls::SslStream::new(ssl, stream)?;
+                std::pin::Pin::new(&mut stream).accept().await?;
+                Ok::<_, anyhow::Error>(stream)
+            })
+            .await
             {
                 Ok(Ok(stream)) => {
                     serve_connection(stream, peer, l4, expected_auth, header_timeout, permit).await;

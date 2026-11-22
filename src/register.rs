@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use boring::{
+use btls::{
     ec::{EcGroup, EcKey},
     nid::Nid,
     pkey::PKey,
@@ -69,13 +69,13 @@ struct ApiResponse {
 
 fn random_wg_pubkey() -> Result<String> {
     let mut key = [0u8; 32];
-    boring::rand::rand_bytes(&mut key).context("RNG failure")?;
+    btls::rand::rand_bytes(&mut key).context("RNG failure")?;
     Ok(base64::engine::general_purpose::STANDARD.encode(key))
 }
 
 fn random_android_serial() -> Result<String> {
     let mut serial = [0u8; 8];
-    boring::rand::rand_bytes(&mut serial).context("RNG failure")?;
+    btls::rand::rand_bytes(&mut serial).context("RNG failure")?;
     Ok(format!("{:016x}", u64::from_be_bytes(serial)))
 }
 
@@ -93,8 +93,8 @@ fn cf_time_string() -> String {
     )
 }
 
-fn registration_tls_connector() -> Result<boring::ssl::SslConnector> {
-    use boring::ssl::{SslConnector, SslMethod};
+fn registration_tls_connector() -> Result<btls::ssl::SslConnector> {
+    use btls::ssl::{SslConnector, SslMethod};
 
     let mut builder = SslConnector::builder(SslMethod::tls()).context("failed to configure TLS")?;
     builder
@@ -127,15 +127,16 @@ async fn api_request_inner(
 ) -> Result<ApiResponse> {
     let tcp = connect_api(source_ip).await?;
     let connector = registration_tls_connector()?;
-    let tls = tokio_boring::connect(
-        connector
-            .configure()
-            .context("failed to configure TLS connection")?,
-        API_HOST,
-        tcp,
-    )
-    .await
-    .context("registration TLS handshake failed")?;
+    let ssl = connector
+        .configure()
+        .context("failed to configure TLS connection")?
+        .into_ssl(API_HOST)
+        .context("failed to configure TLS hostname")?;
+    let mut tls = tokio_btls::SslStream::new(ssl, tcp)?;
+    std::pin::Pin::new(&mut tls)
+        .connect()
+        .await
+        .context("registration TLS handshake failed")?;
 
     let (mut sender, connection) = http1::Builder::new()
         .handshake::<_, Full<Bytes>>(TokioIo::new(tls))

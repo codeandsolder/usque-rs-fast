@@ -760,7 +760,7 @@ async fn open_native_quic(config: &Config, tunnel_cfg: &TunnelConfig) -> Result<
     log::info!("UDP GSO enabled: {udp_gso}");
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    boring::rand::rand_bytes(&mut scid)?;
+    btls::rand::rand_bytes(&mut scid)?;
     let scid = quiche::ConnectionId::from_ref(&scid);
     let conn = quiche::connect(
         Some(&tunnel_cfg.sni),
@@ -843,7 +843,7 @@ fn connect_request_headers() -> Vec<quiche::h3::Header> {
 }
 
 async fn establish_connect_ip(mut quic: NativeQuic) -> Result<NativeSession> {
-    let mut h3_config = quiche::h3::Config::new().map_err(|e| anyhow::anyhow!("h3 config: {e}"))?;
+    let mut h3_config = quiche::h3::Config::new();
     h3_config.enable_extended_connect(true);
     let mut h3_conn = quiche::h3::Connection::with_transport(&mut quic.conn, &h3_config)
         .map_err(|e| anyhow::anyhow!("h3 connection: {e}"))?;

@@ -12,11 +12,11 @@ path = "src/main.rs"
 
 [features]
 default = ["socks5-proxy"]
-tun = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:thiserror", "dep:datagram-socket", "dep:octets", "dep:tun-rs", "dep:boring", "dep:log"]
-http-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:boring", "dep:log"]
-https-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:tokio-boring", "dep:boring", "dep:log"]
-socks5-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:fast-socks5", "dep:boring", "dep:log"]
-register = ["dep:time", "tokio/io-util", "tokio/net", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "dep:hyper-util", "dep:tokio-boring", "dep:boring", "dep:log"]
+tun = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:nix", "dep:thiserror", "dep:datagram-socket", "dep:octets", "dep:tun-rs", "dep:btls", "dep:log"]
+http-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:btls", "dep:log"]
+https-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "hyper/server", "dep:hyper-util", "dep:tokio-btls", "dep:btls", "dep:log"]
+socks5-proxy = ["register", "dep:env_logger", "tokio/io-util", "tokio/net", "tokio/sync", "tokio/time", "dep:quiche", "dep:socket2", "dep:fast-socks5", "dep:btls", "dep:log"]
+register = ["dep:time", "tokio/io-util", "tokio/net", "dep:bytes", "dep:http-body-util", "dep:hyper", "hyper/client", "hyper/http1", "dep:hyper-util", "dep:tokio-btls", "dep:btls", "dep:log"]
 
 [dependencies]
 quiche = { version = "0.30.0", optional = true }
@@ -27,8 +27,8 @@ tokio = { version = "1", features = ["macros", "rt"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-boring = { version = "5.2", optional = true }
-tokio-boring = { version = "5.2", optional = true }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096", optional = true }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096", optional = true }
 base64 = "0.23"
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", default-features = false, optional = true }
@@ -83,9 +83,9 @@ allow_attributes_without_reason = "deny"
 
 
 [patch.crates-io]
-quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "ae0e0667df3d9134b1b9a51038305e2ecf38dec0" }
-octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "ae0e0667df3d9134b1b9a51038305e2ecf38dec0" }
-datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "ae0e0667df3d9134b1b9a51038305e2ecf38dec0" }
+quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "fe36a2a07ee9490d48730556412c03d1b02cba33" }
+octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "fe36a2a07ee9490d48730556412c03d1b02cba33" }
+datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "fe36a2a07ee9490d48730556412c03d1b02cba33" }
 
 [profile.release]
 opt-level = 3

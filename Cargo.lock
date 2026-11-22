@@ -75,12 +75,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "antidote"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "307f1158c6f649671b2c5b2939b7513de520500dfe92913a49d5d313e44a6ee7"
-
-[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -124,19 +118,18 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bindgen"
-version = "0.72.1"
+version = "0.73.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+checksum = "787ef8ef523575546b106a58213d6e6b06198a05c2f757258c68a74273670cfa"
 dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools",
  "proc-macro2",
  "quote",
  "regex",
  "rustc-hash",
- "shlex 1.3.0",
+ "shlex",
  "syn 2.0.119",
 ]
 
@@ -160,23 +153,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "boring"
-version = "5.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a03220c5209cb3feb5cb0516b5fd9d121fc3a6d1b9ac07f13c2a9ca5d9df4e4"
+name = "btls"
+version = "0.5.6"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
 dependencies = [
  "bitflags",
- "boring-sys",
+ "btls-sys",
  "foreign-types",
  "libc",
  "openssl-macros",
 ]
 
 [[package]]
-name = "boring-sys"
-version = "5.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34694a68abe0d6600d51f0790e463cff05c18e8274992bdbd0839bbb5b86ec55"
+name = "btls-sys"
+version = "0.5.6"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
 dependencies = [
  "bindgen",
  "cmake",
@@ -203,7 +194,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155"
 dependencies = [
  "find-msvc-tools",
- "shlex 2.0.1",
+ "shlex",
 ]
 
 [[package]]
@@ -317,7 +308,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "datagram-socket"
 version = "0.8.1"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=ae0e0667df3d9134b1b9a51038305e2ecf38dec0#ae0e0667df3d9134b1b9a51038305e2ecf38dec0"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=fe36a2a07ee9490d48730556412c03d1b02cba33#fe36a2a07ee9490d48730556412c03d1b02cba33"
 dependencies = [
  "bytes",
  "futures-util",
@@ -686,15 +677,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -741,21 +723,6 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
-
-[[package]]
-name = "linked-hash-map"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
-
-[[package]]
-name = "linked_hash_set"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "984fb35d06508d1e69fc91050cceba9c0b748f983e6739fa2c7a9237154c52c8"
-dependencies = [
- "linked-hash-map",
-]
 
 [[package]]
 name = "linux-raw-sys"
@@ -878,7 +845,7 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=ae0e0667df3d9134b1b9a51038305e2ecf38dec0#ae0e0667df3d9134b1b9a51038305e2ecf38dec0"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=fe36a2a07ee9490d48730556412c03d1b02cba33#fe36a2a07ee9490d48730556412c03d1b02cba33"
 
 [[package]]
 name = "once_cell"
@@ -950,10 +917,9 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.30.0"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=ae0e0667df3d9134b1b9a51038305e2ecf38dec0#ae0e0667df3d9134b1b9a51038305e2ecf38dec0"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=fe36a2a07ee9490d48730556412c03d1b02cba33#fe36a2a07ee9490d48730556412c03d1b02cba33"
 dependencies = [
- "boring",
- "boring-sys",
+ "btls",
  "bytes",
  "either",
  "enum_dispatch",
@@ -1108,12 +1074,6 @@ dependencies = [
 
 [[package]]
 name = "shlex"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
-
-[[package]]
-name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
@@ -1251,15 +1211,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-boring"
-version = "5.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98af1e895aca8aa5c68b7c1289cb97d90f27a0b2da8c8ff8d06150d9fe43cc35"
+name = "tokio-btls"
+version = "0.5.6"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
 dependencies = [
- "antidote",
- "boring",
- "boring-sys",
- "linked_hash_set",
+ "btls",
+ "btls-sys",
  "tokio",
 ]
 
@@ -1316,7 +1273,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
- "boring",
+ "btls",
  "bytes",
  "clap",
  "datagram-socket",
@@ -1336,7 +1293,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
- "tokio-boring",
+ "tokio-btls",
  "tun-rs",
 ]
 
