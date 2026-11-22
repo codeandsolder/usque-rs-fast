@@ -8,7 +8,7 @@ const ICMPV6_TYPE_PACKET_TOO_BIG: u8 = 2;
 
 /// Compose an ICMP "Packet Too Big" / "Fragmentation Needed" response
 /// for an IP packet that was too large to send as a QUIC datagram.
-#[must_use]
+#[must_use = "the returned ICMP packet reports the MTU constraint"]
 pub fn compose_icmp_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
     if original.is_empty() {
         return None;
