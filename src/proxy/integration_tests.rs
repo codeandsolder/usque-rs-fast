@@ -401,7 +401,8 @@ async fn https_proxy_tls_connect_and_relay_over_real_socket() -> Result<()> {
     builder.set_verify(SslVerifyMode::NONE);
     let config = builder.build().configure()?;
     let socket = TcpStream::connect(addr).await?;
-    let mut client = timeout(DEADLINE, tokio_btls::connect(config, "localhost", socket)).await??;
+    let mut client = tokio_btls::SslStream::new(config.into_ssl("localhost")?, socket)?;
+    timeout(DEADLINE, std::pin::Pin::new(&mut client).connect()).await??;
     let req = format!(
         "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
         origin.port()

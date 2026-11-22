@@ -127,15 +127,16 @@ async fn api_request_inner(
 ) -> Result<ApiResponse> {
     let tcp = connect_api(source_ip).await?;
     let connector = registration_tls_connector()?;
-    let tls = tokio_btls::connect(
-        connector
-            .configure()
-            .context("failed to configure TLS connection")?,
-        API_HOST,
-        tcp,
-    )
-    .await
-    .context("registration TLS handshake failed")?;
+    let ssl = connector
+        .configure()
+        .context("failed to configure TLS connection")?
+        .into_ssl(API_HOST)
+        .context("failed to configure TLS hostname")?;
+    let mut tls = tokio_btls::SslStream::new(ssl, tcp)?;
+    std::pin::Pin::new(&mut tls)
+        .connect()
+        .await
+        .context("registration TLS handshake failed")?;
 
     let (mut sender, connection) = http1::Builder::new()
         .handshake::<_, Full<Bytes>>(TokioIo::new(tls))

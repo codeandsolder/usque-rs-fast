@@ -538,7 +538,7 @@ impl Session {
 
         // Basic HTTP CONNECT does not require SETTINGS_ENABLE_CONNECT_PROTOCOL;
         // that setting is for extended CONNECT protocols such as CONNECT-IP.
-        let h3_config = quiche::h3::Config::new()?;
+        let h3_config = quiche::h3::Config::new();
         let h3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
         let keepalive_period = config.keepalive_period;
         Ok(Self {

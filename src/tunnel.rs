@@ -843,7 +843,7 @@ fn connect_request_headers() -> Vec<quiche::h3::Header> {
 }
 
 async fn establish_connect_ip(mut quic: NativeQuic) -> Result<NativeSession> {
-    let mut h3_config = quiche::h3::Config::new().map_err(|e| anyhow::anyhow!("h3 config: {e}"))?;
+    let mut h3_config = quiche::h3::Config::new();
     h3_config.enable_extended_connect(true);
     let mut h3_conn = quiche::h3::Connection::with_transport(&mut quic.conn, &h3_config)
         .map_err(|e| anyhow::anyhow!("h3 connection: {e}"))?;
