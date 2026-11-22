@@ -107,6 +107,13 @@ sudo ./target/release/usque-rs nativetun
 `usque-rs` creates the interface, sets the selected WARP IPv4/IPv6 addresses and MTU,
 and maintains the MASQUE tunnel. Routing policy remains yours.
 
+TUN write batching is configured explicitly on the native TUN command:
+`--tun-write-packets` (default 1), `--tun-write-max-us` (default 1000),
+`--tun-write-activation-us` (default half the deadline), and
+`--tun-write-adaptive` (off by default). Invalid limits are rejected before
+registration or device creation. The same validated policy applies to every
+reconnected session.
+
 Useful TUN options include:
 
 ```text

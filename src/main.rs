@@ -148,6 +148,36 @@ struct NativeTunOptions {
     no_iproute2: bool,
     interface_name: Option<String>,
     source_ip: Option<IpAddr>,
+    tun_write: tunnel::TunWriteConfig,
+}
+
+#[cfg(feature = "tun")]
+#[derive(Args)]
+struct TunWriteArgs {
+    /// Target packet count for TUN output batching (1 disables retention).
+    #[arg(long, default_value_t = tunnel::TunWriteConfig::DEFAULT_PACKET_TARGET)]
+    tun_write_packets: usize,
+    /// Maximum TUN write batching delay, in microseconds (1..=1000).
+    #[arg(long, default_value_t = tunnel::TunWriteConfig::DEFAULT_MAX_DELAY_US)]
+    tun_write_max_us: u64,
+    /// Adaptive batching activation window in microseconds (default: half the delay).
+    #[arg(long)]
+    tun_write_activation_us: Option<u64>,
+    /// Enable adaptive activation and deactivation of the configured batch size.
+    #[arg(long)]
+    tun_write_adaptive: bool,
+}
+
+#[cfg(feature = "tun")]
+impl TunWriteArgs {
+    fn into_config(self) -> Result<tunnel::TunWriteConfig> {
+        tunnel::TunWriteConfig::new(
+            self.tun_write_packets,
+            self.tun_write_max_us,
+            self.tun_write_activation_us,
+            self.tun_write_adaptive,
+        )
+    }
 }
 
 #[cfg(any(
@@ -273,6 +303,8 @@ enum Commands {
         no_iproute2: bool,
         #[arg(short = 'n', long)]
         interface_name: Option<String>,
+        #[command(flatten)]
+        tun_write: TunWriteArgs,
     },
 
     /// Expose one shared WARP L4 session through one or more proxy listeners.
@@ -321,6 +353,7 @@ async fn main() -> Result<()> {
                 mtu,
                 no_iproute2,
                 interface_name,
+                tun_write,
             } => {
                 cmd_nativetun(
                     &registration,
@@ -337,6 +370,7 @@ async fn main() -> Result<()> {
                         no_iproute2,
                         interface_name,
                         source_ip,
+                        tun_write: tun_write.into_config()?,
                     },
                 )
                 .await
@@ -407,6 +441,7 @@ async fn cmd_nativetun(registration: &RegistrationArgs, options: NativeTunOption
         no_iproute2,
         interface_name,
         source_ip,
+        tun_write,
     } = options;
     if keepalive_period.is_zero() {
         anyhow::bail!("keepalive period must be greater than zero");
@@ -453,6 +488,7 @@ async fn cmd_nativetun(registration: &RegistrationArgs, options: NativeTunOption
         keepalive_period,
         mtu,
         source_ip,
+        tun_write,
     };
     tunnel::maintain_tunnel(&cfg, &tunnel_cfg, tun_dev).await
 }
@@ -1007,6 +1043,51 @@ mod registration_lifecycle_tests {
         assert!(validate_source_family(Some("2001:db8::1".parse()?), false).is_err());
         assert!(validate_source_family(None, false).is_ok());
         assert!(validate_source_family(None, true).is_ok());
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "tun"))]
+mod tun_write_args_tests {
+    use super::*;
+
+    fn parsed_policy(args: &[&str]) -> Result<tunnel::TunWriteConfig> {
+        let cli = Cli::try_parse_from(
+            ["usque-rs", "nativetun"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )?;
+        match cli.command {
+            Commands::NativeTun { tun_write, .. } => tun_write.into_config(),
+            #[cfg(any(
+                feature = "http-proxy",
+                feature = "https-proxy",
+                feature = "socks5-proxy"
+            ))]
+            Commands::Proxy { .. } => anyhow::bail!("expected native TUN command"),
+        }
+    }
+
+    #[test]
+    fn tun_write_cli_defaults_and_overrides() -> Result<()> {
+        assert_eq!(parsed_policy(&[])?, tunnel::TunWriteConfig::default());
+        assert_eq!(
+            parsed_policy(&[
+                "--tun-write-packets",
+                "4",
+                "--tun-write-max-us",
+                "500",
+                "--tun-write-activation-us",
+                "300",
+                "--tun-write-adaptive",
+            ])?,
+            tunnel::TunWriteConfig::new(4, 500, Some(300), true)?
+        );
+        assert!(parsed_policy(&["--tun-write-packets", "0"]).is_err());
+        assert!(parsed_policy(&["--tun-write-max-us", "invalid"]).is_err());
+        assert!(
+            parsed_policy(&["--tun-write-max-us", "1", "--tun-write-activation-us", "2"]).is_err()
+        );
         Ok(())
     }
 }

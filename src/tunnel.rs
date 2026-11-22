@@ -162,6 +162,71 @@ pub struct TunnelConfig {
     pub keepalive_period: Duration,
     pub mtu: u32,
     pub source_ip: Option<IpAddr>,
+    pub tun_write: TunWriteConfig,
+}
+
+/// Validated receive-side TUN write batching policy, shared by reconnects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TunWriteConfig {
+    packet_target: usize,
+    max_delay: Duration,
+    activation_span: Duration,
+    adaptive: bool,
+}
+
+impl TunWriteConfig {
+    pub const DEFAULT_PACKET_TARGET: usize = 1;
+    pub const DEFAULT_MAX_DELAY_US: u64 = 1_000;
+    const MAX_DELAY_US: u64 = 1_000;
+
+    /// Construct a policy in microseconds. Omitted activation time uses half
+    /// the deadline (including fractional microseconds).
+    ///
+    /// # Errors
+    /// Returns an error for a packet target outside the TUN buffer capacity,
+    /// an invalid delay, or an activation span outside the delay.
+    pub fn new(
+        packet_target: usize,
+        max_delay_us: u64,
+        activation_span_us: Option<u64>,
+        adaptive: bool,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=IDEAL_BATCH_SIZE).contains(&packet_target),
+            "TUN write packet target must be 1..={IDEAL_BATCH_SIZE}"
+        );
+        anyhow::ensure!(
+            (1..=Self::MAX_DELAY_US).contains(&max_delay_us),
+            "TUN write deadline must be 1..={} us",
+            Self::MAX_DELAY_US
+        );
+        if let Some(span) = activation_span_us {
+            anyhow::ensure!(
+                (1..=max_delay_us).contains(&span),
+                "TUN write activation span must be 1..={max_delay_us} us"
+            );
+        }
+        let max_delay = Duration::from_micros(max_delay_us);
+        let activation_span = activation_span_us.map_or(max_delay / 2, Duration::from_micros);
+        Ok(Self {
+            packet_target,
+            max_delay,
+            activation_span,
+            adaptive,
+        })
+    }
+}
+
+impl Default for TunWriteConfig {
+    fn default() -> Self {
+        let max_delay = Duration::from_micros(Self::DEFAULT_MAX_DELAY_US);
+        Self {
+            packet_target: Self::DEFAULT_PACKET_TARGET,
+            max_delay,
+            activation_span: max_delay / 2,
+            adaptive: false,
+        }
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -365,17 +430,17 @@ struct TunWriteState {
 }
 
 impl TunWriteState {
-    fn new(
-        adaptive: bool,
-        packet_target: usize,
-        max_delay: Duration,
-        activation_span: Duration,
-    ) -> Self {
+    fn new(config: TunWriteConfig) -> Self {
         Self {
-            gate: TunWriteBatchGate::new(adaptive, packet_target, max_delay, activation_span),
+            gate: TunWriteBatchGate::new(
+                config.adaptive,
+                config.packet_target,
+                config.max_delay,
+                config.activation_span,
+            ),
             inbound_count: 0,
             deadline: None,
-            max_delay,
+            max_delay: config.max_delay,
         }
     }
 
@@ -1144,30 +1209,6 @@ enum ForwardEvent {
     Stats,
 }
 
-fn tun_write_config() -> (usize, u64, Option<u64>, bool) {
-    let packet_target = std::env::var("USQUE_TUN_WRITE_PACKETS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, IDEAL_BATCH_SIZE);
-    let max_delay_us = std::env::var("USQUE_TUN_WRITE_MAX_US")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1_000)
-        .clamp(1, 1_000);
-    let activation_span_us = std::env::var("USQUE_TUN_WRITE_ACTIVATION_US")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|value| value.clamp(1, max_delay_us));
-    let adaptive = std::env::var("USQUE_TUN_WRITE_ADAPTIVE").is_ok_and(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    });
-    (packet_target, max_delay_us, activation_span_us, adaptive)
-}
-
 async fn enforce_tun_write_deadline(
     tun_dev: &tun_rs::AsyncDevice,
     runtime: &mut ForwardRuntime,
@@ -1412,6 +1453,7 @@ async fn forward_native_session(
     pending_packets: &mut VecDeque<Vec<u8>>,
     mtu: usize,
     keepalive_interval: Duration,
+    tun_write_config: TunWriteConfig,
 ) -> Result<()> {
     let flow_prefix = build_flow_prefix(session.flow_id)?;
     let mut stats = TunnelStats::new();
@@ -1422,15 +1464,8 @@ async fn forward_native_session(
         &mut stats,
     )?;
 
-    let (packet_target, max_delay_us, activation_span_us, adaptive) = tun_write_config();
-    let max_delay = Duration::from_micros(max_delay_us);
-    let activation_span = activation_span_us.map_or(max_delay / 2, Duration::from_micros);
-    log::info!(
-        "TUN write batching: packet_target={packet_target} max_delay_us={max_delay_us} activation_span_us={} adaptive={adaptive}",
-        activation_span.as_micros()
-    );
-
-    let tun_write = TunWriteState::new(adaptive, packet_target, max_delay, activation_span);
+    log::info!("TUN write batching: {tun_write_config:?}");
+    let tun_write = TunWriteState::new(tun_write_config);
     let mut runtime = ForwardRuntime::new(flow_prefix, stats, mtu + 128, tun_write);
     runtime.stats_interval.tick().await;
 
@@ -1499,6 +1534,7 @@ async fn run_tunnel_session(
         pending_packets,
         mtu,
         tunnel_cfg.keepalive_period,
+        tunnel_cfg.tun_write,
     ))
     .await
 }
@@ -1677,6 +1713,34 @@ mod tests {
         assert!(inbound_packets.iter().all(Vec::is_empty));
         assert_eq!(stats.rx_packets, 0);
         assert_eq!(stats.rx_bytes, 0);
+    }
+
+    #[test]
+    fn tun_write_config_preserves_defaults_and_fractional_activation() -> Result<()> {
+        let default = TunWriteConfig::default();
+        assert_eq!(default, TunWriteConfig::new(1, 1_000, None, false)?);
+        assert_eq!(TunWriteState::new(default).effective_target(), 1);
+        let fixed = TunWriteConfig::new(4, 1, None, false)?;
+        assert_eq!(fixed.activation_span, Duration::from_nanos(500));
+        assert_eq!(TunWriteState::new(fixed).effective_target(), 4);
+        let adaptive = TunWriteConfig::new(4, 500, Some(300), true)?;
+        assert_eq!(adaptive.activation_span, Duration::from_micros(300));
+        assert_eq!(TunWriteState::new(adaptive).effective_target(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_tun_write_policy_is_rejected_instead_of_clamped() {
+        for (target, delay, activation) in [
+            (0, 100, None),
+            (IDEAL_BATCH_SIZE + 1, 100, None),
+            (1, 0, None),
+            (1, 1_001, None),
+            (1, 100, Some(0)),
+            (1, 100, Some(101)),
+        ] {
+            assert!(TunWriteConfig::new(target, delay, activation, false).is_err());
+        }
     }
 
     #[test]
