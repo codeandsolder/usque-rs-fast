@@ -371,7 +371,7 @@ async fn http_connect_tunnel_occupies_real_listener_capacity() -> Result<()> {
 #[cfg(feature = "https-proxy")]
 #[tokio::test]
 async fn https_proxy_tls_connect_and_relay_over_real_socket() -> Result<()> {
-    use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use btls::ssl::{SslConnector, SslMethod, SslVerifyMode};
     let (origin, origin_task) = echo_origin().await?;
     let folder = tempfile::tempdir()?;
     let certificate = folder.path().join("certificate.pem");
@@ -401,8 +401,7 @@ async fn https_proxy_tls_connect_and_relay_over_real_socket() -> Result<()> {
     builder.set_verify(SslVerifyMode::NONE);
     let config = builder.build().configure()?;
     let socket = TcpStream::connect(addr).await?;
-    let mut client =
-        timeout(DEADLINE, tokio_boring::connect(config, "localhost", socket)).await??;
+    let mut client = timeout(DEADLINE, tokio_btls::connect(config, "localhost", socket)).await??;
     let req = format!(
         "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
         origin.port()

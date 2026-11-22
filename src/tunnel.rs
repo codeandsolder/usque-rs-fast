@@ -760,7 +760,7 @@ async fn open_native_quic(config: &Config, tunnel_cfg: &TunnelConfig) -> Result<
     log::info!("UDP GSO enabled: {udp_gso}");
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    boring::rand::rand_bytes(&mut scid)?;
+    btls::rand::rand_bytes(&mut scid)?;
     let scid = quiche::ConnectionId::from_ref(&scid);
     let conn = quiche::connect(
         Some(&tunnel_cfg.sni),

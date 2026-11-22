@@ -243,7 +243,7 @@ impl Config {
         feature = "socks5-proxy"
     ))]
     pub fn get_endpoint_pub_key_der(&self) -> Result<Vec<u8>> {
-        let key = boring::pkey::PKey::public_key_from_pem(self.endpoint_pub_key.as_bytes())
+        let key = btls::pkey::PKey::public_key_from_pem(self.endpoint_pub_key.as_bytes())
             .context("failed to parse endpoint public key PEM")?;
         key.public_key_to_der()
             .context("failed to encode endpoint public key as SPKI DER")
