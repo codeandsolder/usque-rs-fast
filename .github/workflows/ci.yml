@@ -41,7 +41,6 @@ jobs:
           echo 'allow(...) attributes are forbidden in Rust sources; use a narrow reasoned expect(...)' >&2
           exit 1
         fi
-        python3 -m py_compile .github/scripts/*.py
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go perl pkg-config clang libclang-dev nasm
         cargo +1.100.0 fmt --all --check
@@ -91,15 +90,20 @@ jobs:
       - name: Build representative release target and check cache activity
         shell: bash
         run: |
+          set -euo pipefail
+          compile_requests() {
+            "$SCCACHE_BIN" --show-stats --stats-format json |
+              jq -er '.stats.compile_requests | select(type == "number" and . >= 0 and floor == .)'
+          }
+          before="$(compile_requests)"
           bash .github/scripts/cross-build-with-sccache.sh x86_64-unknown-linux-musl
           test -f target/x86_64-unknown-linux-musl/release/usque-rs
-          "$SCCACHE_BIN" --show-stats --stats-format json | python3 -c '
-          import json,sys
-          stats=json.load(sys.stdin)["stats"]
-          n=stats.get("compile_requests",0)
-          print(f"Cross-container sccache compile requests: {n}")
-          if n < 1: sys.exit("No compiler traffic reached the host sccache daemon")
-          '
+          after="$(compile_requests)"
+          printf 'Cross-container sccache compile requests: %s -> %s\n' "$before" "$after"
+          if (( after <= before )); then
+            echo "No compiler traffic reached the host sccache daemon during the build" >&2
+            exit 1
+          fi
       - name: Prepare verified deployable artifact
         shell: bash
         run: |

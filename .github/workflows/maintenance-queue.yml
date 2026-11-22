@@ -11,63 +11,7 @@ permissions:
 
 jobs:
   rust-release-queue:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Detect current stable Rust and queue a full review
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          curl -fsSL https://static.rust-lang.org/dist/channel-rust-stable.toml -o /tmp/rust-stable.toml
-          read -r VERSION RELEASE_DATE < <(python3 - <<'PY'
-          import tomllib
-          with open("/tmp/rust-stable.toml", "rb") as f:
-              data = tomllib.load(f)
-          print(data["pkg"]["rust"]["version"].split()[0], data["date"])
-          PY
-          )
-
-          test -n "$VERSION"
-          echo "Current stable Rust: $VERSION (release date $RELEASE_DATE)"
-
-          gh label create "automation:rust-release" --repo "$REPO" --color "8250df" --description "Queued automatically when stable Rust changes" --force
-
-          marker="rust-stable-${VERSION}"
-          existing="$(gh issue list --repo "$REPO" --state all --limit 200 --search "${marker} in:body" --json number --jq '.[0].number // empty')"
-          if [[ -n "$existing" ]]; then
-            echo "Rust $VERSION review already exists as issue #$existing"
-            exit 0
-          fi
-
-          export marker dep details log stat update_log VERSION
-
-          body="$(python3 .github/scripts/render-maintenance-template.py <<'EOF'
-          <!-- ${marker} -->
-          <!-- automation-queue:rust-release -->
-
-          Rust **${VERSION}** is now the stable toolchain.
-
-          Do a complete repository refresh against this release rather than only replacing the toolchain version:
-
-          - Read the official Rust ${VERSION} announcement and detailed release notes/changelog.
-          - Review relevant language, standard-library, rustc, Cargo, Clippy, rustfmt, target/platform, and tooling changes.
-          - Review all Rust code, `Cargo.toml`/`Cargo.lock`, CI/release and cross-build tooling, README/setup docs, tests, lints, and project conventions for newly preferable patterns or obsolete workarounds.
-          - Adopt useful newly-stable features and current best practices where they improve the project; remove workarounds that the new stable release makes unnecessary.
-          - Update the current-stable CI/toolchain references while preserving the intentional MSRV contract unless there is a separately justified reason to raise it.
-          - Run the full CI-equivalent test matrix and fix fallout.
-          - If the release genuinely requires no changes beyond what is already present, document what was reviewed and close this issue as a no-op.
-
-          This issue is generated automatically. A ChatGPT maintenance automation is expected to implement it.
-          EOF
-          )"
-
-          gh issue create --repo "$REPO" --title "Rust ${VERSION}: full best-practices refresh" --label "automation:rust-release" --body "$body"
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-release-review.yml@532137869abfb0e0b3d6c8f80346e9240ef9cf51 # main
 
   upstream-queue:
     runs-on: ubuntu-26.04
