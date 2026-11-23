@@ -155,7 +155,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=1f74e9fda91926e5185c2d028d393054b167e84a#1f74e9fda91926e5185c2d028d393054b167e84a"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -167,7 +167,7 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=1f74e9fda91926e5185c2d028d393054b167e84a#1f74e9fda91926e5185c2d028d393054b167e84a"
 dependencies = [
  "bindgen",
  "cmake",
@@ -308,7 +308,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "datagram-socket"
 version = "0.8.1"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=fe36a2a07ee9490d48730556412c03d1b02cba33#fe36a2a07ee9490d48730556412c03d1b02cba33"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=bc9eba6039c44c3651fc22696aeee9ed3fae90ba#bc9eba6039c44c3651fc22696aeee9ed3fae90ba"
 dependencies = [
  "bytes",
  "futures-util",
@@ -845,7 +845,7 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=fe36a2a07ee9490d48730556412c03d1b02cba33#fe36a2a07ee9490d48730556412c03d1b02cba33"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=bc9eba6039c44c3651fc22696aeee9ed3fae90ba#bc9eba6039c44c3651fc22696aeee9ed3fae90ba"
 
 [[package]]
 name = "once_cell"
@@ -917,7 +917,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.30.0"
-source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=fe36a2a07ee9490d48730556412c03d1b02cba33#fe36a2a07ee9490d48730556412c03d1b02cba33"
+source = "git+https://github.com/codeandsolder/quiche-fast.git?rev=bc9eba6039c44c3651fc22696aeee9ed3fae90ba#bc9eba6039c44c3651fc22696aeee9ed3fae90ba"
 dependencies = [
  "btls",
  "bytes",
@@ -1213,7 +1213,7 @@ dependencies = [
 [[package]]
 name = "tokio-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=1f74e9fda91926e5185c2d028d393054b167e84a#1f74e9fda91926e5185c2d028d393054b167e84a"
 dependencies = [
  "btls",
  "btls-sys",

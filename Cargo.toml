@@ -27,8 +27,8 @@ tokio = { version = "1", features = ["macros", "rt"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096", optional = true }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096", optional = true }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "1f74e9fda91926e5185c2d028d393054b167e84a", optional = true }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "1f74e9fda91926e5185c2d028d393054b167e84a", optional = true }
 base64 = "0.23"
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", default-features = false, optional = true }
@@ -83,9 +83,9 @@ allow_attributes_without_reason = "deny"
 
 
 [patch.crates-io]
-quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "fe36a2a07ee9490d48730556412c03d1b02cba33" }
-octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "fe36a2a07ee9490d48730556412c03d1b02cba33" }
-datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "fe36a2a07ee9490d48730556412c03d1b02cba33" }
+quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "bc9eba6039c44c3651fc22696aeee9ed3fae90ba" }
+octets = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "bc9eba6039c44c3651fc22696aeee9ed3fae90ba" }
+datagram-socket = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "bc9eba6039c44c3651fc22696aeee9ed3fae90ba" }
 
 [profile.release]
 opt-level = 3
