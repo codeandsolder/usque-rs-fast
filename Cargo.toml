@@ -28,7 +28,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "1f74e9fda91926e5185c2d028d393054b167e84a", optional = true }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "1f74e9fda91926e5185c2d028d393054b167e84a", optional = true }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "2d359c345558780b09516f1aaaad68abe165c0b3", optional = true }
 base64 = "0.23"
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", default-features = false, optional = true }
