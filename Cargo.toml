@@ -37,7 +37,7 @@ thiserror = { version = "2", optional = true }
 tun-rs = { version = "2.8.16", default-features = false, features = ["async"], optional = true }
 time = { version = "0.3", optional = true }
 socket2 = { version = "0.6", optional = true }
-nix = { version = "0.31.3", features = ["net", "socket", "time", "uio"], optional = true }
+nix = { version = "0.32.0", features = ["net", "socket", "time", "uio"], optional = true }
 datagram-socket = { version = "0.8.0", optional = true }
 fast-socks5 = { git = "https://github.com/codeandsolder/fast-socks5-fast", rev = "d1a29bcb29d5e44762393db7241eb229061bbdf4", optional = true }
 hyper = { version = "1", default-features = false, optional = true }
