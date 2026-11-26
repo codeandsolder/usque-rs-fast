@@ -57,8 +57,8 @@ jobs:
 
   cross-cache-smoke:
     # Explicit dispatch only: no additional routine PR runners. Build a
-    # deployable full-proxy static artifact via the existing release bridge
-    # while verifying mandatory cross-container sccache connectivity.
+    # deployable full-proxy static artifact via the existing container cache
+    # while verifying mandatory server-owned cross-container cache activity.
     name: Cross-container sccache smoke (x86_64 musl)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation == 'cross-cache' }}
     runs-on: ubuntu-26.04
@@ -79,10 +79,11 @@ jobs:
         with:
           toolchain: "${{ steps.compiler.outputs.channel }}"
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@be135bb62c642cddf3bacbb3f22779aac9ebe615 # ci/cache-cross-container-20261120
         with:
           rust-toolchain: "${{ steps.compiler.outputs.channel }}"
           rustflags: "cross:x86_64-unknown-linux-musl:baseline"
+          execution: cross
       - name: Install cross
         uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
@@ -91,19 +92,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          compile_requests() {
-            "$SCCACHE_BIN" --show-stats --stats-format json |
-              jq -er '.stats.compile_requests | select(type == "number" and . >= 0 and floor == .)'
-          }
-          before="$(compile_requests)"
           bash .github/scripts/cross-build-with-sccache.sh x86_64-unknown-linux-musl
           test -f target/x86_64-unknown-linux-musl/release/usque-rs
-          after="$(compile_requests)"
-          printf 'Cross-container sccache compile requests: %s -> %s\n' "$before" "$after"
-          if (( after <= before )); then
-            echo "No compiler traffic reached the host sccache daemon during the build" >&2
-            exit 1
-          fi
+          # The canonical finalizer verifies actual container compiler
+          # statistics and rejects missing traffic or backend errors.
+
       - name: Prepare verified deployable artifact
         shell: bash
         run: |
@@ -123,7 +116,7 @@ jobs:
           retention-days: 7
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@be135bb62c642cddf3bacbb3f22779aac9ebe615 # ci/cache-cross-container-20261120
 
   x86-codegen:
     name: x86 codegen / ${{ matrix.cpu }}

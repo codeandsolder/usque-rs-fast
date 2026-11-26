@@ -85,9 +85,10 @@ jobs:
           components: "${{ matrix.target == 'mipsel-unknown-linux-musl' && 'rust-src' || '' }}"
 
       - name: Setup mandatory shared sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@be135bb62c642cddf3bacbb3f22779aac9ebe615 # ci/cache-cross-container-20261120
         with:
           rust-toolchain: "${{ steps.compiler.outputs.channel }}"
+          execution: cross
           # Scope the persisted cache by target/CPU. The setup input only
           # affects the cache identity; it does not set compiler RUSTFLAGS.
           rustflags: "cross:${{ matrix.target }}:${{ matrix.cpu_level || 'baseline' }}:${{ matrix.rustflags || '' }}"
@@ -146,4 +147,4 @@ jobs:
           fail_on_unmatched_files: true
       - name: Finalize mandatory shared sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@be135bb62c642cddf3bacbb3f22779aac9ebe615 # ci/cache-cross-container-20261120
