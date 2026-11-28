@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   rust-release-queue:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-release-review.yml@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-release-review.yml@5b72e3865937d6e85e9ea485af9d04ec83343c5f # main
 
   upstream-queue:
     runs-on: ubuntu-26.04

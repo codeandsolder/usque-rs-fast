@@ -28,7 +28,7 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.validation != 'cross-cache' }}
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5b72e3865937d6e85e9ea485af9d04ec83343c5f # main
     with:
       runner: ubuntu-26.04
       rust-components: "rustfmt clippy"
@@ -73,13 +73,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Resolve native quarantined Rust
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@5b72e3865937d6e85e9ea485af9d04ec83343c5f # main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: "${{ steps.compiler.outputs.channel }}"
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@5b72e3865937d6e85e9ea485af9d04ec83343c5f # main
         with:
           rust-toolchain: "${{ steps.compiler.outputs.channel }}"
           rustflags: "cross:x86_64-unknown-linux-musl:baseline"
@@ -123,7 +123,7 @@ jobs:
           retention-days: 7
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@5b72e3865937d6e85e9ea485af9d04ec83343c5f # main
 
   x86-codegen:
     name: x86 codegen / ${{ matrix.cpu }}
@@ -144,14 +144,14 @@ jobs:
 
       - name: Resolve native quarantined Rust
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@5b72e3865937d6e85e9ea485af9d04ec83343c5f # main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: "${{ steps.compiler.outputs.channel }}"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@5b72e3865937d6e85e9ea485af9d04ec83343c5f # main
         with:
           rust-toolchain: "${{ steps.compiler.outputs.channel }}"
           rustflags: "-C target-cpu=${{ matrix.cpu }}"
@@ -162,4 +162,4 @@ jobs:
         run: cargo check --all-targets --all-features --target x86_64-unknown-linux-gnu
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@5b72e3865937d6e85e9ea485af9d04ec83343c5f # main
